@@ -353,6 +353,8 @@ class LLMClient:
                 if structured_output_hook is not None:
                     result.structured = structured_output_hook(result.text)
                 return result
+            except asyncio.CancelledError:
+                raise
             except httpx.RequestError as e:
                 error_msg = str(e) or repr(e)
                 if attempt == MAX_API_RETRIES - 1:
@@ -429,7 +431,6 @@ class LLMClient:
             request_name: Name of the request for token tracking
             stream: If True, stream the response
             stream_callback: Optional callback for streaming chunks.
-                If None and stream=True, prints to stdout.
 
         Returns:
             Tuple containing:
@@ -509,8 +510,6 @@ class LLMClient:
                             full_content.append(content)
                             if stream_callback:
                                 stream_callback(content)
-                            else:
-                                print(content, end="", flush=True)
 
                     if "usage" in chunk and chunk["usage"] is not None:
                         input_tokens = chunk["usage"].get("prompt_tokens", 0)
@@ -519,9 +518,6 @@ class LLMClient:
                         )
                 except json.JSONDecodeError:
                     continue
-
-        if not stream_callback:
-            print(flush=True)
 
         response_text = "".join(full_content)
 
