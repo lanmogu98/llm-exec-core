@@ -58,7 +58,10 @@ class ResponseCache:
 
         response, timestamp = self._cache[key]
 
-        if self._ttl_seconds > 0 and time.time() - timestamp > self._ttl_seconds:
+        if (
+            self._ttl_seconds > 0
+            and time.time() - timestamp > self._ttl_seconds
+        ):
             del self._cache[key]
             self._misses += 1
             return None
@@ -147,7 +150,9 @@ class LLMClient:
             "Authorization": f"Bearer {self.api_key}",
         }
 
-        self.request_overrides = dict(provider_settings.request_overrides or {})
+        self.request_overrides = dict(
+            provider_settings.request_overrides or {}
+        )
         if self._thinking_level:
             self.request_overrides["reasoning_effort"] = self._thinking_level
 
@@ -160,8 +165,12 @@ class LLMClient:
         }
 
         if provider_settings.rate_limit:
-            self._min_interval = provider_settings.rate_limit.min_interval_seconds
-            self._max_rpm = provider_settings.rate_limit.max_requests_per_minute
+            self._min_interval = (
+                provider_settings.rate_limit.min_interval_seconds
+            )
+            self._max_rpm = (
+                provider_settings.rate_limit.max_requests_per_minute
+            )
         else:
             self._min_interval = MIN_REQUEST_INTERVAL_SECONDS
             self._max_rpm = MAX_REQUESTS_PER_MINUTE
@@ -182,7 +191,9 @@ class LLMClient:
     async def __aenter__(self):
         """Context manager entry."""
         if self._async_client is None:
-            self._async_client = httpx.AsyncClient(timeout=API_REQUEST_TIMEOUT_SECONDS)
+            self._async_client = httpx.AsyncClient(
+                timeout=API_REQUEST_TIMEOUT_SECONDS
+            )
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -194,7 +205,9 @@ class LLMClient:
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create async client."""
         if self._async_client is None:
-            self._async_client = httpx.AsyncClient(timeout=API_REQUEST_TIMEOUT_SECONDS)
+            self._async_client = httpx.AsyncClient(
+                timeout=API_REQUEST_TIMEOUT_SECONDS
+            )
         return self._async_client
 
     async def close(self):
@@ -221,7 +234,8 @@ class LLMClient:
         if self._max_rpm > 0:
             cutoff_time = current_time - 60
             while (
-                self._request_timestamps and self._request_timestamps[0] < cutoff_time
+                self._request_timestamps
+                and self._request_timestamps[0] < cutoff_time
             ):
                 self._request_timestamps.popleft()
 
@@ -309,9 +323,13 @@ class LLMClient:
                         client, data, start_time, request_name, stream_callback
                     )
                 else:
-                    response_text, legacy_usage = await self._non_stream_response(
-                        client, data, start_time, request_name
+                    legacy_result = await self._non_stream_response(
+                        client,
+                        data,
+                        start_time,
+                        request_name,
                     )
+                    response_text, legacy_usage = legacy_result
 
                 if self._cache_enabled:
                     self._cache.set(prompt, self.model, response_text)
@@ -327,7 +345,9 @@ class LLMClient:
                         trace_context=trace_context,
                         started_at=started_at,
                         finished_at=finished_at,
-                        duration_seconds=legacy_usage["process_times"]["total_time"],
+                        duration_seconds=legacy_usage["process_times"][
+                            "total_time"
+                        ],
                     ),
                 )
                 if structured_output_hook is not None:
@@ -445,7 +465,9 @@ class LLMClient:
         input_tokens = result.get("usage", {}).get("prompt_tokens", 0)
         output_tokens = result.get("usage", {}).get("completion_tokens", 0)
 
-        usage = self._track_usage(input_tokens, output_tokens, start_time, request_name)
+        usage = self._track_usage(
+            input_tokens, output_tokens, start_time, request_name
+        )
         return response_text, usage
 
     async def _stream_response(
@@ -492,7 +514,9 @@ class LLMClient:
 
                     if "usage" in chunk and chunk["usage"] is not None:
                         input_tokens = chunk["usage"].get("prompt_tokens", 0)
-                        output_tokens = chunk["usage"].get("completion_tokens", 0)
+                        output_tokens = chunk["usage"].get(
+                            "completion_tokens", 0
+                        )
                 except json.JSONDecodeError:
                     continue
 
@@ -510,7 +534,9 @@ class LLMClient:
         if output_tokens == 0:
             output_tokens = estimate_tokens(response_text)
 
-        usage = self._track_usage(input_tokens, output_tokens, start_time, request_name)
+        usage = self._track_usage(
+            input_tokens, output_tokens, start_time, request_name
+        )
         return response_text, usage
 
     def _track_usage(
@@ -564,7 +590,9 @@ class LLMClient:
             "process_times": {"total_time": process_time},
         }
 
-    def _usage_from_legacy_request(self, legacy_usage: Dict[str, Any]) -> TokenUsage:
+    def _usage_from_legacy_request(
+        self, legacy_usage: Dict[str, Any]
+    ) -> TokenUsage:
         requests = []
         request_times = []
         if self.token_usage["requests"]:

@@ -21,5 +21,8 @@ dev = [
     "mypy>=1.0.0",
 ]
 
+[tool.black]
+line-length = 79
+
 [tool.setuptools]
 package-data = { "llm_exec_core" = ["*.yml"] }

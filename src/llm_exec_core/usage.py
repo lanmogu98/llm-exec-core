@@ -74,21 +74,28 @@ def format_usage_report(
             output_request_cost = request.get("output_cost", 0.0)
             total_request_cost = request.get("total_cost", 0.0)
             process_time = request.get("process_time", 0.0)
+            input_cost_text = _as_number(request_cost)
+            output_cost_text = _as_number(output_request_cost)
+            total_cost_text = _as_number(total_request_cost)
 
             lines.append(f"  Request {index}: {request.get('name')}")
             lines.append(f"    Timestamp: {request.get('timestamp', 'N/A')}")
             lines.append(f"    Input Tokens: {request.get('input_tokens', 0)}")
-            lines.append(f"    Output Tokens: {request.get('output_tokens', 0)}")
+            lines.append(
+                f"    Output Tokens: {request.get('output_tokens', 0)}"
+            )
             lines.append(f"    Total Tokens: {request.get('total_tokens', 0)}")
-            lines.append(f"    Process Time: {_as_number(process_time):.2f} seconds")
             lines.append(
-                f"    Input Cost: {pricing_currency}{_as_number(request_cost):.6f}"
+                f"    Process Time: {_as_number(process_time):.2f} seconds"
             )
             lines.append(
-                f"    Output Cost: {pricing_currency}{_as_number(output_request_cost):.6f}"
+                f"    Input Cost: {pricing_currency}{input_cost_text:.6f}"
             )
             lines.append(
-                f"    Total Cost: {pricing_currency}{_as_number(total_request_cost):.6f}"
+                f"    Output Cost: {pricing_currency}{output_cost_text:.6f}"
+            )
+            lines.append(
+                f"    Total Cost: {pricing_currency}{total_cost_text:.6f}"
             )
             lines.append("")
 
