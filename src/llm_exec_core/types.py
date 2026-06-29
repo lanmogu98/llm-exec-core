@@ -20,6 +20,23 @@ class TokenUsage:
     requests: List[Dict[str, Any]] = field(default_factory=list)
     process_times: Dict[str, Any] = field(default_factory=dict)
 
+    def to_legacy_dict(self, duration_seconds: float = 0.0) -> Dict[str, Any]:
+        process_times: Dict[str, Any] = dict(self.process_times)
+        if "request_times" not in process_times:
+            process_times["request_times"] = []
+        process_times["total_time"] = duration_seconds
+        return {
+            "total_input_tokens": self.input_tokens,
+            "total_output_tokens": self.output_tokens,
+            "requests": self.requests,
+            "process_times": process_times,
+            "cost": {
+                "input_cost": self.input_cost,
+                "output_cost": self.output_cost,
+                "total_cost": self.total_cost,
+            },
+        }
+
 
 @dataclass(slots=True)
 class ExecutionMetadata:
@@ -46,19 +63,8 @@ class LLMResult:
     metadata: ExecutionMetadata
 
     def to_legacy_tuple(self) -> tuple[str, Dict[str, Any]]:
-        legacy_usage: Dict[str, Any] = {
-            "total_input_tokens": self.usage.input_tokens,
-            "total_output_tokens": self.usage.output_tokens,
-            "requests": self.usage.requests,
-            "process_times": {
-                **self.usage.process_times,
-                "total_time": self.metadata.duration_seconds,
-            },
-            "cost": {
-                "input_cost": self.usage.input_cost,
-                "output_cost": self.usage.output_cost,
-                "total_cost": self.usage.total_cost,
-            },
-            "metadata": asdict(self.metadata),
-        }
+        legacy_usage: Dict[str, Any] = self.usage.to_legacy_dict(
+            duration_seconds=self.metadata.duration_seconds
+        )
+        legacy_usage["metadata"] = asdict(self.metadata)
         return self.text, legacy_usage
