@@ -61,6 +61,7 @@ class LLMResult:
     text: str
     usage: TokenUsage
     metadata: ExecutionMetadata
+    structured: Any | None = None
 
     def to_legacy_tuple(self) -> tuple[str, Dict[str, Any]]:
         legacy_usage: Dict[str, Any] = self.usage.to_legacy_dict(

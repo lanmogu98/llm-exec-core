@@ -28,6 +28,7 @@ from .constants import (
     RESPONSE_CACHE_TTL_SECONDS,
 )
 from .tokens import estimate_tokens
+from .types import ExecutionMetadata, LLMResult, TokenUsage
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +58,7 @@ class ResponseCache:
 
         response, timestamp = self._cache[key]
 
-        if (
-            self._ttl_seconds > 0
-            and time.time() - timestamp > self._ttl_seconds
-        ):
+        if self._ttl_seconds > 0 and time.time() - timestamp > self._ttl_seconds:
             del self._cache[key]
             self._misses += 1
             return None
@@ -123,7 +121,7 @@ class LLMClient:
         """
         self._thinking_level = thinking_level
 
-        _, provider_settings, model_details = get_model_details(
+        provider_name, provider_settings, model_details = get_model_details(
             model_name, config_source
         )
 
@@ -138,6 +136,7 @@ class LLMClient:
         self.max_tokens = provider_settings.max_tokens
         self.model_name = model_name
         self.model = model_details.id
+        self.provider_name = provider_name
         self.pricing = model_details.pricing
         self.pricing_currency = provider_settings.pricing_currency
         self.temperature = provider_settings.temperature
@@ -148,9 +147,7 @@ class LLMClient:
             "Authorization": f"Bearer {self.api_key}",
         }
 
-        self.request_overrides = dict(
-            provider_settings.request_overrides or {}
-        )
+        self.request_overrides = dict(provider_settings.request_overrides or {})
         if self._thinking_level:
             self.request_overrides["reasoning_effort"] = self._thinking_level
 
@@ -163,12 +160,8 @@ class LLMClient:
         }
 
         if provider_settings.rate_limit:
-            self._min_interval = (
-                provider_settings.rate_limit.min_interval_seconds
-            )
-            self._max_rpm = (
-                provider_settings.rate_limit.max_requests_per_minute
-            )
+            self._min_interval = provider_settings.rate_limit.min_interval_seconds
+            self._max_rpm = provider_settings.rate_limit.max_requests_per_minute
         else:
             self._min_interval = MIN_REQUEST_INTERVAL_SECONDS
             self._max_rpm = MAX_REQUESTS_PER_MINUTE
@@ -189,9 +182,7 @@ class LLMClient:
     async def __aenter__(self):
         """Context manager entry."""
         if self._async_client is None:
-            self._async_client = httpx.AsyncClient(
-                timeout=API_REQUEST_TIMEOUT_SECONDS
-            )
+            self._async_client = httpx.AsyncClient(timeout=API_REQUEST_TIMEOUT_SECONDS)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -203,9 +194,7 @@ class LLMClient:
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create async client."""
         if self._async_client is None:
-            self._async_client = httpx.AsyncClient(
-                timeout=API_REQUEST_TIMEOUT_SECONDS
-            )
+            self._async_client = httpx.AsyncClient(timeout=API_REQUEST_TIMEOUT_SECONDS)
         return self._async_client
 
     async def close(self):
@@ -232,8 +221,7 @@ class LLMClient:
         if self._max_rpm > 0:
             cutoff_time = current_time - 60
             while (
-                self._request_timestamps
-                and self._request_timestamps[0] < cutoff_time
+                self._request_timestamps and self._request_timestamps[0] < cutoff_time
             ):
                 self._request_timestamps.popleft()
 
@@ -251,46 +239,53 @@ class LLMClient:
         self._last_request_time = current_time
         self._request_timestamps.append(current_time)
 
-    async def generate_response(
+    async def generate(
         self,
         prompt: str,
         request_name: str = "unnamed_request",
         stream: bool = False,
         stream_callback: Optional[Callable[[str], None]] = None,
-    ) -> Tuple[str, Dict[str, Any]]:
-        """
-        Generate a response using the LLM API (Async).
+        structured_output_hook: Optional[Callable[[str], Any]] = None,
+        trace_context: Optional[Dict[str, Any]] = None,
+        run_id: str = "",
+        request_id: str = "",
+    ) -> LLMResult:
+        """Generate a structured LLM result."""
+        started_at = datetime.now()
+        start_time = time.time()
 
-        Args:
-            prompt: The prompt to send to the API
-            request_name: Name of the request for token tracking
-            stream: If True, stream the response
-            stream_callback: Optional callback for streaming chunks.
-                If None and stream=True, prints to stdout.
-
-        Returns:
-            Tuple containing:
-            - The response text
-            - Dictionary with usage statistics for this specific request
-        """
         if self._cache_enabled:
             cached_response = self._cache.get(prompt, self.model)
             if cached_response is not None:
                 logger.info("Cache hit for %s", request_name)
-                empty_usage = {
-                    "total_input_tokens": 0,
-                    "total_output_tokens": 0,
-                    "cost": {
-                        "input_cost": 0,
-                        "output_cost": 0,
-                        "total_cost": 0,
-                    },
-                    "process_times": {"total_time": 0},
-                }
-                return cached_response, empty_usage
+                finished_at = datetime.now()
+                result = LLMResult(
+                    text=cached_response,
+                    usage=self._build_token_usage(
+                        input_tokens=0,
+                        output_tokens=0,
+                        input_cost=0.0,
+                        output_cost=0.0,
+                        total_cost=0.0,
+                        requests=[],
+                        process_times={"request_times": []},
+                    ),
+                    metadata=self._build_metadata(
+                        request_name=request_name,
+                        request_id=request_id,
+                        run_id=run_id,
+                        trace_context=trace_context,
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        duration_seconds=finished_at.timestamp()
+                        - started_at.timestamp(),
+                    ),
+                )
+                if structured_output_hook is not None:
+                    result.structured = structured_output_hook(result.text)
+                return result
 
         await self._wait_for_rate_limit()
-        start_time = time.time()
 
         data = {
             "model": self.model,
@@ -310,18 +305,34 @@ class LLMClient:
         for attempt in range(MAX_API_RETRIES):
             try:
                 if stream:
-                    response_text, usage = await self._stream_response(
+                    response_text, legacy_usage = await self._stream_response(
                         client, data, start_time, request_name, stream_callback
                     )
                 else:
-                    response_text, usage = await self._non_stream_response(
+                    response_text, legacy_usage = await self._non_stream_response(
                         client, data, start_time, request_name
                     )
 
                 if self._cache_enabled:
                     self._cache.set(prompt, self.model, response_text)
 
-                return response_text, usage
+                finished_at = datetime.now()
+                result = LLMResult(
+                    text=response_text,
+                    usage=self._usage_from_legacy_request(legacy_usage),
+                    metadata=self._build_metadata(
+                        request_name=request_name,
+                        request_id=request_id,
+                        run_id=run_id,
+                        trace_context=trace_context,
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        duration_seconds=legacy_usage["process_times"]["total_time"],
+                    ),
+                )
+                if structured_output_hook is not None:
+                    result.structured = structured_output_hook(result.text)
+                return result
             except httpx.RequestError as e:
                 error_msg = str(e) or repr(e)
                 if attempt == MAX_API_RETRIES - 1:
@@ -383,6 +394,36 @@ class LLMClient:
 
         raise RuntimeError("Retry loop exited without returning or raising")
 
+    async def generate_response(
+        self,
+        prompt: str,
+        request_name: str = "unnamed_request",
+        stream: bool = False,
+        stream_callback: Optional[Callable[[str], None]] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """
+        Generate a response using the LLM API (Async).
+
+        Args:
+            prompt: The prompt to send to the API
+            request_name: Name of the request for token tracking
+            stream: If True, stream the response
+            stream_callback: Optional callback for streaming chunks.
+                If None and stream=True, prints to stdout.
+
+        Returns:
+            Tuple containing:
+            - The response text
+            - Dictionary with usage statistics for this specific request
+        """
+        result = await self.generate(
+            prompt,
+            request_name=request_name,
+            stream=stream,
+            stream_callback=stream_callback,
+        )
+        return result.to_legacy_tuple()
+
     async def _non_stream_response(
         self,
         client: httpx.AsyncClient,
@@ -404,9 +445,7 @@ class LLMClient:
         input_tokens = result.get("usage", {}).get("prompt_tokens", 0)
         output_tokens = result.get("usage", {}).get("completion_tokens", 0)
 
-        usage = self._track_usage(
-            input_tokens, output_tokens, start_time, request_name
-        )
+        usage = self._track_usage(input_tokens, output_tokens, start_time, request_name)
         return response_text, usage
 
     async def _stream_response(
@@ -453,9 +492,7 @@ class LLMClient:
 
                     if "usage" in chunk and chunk["usage"] is not None:
                         input_tokens = chunk["usage"].get("prompt_tokens", 0)
-                        output_tokens = chunk["usage"].get(
-                            "completion_tokens", 0
-                        )
+                        output_tokens = chunk["usage"].get("completion_tokens", 0)
                 except json.JSONDecodeError:
                     continue
 
@@ -473,9 +510,7 @@ class LLMClient:
         if output_tokens == 0:
             output_tokens = estimate_tokens(response_text)
 
-        usage = self._track_usage(
-            input_tokens, output_tokens, start_time, request_name
-        )
+        usage = self._track_usage(input_tokens, output_tokens, start_time, request_name)
         return response_text, usage
 
     def _track_usage(
@@ -528,6 +563,73 @@ class LLMClient:
             },
             "process_times": {"total_time": process_time},
         }
+
+    def _usage_from_legacy_request(self, legacy_usage: Dict[str, Any]) -> TokenUsage:
+        requests = []
+        request_times = []
+        if self.token_usage["requests"]:
+            requests = [dict(self.token_usage["requests"][-1])]
+        if self.token_usage["process_times"]["request_times"]:
+            request_times = [
+                dict(self.token_usage["process_times"]["request_times"][-1])
+            ]
+
+        return self._build_token_usage(
+            input_tokens=legacy_usage["total_input_tokens"],
+            output_tokens=legacy_usage["total_output_tokens"],
+            input_cost=legacy_usage["cost"]["input_cost"],
+            output_cost=legacy_usage["cost"]["output_cost"],
+            total_cost=legacy_usage["cost"]["total_cost"],
+            requests=requests,
+            process_times={"request_times": request_times},
+        )
+
+    def _build_token_usage(
+        self,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        input_cost: float,
+        output_cost: float,
+        total_cost: float,
+        requests: list[Dict[str, Any]],
+        process_times: Dict[str, Any],
+    ) -> TokenUsage:
+        return TokenUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+            input_cost=input_cost,
+            output_cost=output_cost,
+            total_cost=total_cost,
+            currency=self.pricing_currency,
+            requests=requests,
+            process_times=process_times,
+        )
+
+    def _build_metadata(
+        self,
+        *,
+        request_name: str,
+        request_id: str,
+        run_id: str,
+        trace_context: Optional[Dict[str, Any]],
+        started_at: datetime,
+        finished_at: datetime,
+        duration_seconds: float,
+    ) -> ExecutionMetadata:
+        return ExecutionMetadata(
+            request_id=request_id,
+            run_id=run_id,
+            request_name=request_name,
+            model_name=self.model_name,
+            model_id=self.model,
+            provider_name=self.provider_name,
+            started_at=started_at.isoformat(),
+            finished_at=finished_at.isoformat(),
+            duration_seconds=duration_seconds,
+            trace_context=dict(trace_context or {}),
+        )
 
     def get_token_usage(self) -> Dict[str, Any]:
         """
