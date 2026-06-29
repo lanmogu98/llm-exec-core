@@ -1,8 +1,15 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import inspect
 
 from llm_exec_core.client import LLMClient
+
+
+def test_get_supported_models_is_zero_arg_staticmethod():
+    sig = inspect.signature(LLMClient.get_supported_models)
+
+    assert len(sig.parameters) == 0
 
 
 @pytest.mark.asyncio
