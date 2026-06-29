@@ -261,8 +261,8 @@ class LLMClient:
         stream_callback: Optional[Callable[[str], None]] = None,
         structured_output_hook: Optional[Callable[[str], Any]] = None,
         trace_context: Optional[Dict[str, Any]] = None,
-        run_id: str = "",
-        request_id: str = "",
+        run_id: str | None = None,
+        request_id: str | None = None,
     ) -> LLMResult:
         """Generate a structured LLM result."""
         started_at = datetime.now()
@@ -635,8 +635,8 @@ class LLMClient:
         self,
         *,
         request_name: str,
-        request_id: str,
-        run_id: str,
+        request_id: str | None,
+        run_id: str | None,
         trace_context: Optional[Dict[str, Any]],
         started_at: datetime,
         finished_at: datetime,

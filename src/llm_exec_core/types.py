@@ -42,8 +42,8 @@ class TokenUsage:
 class ExecutionMetadata:
     """Execution metadata for a completed LLM request."""
 
-    request_id: str
-    run_id: str
+    request_id: str | None
+    run_id: str | None
     request_name: str
     model_name: str
     model_id: str
