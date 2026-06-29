@@ -102,16 +102,16 @@ class LLMClient:
     """Client for interacting with the LLM API (Async)."""
 
     @staticmethod
-    def get_supported_models():
+    def get_supported_models() -> list[str]:
         """Return list of supported model names from llm_config.yml."""
         return get_supported_models()
 
     def __init__(
         self,
         model_name: str,
-        thinking_level: str = None,
-        config_source: Path | dict | None = None,
-    ):
+        thinking_level: str | None = None,
+        config_source: Path | Dict[str, Any] | None = None,
+    ) -> None:
         """
         Initialize the LLM client for a specific model.
         The client automatically determines the service provider and settings.
@@ -156,7 +156,7 @@ class LLMClient:
         if self._thinking_level:
             self.request_overrides["reasoning_effort"] = self._thinking_level
 
-        self.token_usage = {
+        self.token_usage: Dict[str, Any] = {
             "total_input_tokens": 0,
             "total_output_tokens": 0,
             "requests": [],
@@ -176,7 +176,7 @@ class LLMClient:
             self._max_rpm = MAX_REQUESTS_PER_MINUTE
 
         self._last_request_time = 0.0
-        self._request_timestamps = deque(
+        self._request_timestamps: deque[float] = deque(
             maxlen=self._max_rpm if self._max_rpm > 0 else 100
         )
 
