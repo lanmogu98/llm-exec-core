@@ -1,0 +1,298 @@
+# |
+#   This is the single source of truth for all LLM configuration.
+#   The structure is: provider -> provider_settings -> model_name -> model_details
+#   Users can add new models to the config file in the format demonstrated below.
+#    - provider: the name of the LLM provider.
+#    - provider_settings: the settings of the LLM provider.
+#    - model_name: the name of the LLM model.
+#    - model_details: the details of the LLM model.
+#    - pricing: the pricing of the LLM model, per 1M tokens.
+#    - pricing_currency: the currency of the pricing.
+#    - max_tokens: the maximum number of tokens the model can generate.
+#    - context_window: the maximum number of tokens the model can process.
+#    - rate_limit (optional): per-provider rate limiting configuration
+#        - min_interval_seconds: minimum time between requests (default: 0.5)
+#        - max_requests_per_minute: max requests per minute, 0 = unlimited (default: 60)
+#
+#   In default, and as a highly recommend practice, the API key of each model is
+#   stored in the environment variable.
+
+#-------------------------------------------------------------------------------
+# Shared endpoints for reuse across providers
+#-------------------------------------------------------------------------------
+_shared_endpoints:
+  volcengine: &volcengine_endpoint "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+  openrouter: &openrouter_endpoint "https://openrouter.ai/api/v1/chat/completions"
+
+
+deepseek-volcengine:
+  api_key_env_var: "DEEPSEEK_API_KEY_VOLC"
+  api_base_url: *volcengine_endpoint
+  temperature: 0.4
+  max_tokens: 16000
+  context_window: 128000
+  pricing_currency: "¥"
+  models:
+    deepseek-v3.2:
+      id: "deepseek-v3-2-251201"
+      pricing: { input: 2.00, output: 8.00 }
+    deepseek-r1:
+      id: "deepseek-r1-250528"
+      pricing: { input: 4.00, output: 16.00 }
+
+# DeepSeek official API. V4 and V4-Pro are exclusive to this endpoint (not on Volcengine).
+# Block defaults match V3.2 / R1 limits; V4 family is capped here pending #21
+# (per-model max_tokens / context_window override).
+# Model IDs sourced from api-docs.deepseek.com/quick_start/pricing (May 2026).
+# Recommend a live curl test before first production use — research was based on
+# search snippets, not direct page render. Aliases `deepseek-chat` and
+# `deepseek-reasoner` retire 2026-07-24.
+deepseek:
+  api_key_env_var: "DEEPSEEK_API_KEY"
+  api_base_url: "https://api.deepseek.com/chat/completions"
+  temperature: 0.4
+  max_tokens: 64000  # V3.2/R1 max output; V4-Flash/V4-Pro support 384K (capped here)
+  context_window: 128000  # V3.2/R1 context; V4-Flash/V4-Pro support 1M (capped here)
+  pricing_currency: "$"
+  # Live test (2026-05-09) confirmed: official API rejects versioned IDs
+  # (deepseek-v3.2, deepseek-r1) with "supported API model names are
+  # deepseek-v4-pro or deepseek-v4-flash". V3.2 and R1 are Volcengine-only now.
+  models:
+    deepseek-v4-flash:
+      id: "deepseek-v4-flash"
+      pricing: { input: 0.14, output: 0.28 }
+    # V4-Pro is on a 75% promo through 2026-05-31; standard rates resume after.
+    # Standard: input $1.74 / output $3.48
+    deepseek-v4-pro:
+      id: "deepseek-v4-pro"
+      pricing: { input: 0.435, output: 0.87 }
+
+gemini:
+  api_key_env_var: "GEMINI_API_KEY"
+  api_base_url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+  temperature: 1.0  # Gemini 3 recommends default 1.0 to avoid looping issues
+  max_tokens: 65536
+  context_window: 1000000  # Gemini 3 supports 1M token input
+  pricing_currency: "$"
+  # Gemini 3 thinking configuration via OpenAI compatibility layer
+  # If not set, model uses dynamic thinking (defaults to "high" with auto-adjustment)
+  # Use CLI --thinking to override: low | medium | high | minimal
+  # See: https://ai.google.dev/gemini-api/docs/gemini-3
+  # request_overrides:
+  #   reasoning_effort: "high"  # Uncomment to force specific level
+  models:
+    gemini-3-flash:
+      id: "gemini-3-flash-preview"
+      pricing: { input: 0.5, output: 3.00 }
+    gemini-3.1-flash-lite:
+      id: "gemini-3.1-flash-lite-preview"
+      pricing: { input: 0.25, output: 1.50 }
+    gemini-3.1-pro:
+      id: "gemini-3.1-pro-preview"
+      pricing: { input: 2.50, output: 15.00 }
+
+# Gemini Free Tier - uses separate API key with stricter rate limits.
+# Provider-wide rate_limit applies to ALL models in this block; we use the most
+# restrictive cap (10 RPM) to avoid throttling violations on any free-tier model.
+# Verified per ai.google.dev/gemini-api/docs/pricing (May 2026 — free tier was
+# tightened 2026-04-01: Pro models moved to paid; Flash retained at reduced RPD):
+#   gemini-2.5-flash:               10 RPM, 250K TPM
+#   gemini-2.5-flash-lite:          15 RPM, 250K TPM
+#   gemini-3-flash-preview:         10 RPM (lowest published flash cap)
+#   gemini-3.1-flash-lite-preview:  free, RPM unpublished — fall back to 10
+# Note: Free tier does NOT support gemini-3-pro / gemini-3.1-pro (paid only).
+# Exact per-project RPD/TPM is shown in AI Studio dashboard, not this comment.
+gemini-free:
+  api_key_env_var: "GEMINI_FT_API_KEY"
+  api_base_url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+  temperature: 1.0
+  max_tokens: 65536
+  context_window: 1000000  # 1M context
+  pricing_currency: "$"
+  rate_limit:
+    min_interval_seconds: 6.0  # 10 RPM = 60s / 10
+    max_requests_per_minute: 10
+  models:
+    gemini-2.5-flash-free:
+      id: "gemini-2.5-flash"
+      pricing: { input: 0.0, output: 0.0 }
+    gemini-2.5-flash-lite-free:
+      id: "gemini-2.5-flash-lite"
+      pricing: { input: 0.0, output: 0.0 }
+    gemini-3-flash-free:
+      id: "gemini-3-flash-preview"
+      pricing: { input: 0.0, output: 0.0 }
+    gemini-3.1-flash-lite-free:
+      id: "gemini-3.1-flash-lite-preview"
+      pricing: { input: 0.0, output: 0.0 }
+
+# kimi-volcengine: sunset by Volcengine (model id "kimi-k2-250905" returns 404
+# as of 2026-05-09; Moonshot's official K2 series sunset is 2026-05-25). Block
+# preserved as commented placeholder for K2.5 / K2.6 (tracked in #20).
+# kimi-volcengine:
+#   api_key_env_var: "KIMI_API_KEY_VOLC"
+#   api_base_url: *volcengine_endpoint
+#   temperature: 0.5
+#   max_tokens: 32000
+#   context_window: 128000
+#   pricing_currency: "¥"
+#   models:
+#     kimi-k2:
+#       id: "kimi-k2-250905"
+#       pricing: {input: 4.00, output: 16.00}
+
+# Alibaba Bailian (百炼) — same OpenAI-compatible endpoint as legacy DashScope.
+# Tiered pricing for qwen3-max above 32K input is tracked in #6.
+qwen:
+  api_key_env_var: "QWEN_API_KEY"
+  api_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+  temperature: 0.6
+  max_tokens: 32768
+  context_window: 995904
+  pricing_currency: "¥"
+  models:
+    qwen-turbo:
+      id: "qwen-turbo-latest"  # bare "qwen-turbo" returns 400; -latest alias works
+      pricing: {input: 0.30, output: 0.60}
+    qwen-plus:
+      id: "qwen-plus"
+      pricing: {input: 0.80, output: 2.00}  # thinking mode disabled by default
+    qwen3.5-plus:
+      id: "qwen3.5-plus"
+      pricing: {input: 0.80, output: 4.80}
+    qwen3-max-preview:
+      id: "qwen3-max-preview"
+      pricing: {input: 2.50, output: 10.00}  # ≤32K input tier
+    qwen3-max:
+      id: "qwen3-max"
+      pricing: {input: 2.50, output: 10.00}  # ≤32K input tier
+
+zhipu:
+  api_key_env_var: "ZHIPU_API_KEY"
+  api_base_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+  temperature: 0.6
+  max_tokens: 128000  # GLM-4.7 supports up to 128K output
+  context_window: 200000  # GLM-4.7 supports 200K context
+  pricing_currency: "$"
+  models:
+    glm-4.5:
+      id: "glm-4.5"
+      pricing: {input: 0.60, output: 2.20}
+    glm-4.6:
+      id: "glm-4.6"
+      pricing: {input: 0.60, output: 2.20}
+    glm-4.7:
+      id: "glm-4.7"
+      pricing: {input: 0.60, output: 2.20}
+    glm-5:
+      id: "glm-5"
+      pricing: {input: 0.60, output: 1.92}
+    glm-5.1:
+      id: "glm-5.1"
+      pricing: {input: 1.05, output: 3.50}
+
+zhipu-openrouter:
+  api_key_env_var: "ZHIPU_API_KEY_OPENROUTER"
+  api_base_url: *openrouter_endpoint
+  temperature: 0.6
+  # OpenRouter currently reports z-ai/glm-4.7 max_completion_tokens=131072.
+  # Keep this shared default below that limit to leave input context headroom
+  # across GLM variants while still allowing long-form outputs.
+  max_tokens: 65536
+  max_tokens_retry:
+    status_code: 404
+    body_contains: "no allowed providers"
+    max_tokens_limit: 8192
+  context_window: 202752  # OpenRouter z-ai routes report 202752, not 200000
+  pricing_currency: "$"
+  # OpenRouter official routing controls (pin to Z.AI route; no fallbacks)
+  request_overrides:
+    provider:
+      only: ["z-ai"]
+      allow_fallbacks: false
+  models:
+    glm-4.5-or:
+      id: "z-ai/glm-4.5"
+      pricing: {input: 0.38, output: 1.60}
+    glm-4.6-or:
+      id: "z-ai/glm-4.6"
+      pricing: {input: 0.39, output: 1.90}
+    glm-4.7-or:
+      id: "z-ai/glm-4.7"
+      pricing: {input: 0.40, output: 1.75}
+    glm-5-or:
+      id: "z-ai/glm-5"
+      pricing: {input: 0.60, output: 1.92}
+    glm-5.1-or:
+      id: "z-ai/glm-5.1"
+      pricing: {input: 1.05, output: 3.50}
+    glm-5-turbo-or:
+      id: "z-ai/glm-5-turbo"
+      pricing: {input: 1.20, output: 4.00}
+
+doubao:
+  api_key_env_var: "DOUBAO_API_KEY"
+  api_base_url: *volcengine_endpoint
+  temperature: 0.6
+  max_tokens: 32000
+  context_window: 256000
+  pricing_currency: "¥"
+  models:
+    doubao-seed-1.6:
+      id: "doubao-seed-1-6-250615"
+      pricing: {input: 0.80, output: 2.00}
+
+openai-openrouter:
+  api_key_env_var: "OPENAI_API_KEY_OPENROUTER"
+  api_base_url: *openrouter_endpoint
+  temperature: 0.6
+  max_tokens: 16384
+  context_window: 128000
+  pricing_currency: "$"
+  models:
+    gpt-4o-or:
+      id: "openai/gpt-4o"
+      pricing: {input: 2.5, output: 10.00}
+    gpt-4.1-or:
+      id: "openai/gpt-4.1"
+      pricing: {input: 2.00, output: 8.00}
+    gpt-5-or:
+      id: "openai/gpt-5"
+      pricing: {input: 1.25, output: 10.00}
+    gpt-5.2-or:
+      id: "openai/gpt-5.2"
+      pricing: {input: 1.75, output: 14.00}
+    gpt-5.4-or:
+      id: "openai/gpt-5.4"
+      pricing: {input: 2.50, output: 15.00}
+    gpt-5.5-or:
+      id: "openai/gpt-5.5"
+      pricing: {input: 5.00, output: 30.00}
+
+anthropic-openrouter:
+  api_key_env_var: "ANTHROPIC_API_KEY_OPENROUTER"
+  api_base_url: *openrouter_endpoint
+  temperature: 0.6
+  max_tokens: 64000
+  context_window: 200000
+  pricing_currency: "$"
+  # Example: per-provider rate limiting (optional, uses defaults if not specified)
+  rate_limit:
+    min_interval_seconds: 1.0  # Claude is expensive, slow down requests
+    max_requests_per_minute: 30
+  models:
+    claude-sonnet-4-or:
+      id: "anthropic/claude-sonnet-4"
+      pricing: {input: 3.00, output: 15.00}
+    claude-opus-4.6-or:
+      id: "anthropic/claude-opus-4.6"
+      pricing: {input: 5.00, output: 25.00}
+    claude-sonnet-4.6-or:
+      id: "anthropic/claude-sonnet-4.6"
+      pricing: {input: 3.00, output: 15.00}
+    claude-opus-4.7-or:
+      id: "anthropic/claude-opus-4.7"
+      pricing: {input: 5.00, output: 25.00}
+    claude-haiku-4.5-or:
+      id: "anthropic/claude-haiku-4.5"
+      pricing: {input: 1.00, output: 5.00}
