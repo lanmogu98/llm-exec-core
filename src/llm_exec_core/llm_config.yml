@@ -13,8 +13,8 @@
 #    - rate_limit (optional): per-provider rate limiting configuration
 #        - min_interval_seconds: minimum time between requests (default: 0.5)
 #        - max_requests_per_minute: max requests per minute, 0 = unlimited (default: 60)
-#   
-#   In default, and as a highly recommend practice, the API key of each model is 
+#
+#   In default, and as a highly recommend practice, the API key of each model is
 #   stored in the environment variable.
 
 #-------------------------------------------------------------------------------
