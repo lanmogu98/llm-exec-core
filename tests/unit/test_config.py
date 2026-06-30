@@ -1,3 +1,4 @@
+from llm_exec_core.client import LLMClient
 from llm_exec_core.config import (
     get_model_details,
     get_supported_models,
@@ -122,3 +123,35 @@ def test_load_all_settings_accepts_path(tmp_path):
 
     assert set(settings.keys()) == {"test-provider"}
     assert list(settings["test-provider"].models.keys()) == ["test-model"]
+
+
+def test_default_settings_cache_returns_isolated_objects(monkeypatch):
+    first = load_all_settings()
+    provider_name = next(iter(first))
+    provider_settings = first[provider_name]
+    model_name = next(iter(provider_settings.models))
+    model_details = provider_settings.models[model_name]
+
+    original_api_base_url = provider_settings.api_base_url
+    original_model_id = model_details.id
+    original_input_price = model_details.pricing.input
+
+    monkeypatch.setenv(provider_settings.api_key_env_var, "test-key")
+
+    provider_settings.api_base_url = "https://mutated.invalid/v1"
+    model_details.id = "mutated-model-id"
+    model_details.pricing.input = 999.0
+
+    second = load_all_settings()
+    second_provider = second[provider_name]
+    second_model = second_provider.models[model_name]
+
+    assert second_provider.api_base_url == original_api_base_url
+    assert second_model.id == original_model_id
+    assert second_model.pricing.input == original_input_price
+
+    client = LLMClient(model_name)
+
+    assert client.api_url == original_api_base_url
+    assert client.model == original_model_id
+    assert client.pricing.input == original_input_price

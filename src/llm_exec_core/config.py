@@ -68,6 +68,15 @@ def _build_settings(
     }
 
 
+def _clone_settings(
+    settings: Dict[str, ProviderSettings],
+) -> Dict[str, ProviderSettings]:
+    return {
+        provider_name: provider_settings.model_copy(deep=True)
+        for provider_name, provider_settings in settings.items()
+    }
+
+
 def load_all_settings(
     config_source: Path | Dict[str, Any] | None = None,
 ) -> Dict[str, ProviderSettings]:
@@ -76,7 +85,7 @@ def load_all_settings(
     if config_source is None:
         if _DEFAULT_PROVIDER_SETTINGS is None:
             _DEFAULT_PROVIDER_SETTINGS = _build_settings(None)
-        return _DEFAULT_PROVIDER_SETTINGS
+        return _clone_settings(_DEFAULT_PROVIDER_SETTINGS)
 
     return _build_settings(config_source)
 

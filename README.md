@@ -1,6 +1,8 @@
 # llm-exec-core
 
-Shared LLM execution package extracted from Editor Assistant.
+`llm-exec-core` is a small Python package for async LLM execution, shared
+provider/model catalog loading, streaming assembly, and typed usage/result
+objects.
 
 It provides:
 
@@ -8,4 +10,19 @@ It provides:
 - `llm_exec_core/llm_config.yml` as the shared model catalog
 - typed result and usage objects for legacy and new call sites
 
-This repo is currently consumed from sibling checkouts during the migration branch. After publish, downstream apps can depend on the released `llm-exec-core` package directly.
+## Install
+
+```bash
+uv add llm-exec-core
+```
+
+## Basic usage
+
+```python
+from llm_exec_core.client import LLMClient
+
+client = LLMClient("your-model-name")
+```
+
+This repo is also used for coordinated local development with sibling
+checkouts during the current extraction/migration work.
