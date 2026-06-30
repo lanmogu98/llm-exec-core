@@ -1,4 +1,4 @@
-"""Provider-agnostic LLM execution core."""
+"""OpenAI-compatible LLM execution core."""
 
 from .client import LLMClient
 from .types import ExecutionMetadata, LLMResult, TokenUsage
