@@ -12,7 +12,7 @@ license = "LicenseRef-Proprietary"
 authors = [{ name = "mogu" }]
 dependencies = [
     "httpx>=0.25.0",
-    "pydantic",
+    "pydantic>=2",
     "pyyaml",
 ]
 
