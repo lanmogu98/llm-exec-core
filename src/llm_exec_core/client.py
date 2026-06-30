@@ -143,6 +143,7 @@ class LLMClient:
         self.pricing = model_details.pricing
         self.pricing_currency = provider_settings.pricing_currency
         self.temperature = provider_settings.temperature
+        self.max_tokens_retry = provider_settings.max_tokens_retry
 
         self.api_url = provider_settings.api_base_url
         self.headers = {
@@ -377,27 +378,25 @@ class LLMClient:
                     body = ""
 
                 status_code = e.response.status_code
-                provider = data.get("provider", {})
-                is_pinned_openrouter = (
-                    "openrouter.ai" in self.api_url
-                    and isinstance(provider, dict)
-                    and provider.get("allow_fallbacks") is False
+                retry_policy = self.max_tokens_retry
+                should_lower_max_tokens = (
+                    retry_policy is not None
+                    and status_code == retry_policy.status_code
+                    and retry_policy.body_contains.lower() in body.lower()
+                    and isinstance(data.get("max_tokens"), int)
+                    and data["max_tokens"] > retry_policy.max_tokens_limit
                 )
-
                 if status_code == 429:
                     logger.warning(
                         "Rate limit exceeded (429), retrying in %s seconds...",
                         retry_delay,
                     )
-                elif (
-                    status_code == 404
-                    and is_pinned_openrouter
-                    and "no allowed providers" in body.lower()
-                    and isinstance(data.get("max_tokens"), int)
-                    and data["max_tokens"] > 8192
-                ):
+                elif should_lower_max_tokens and retry_policy is not None:
                     old_max = data["max_tokens"]
-                    data["max_tokens"] = max(1024, min(8192, old_max // 2))
+                    data["max_tokens"] = max(
+                        1024,
+                        min(retry_policy.max_tokens_limit, old_max // 2),
+                    )
                     logger.warning(
                         "HTTP error 404; lowering max_tokens %s -> %s "
                         "and retrying...",

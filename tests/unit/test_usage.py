@@ -37,3 +37,21 @@ def test_format_usage_report_returns_text_without_writing_file():
     assert "Model: provider-model-id (test-model)" in report
     assert "Total Tokens: 30" in report
     assert "Request 1: brief" in report
+
+
+def test_format_usage_report_uses_placeholder_without_timestamp():
+    report = format_usage_report(
+        project_name="Test Project",
+        model="provider-model-id",
+        model_name="test-model",
+        pricing_currency="$",
+        token_usage={
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "requests": [],
+            "process_times": {"total_time": 0},
+            "cost": {"input_cost": 0, "output_cost": 0, "total_cost": 0},
+        },
+    )
+
+    assert "Generated on: N/A" in report

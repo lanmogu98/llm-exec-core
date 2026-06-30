@@ -22,6 +22,12 @@ class RateLimitSettings(BaseModel):
     max_requests_per_minute: int = 60
 
 
+class MaxTokensRetrySettings(BaseModel):
+    status_code: int
+    body_contains: str
+    max_tokens_limit: int
+
+
 class ProviderSettings(BaseModel):
     api_key_env_var: str
     api_base_url: str
@@ -31,6 +37,7 @@ class ProviderSettings(BaseModel):
     pricing_currency: str
     models: Dict[str, ModelDetails]
     request_overrides: Optional[Dict[str, Any]] = None
+    max_tokens_retry: Optional[MaxTokensRetrySettings] = None
     rate_limit: Optional[RateLimitSettings] = None
 
 

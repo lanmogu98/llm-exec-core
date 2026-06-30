@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from typing import Any, Dict
 
 
@@ -30,7 +29,7 @@ def format_usage_report(
 ) -> str:
     """Return the human-readable token usage report as text only."""
 
-    generated_at = timestamp or time.strftime("%Y-%m-%d %H:%M:%S")
+    generated_at = timestamp or "N/A"
     total_input_tokens = _as_int(token_usage.get("total_input_tokens"))
     total_output_tokens = _as_int(token_usage.get("total_output_tokens"))
     total_tokens = total_input_tokens + total_output_tokens

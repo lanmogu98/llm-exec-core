@@ -26,3 +26,7 @@ client = LLMClient("your-model-name")
 
 This repo is also used for coordinated local development with sibling
 checkouts during the current extraction/migration work.
+
+## License
+
+Proprietary. See [LICENSE](LICENSE).

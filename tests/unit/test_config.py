@@ -45,6 +45,29 @@ def test_get_model_details_returns_provider_name_settings_and_model():
     assert model_details.id == "provider-model-id"
 
 
+def test_provider_settings_accepts_configured_max_tokens_retry_policy():
+    config = {
+        "test-provider": {
+            **CUSTOM_CONFIG["test-provider"],
+            "max_tokens_retry": {
+                "status_code": 404,
+                "body_contains": "no allowed providers",
+                "max_tokens_limit": 8192,
+            },
+        }
+    }
+
+    _, provider_settings, _ = get_model_details("test-model", config)
+
+    assert provider_settings.max_tokens_retry is not None
+    assert provider_settings.max_tokens_retry.status_code == 404
+    assert (
+        provider_settings.max_tokens_retry.body_contains
+        == "no allowed providers"
+    )
+    assert provider_settings.max_tokens_retry.max_tokens_limit == 8192
+
+
 def test_explicit_config_source_is_not_polluted_by_default_cache():
     get_supported_models()
 

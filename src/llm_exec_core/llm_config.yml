@@ -199,6 +199,10 @@ zhipu-openrouter:
   # Keep this shared default below that limit to leave input context headroom
   # across GLM variants while still allowing long-form outputs.
   max_tokens: 65536
+  max_tokens_retry:
+    status_code: 404
+    body_contains: "no allowed providers"
+    max_tokens_limit: 8192
   context_window: 202752  # OpenRouter z-ai routes report 202752, not 200000
   pricing_currency: "$"
   # OpenRouter official routing controls (pin to Z.AI route; no fallbacks)
