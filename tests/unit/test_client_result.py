@@ -125,7 +125,13 @@ async def test_generate_response_legacy_tuple_preserves_duration(
     }
     mock_response.raise_for_status = MagicMock()
 
-    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+    with (
+        patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls,
+        patch(
+            "llm_exec_core.client.time.time",
+            side_effect=[100.0, 100.0, 101.5],
+        ),
+    ):
         mock_httpx_client = AsyncMock()
         mock_httpx_client.post.return_value = mock_response
         mock_cls.return_value = mock_httpx_client
@@ -133,7 +139,7 @@ async def test_generate_response_legacy_tuple_preserves_duration(
         client = LLMClient("test-model", config_source=config)
         _, usage = await client.generate_response("Hello")
 
-    assert usage["process_times"]["total_time"] >= 0
+    assert usage["process_times"]["total_time"] == 1.5
     assert usage["metadata"]["provider_name"] == "test-provider"
     assert usage["metadata"]["request_id"] is None
     assert usage["metadata"]["run_id"] is None

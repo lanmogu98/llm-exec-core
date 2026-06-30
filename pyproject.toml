@@ -5,6 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "llm-exec-core"
 version = "0.1.0"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.25.0",
