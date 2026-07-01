@@ -9,9 +9,10 @@ import logging
 import os
 import time
 from collections import OrderedDict, deque
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import httpx
 
@@ -32,6 +33,8 @@ from .types import ExecutionMetadata, LLMResult, TokenUsage
 
 logger = logging.getLogger(__name__)
 
+_PROTECTED_REQUEST_FIELDS = {"model", "messages", "stream"}
+
 
 class ResponseCache:
     """LRU cache for LLM responses with TTL support."""
@@ -43,14 +46,18 @@ class ResponseCache:
         self._hits = 0
         self._misses = 0
 
-    def _make_key(self, prompt: str, model: str) -> str:
-        """Create a cache key from prompt and model."""
-        content = f"{model}:{prompt}"
+    def _make_key(self, request_payload: Mapping[str, Any]) -> str:
+        """Create a cache key from a deterministic request payload."""
+        content = json.dumps(
+            request_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         return hashlib.sha256(content.encode()).hexdigest()
 
-    def get(self, prompt: str, model: str) -> Optional[str]:
+    def get(self, request_payload: Mapping[str, Any]) -> Optional[str]:
         """Get cached response if exists and not expired."""
-        key = self._make_key(prompt, model)
+        key = self._make_key(request_payload)
 
         if key not in self._cache:
             self._misses += 1
@@ -70,9 +77,9 @@ class ResponseCache:
         self._hits += 1
         return response
 
-    def set(self, prompt: str, model: str, response: str) -> None:
+    def set(self, request_payload: Mapping[str, Any], response: str) -> None:
         """Store response in cache."""
-        key = self._make_key(prompt, model)
+        key = self._make_key(request_payload)
 
         if len(self._cache) >= self._max_size:
             self._cache.popitem(last=False)
@@ -254,6 +261,111 @@ class LLMClient:
         self._last_request_time = current_time
         self._request_timestamps.append(current_time)
 
+    def _normalize_request_options(
+        self,
+        options: Mapping[str, Any] | None,
+    ) -> Dict[str, Any]:
+        if not options:
+            return {}
+
+        normalized: Dict[str, Any] = {}
+        if "extra_body" in options:
+            extra_body = options["extra_body"]
+            if isinstance(extra_body, Mapping):
+                normalized.update(deepcopy(dict(extra_body)))
+            else:
+                normalized["extra_body"] = deepcopy(extra_body)
+
+        for key, value in options.items():
+            if key == "extra_body":
+                continue
+            normalized[key] = deepcopy(value)
+
+        return normalized
+
+    def _validate_no_protected_fields(
+        self,
+        options: Mapping[str, Any],
+        source: str,
+    ) -> None:
+        protected = _PROTECTED_REQUEST_FIELDS.intersection(options)
+        if protected:
+            field_list = ", ".join(sorted(protected))
+            raise ValueError(f"{field_list} is a protected {source} field.")
+
+    def _merge_stream_options(
+        self,
+        provider_stream_options: Any,
+        request_stream_options: Any,
+    ) -> Any:
+        if provider_stream_options is None:
+            return deepcopy(request_stream_options)
+        if request_stream_options is None:
+            return deepcopy(provider_stream_options)
+        if isinstance(provider_stream_options, Mapping) and isinstance(
+            request_stream_options, Mapping
+        ):
+            merged = deepcopy(dict(provider_stream_options))
+            merged.update(deepcopy(dict(request_stream_options)))
+            return merged
+        return deepcopy(request_stream_options)
+
+    def _build_request_payload(
+        self,
+        prompt: str,
+        stream: bool,
+        request_options: Mapping[str, Any] | None,
+    ) -> Dict[str, Any]:
+        provider_options = self._normalize_request_options(
+            self.request_overrides
+        )
+        per_call_options = self._normalize_request_options(request_options)
+
+        self._validate_no_protected_fields(
+            provider_options, "provider request override"
+        )
+        self._validate_no_protected_fields(per_call_options, "request option")
+
+        provider_stream_options = provider_options.pop("stream_options", None)
+        request_stream_options = per_call_options.pop("stream_options", None)
+        stream_options = self._merge_stream_options(
+            provider_stream_options, request_stream_options
+        )
+
+        has_explicit_max_tokens = (
+            "max_tokens" in provider_options
+            or "max_tokens" in per_call_options
+        )
+        has_max_completion_tokens = (
+            "max_completion_tokens" in provider_options
+            or "max_completion_tokens" in per_call_options
+        )
+
+        data: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature,
+            "stream": stream,
+        }
+        if not has_max_completion_tokens or has_explicit_max_tokens:
+            data["max_tokens"] = self.max_tokens
+
+        data.update(provider_options)
+        data.update(per_call_options)
+
+        if stream_options is not None:
+            data["stream_options"] = stream_options
+        if stream:
+            existing_stream_options = data.get("stream_options")
+            if existing_stream_options is None:
+                data["stream_options"] = {"include_usage": True}
+            elif isinstance(existing_stream_options, Mapping):
+                merged_stream_options = deepcopy(dict(existing_stream_options))
+                merged_stream_options.setdefault("include_usage", True)
+                data["stream_options"] = merged_stream_options
+
+        return data
+
     async def generate(
         self,
         prompt: str,
@@ -264,13 +376,16 @@ class LLMClient:
         trace_context: Optional[Dict[str, Any]] = None,
         run_id: str | None = None,
         request_id: str | None = None,
+        *,
+        request_options: Mapping[str, Any] | None = None,
     ) -> LLMResult:
         """Generate a structured LLM result."""
         started_at = datetime.now()
         start_time = time.time()
+        data = self._build_request_payload(prompt, stream, request_options)
 
-        if self._cache_enabled:
-            cached_response = self._cache.get(prompt, self.model)
+        if self._cache_enabled and not stream:
+            cached_response = self._cache.get(data)
             if cached_response is not None:
                 logger.info("Cache hit for %s", request_name)
                 finished_at = datetime.now()
@@ -302,18 +417,6 @@ class LLMClient:
 
         await self._wait_for_rate_limit()
 
-        data = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "stream": stream,
-            **self.request_overrides,
-        }
-
-        if stream:
-            data["stream_options"] = {"include_usage": True}
-
         retry_delay = INITIAL_RETRY_DELAY_SECONDS
         client = await self._get_client()
 
@@ -332,8 +435,8 @@ class LLMClient:
                     )
                     response_text, legacy_usage = legacy_result
 
-                if self._cache_enabled:
-                    self._cache.set(prompt, self.model, response_text)
+                if self._cache_enabled and not stream:
+                    self._cache.set(data, response_text)
 
                 finished_at = datetime.now()
                 result = LLMResult(
@@ -421,6 +524,8 @@ class LLMClient:
         request_name: str = "unnamed_request",
         stream: bool = False,
         stream_callback: Optional[Callable[[str], None]] = None,
+        *,
+        request_options: Mapping[str, Any] | None = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Generate a response using the LLM API (Async).
@@ -441,6 +546,7 @@ class LLMClient:
             request_name=request_name,
             stream=stream,
             stream_callback=stream_callback,
+            request_options=request_options,
         )
         return result.to_legacy_tuple()
 

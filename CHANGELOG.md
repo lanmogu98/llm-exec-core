@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0
+
+### Added
+
+- Add per-call `request_options` for OpenAI-compatible Chat Completions
+  payload fields, including structured output request formats, tool request
+  pass-through, sampling controls, routing options, and stream options.
+- Cache non-streaming responses by deterministic request payload instead of
+  only model and prompt, and bypass response cache for streaming calls.
+
 ## 0.1.0
 
 ### Added

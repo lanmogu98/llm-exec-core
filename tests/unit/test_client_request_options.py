@@ -1,0 +1,346 @@
+from contextlib import asynccontextmanager
+from copy import deepcopy
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from llm_exec_core.client import LLMClient
+
+
+def _config(request_overrides=None, max_tokens=128):
+    provider_config = {
+        "api_key_env_var": "TEST_API_KEY",
+        "api_base_url": "https://example.invalid/chat/completions",
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+        "context_window": 4096,
+        "pricing_currency": "$",
+        "models": {
+            "test-model": {
+                "id": "provider-model-id",
+                "pricing": {"input": 1.0, "output": 2.0},
+            }
+        },
+    }
+    if request_overrides is not None:
+        provider_config["request_overrides"] = request_overrides
+    return {"test-provider": provider_config}
+
+
+def _success_response(content="ok"):
+    response = MagicMock()
+    response.json.return_value = {
+        "choices": [{"message": {"content": content}}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 6},
+    }
+    response.raise_for_status = MagicMock()
+    return response
+
+
+def _disable_rate_limit(client):
+    client._min_interval = 0
+
+
+@pytest.mark.asyncio
+async def test_generate_merges_request_options_into_payload_without_mutation(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    provider_overrides = {
+        "top_p": 0.7,
+        "provider": {"only": ["z-ai"], "allow_fallbacks": False},
+        "extra_body": {
+            "enable_search": False,
+            "provider_flag": "from-config",
+        },
+    }
+    request_options = {
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "strict": True,
+                "schema": {"type": "object"},
+            },
+        },
+        "top_p": 0.2,
+        "extra_body": {
+            "enable_search": True,
+            "top_p": 0.3,
+            "extra_body": {
+                "google": {"thinking_config": {"thinking_budget": 1024}}
+            },
+        },
+    }
+    original_provider_overrides = deepcopy(provider_overrides)
+    original_request_options = deepcopy(request_options)
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(request_overrides=provider_overrides),
+        )
+        await client.generate("Hello", request_options=request_options)
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert payload == {
+        "model": "provider-model-id",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": 0.1,
+        "max_tokens": 128,
+        "stream": False,
+        "provider": {"only": ["z-ai"], "allow_fallbacks": False},
+        "provider_flag": "from-config",
+        "enable_search": True,
+        "response_format": request_options["response_format"],
+        "top_p": 0.2,
+        "extra_body": {
+            "google": {"thinking_config": {"thinking_budget": 1024}}
+        },
+    }
+    assert provider_overrides == original_provider_overrides
+    assert request_options == original_request_options
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "request_options",
+    [
+        {"model": "other-model"},
+        {"messages": [{"role": "user", "content": "override"}]},
+        {"stream": True},
+        {"extra_body": {"model": "other-model"}},
+        {"extra_body": {"messages": []}},
+        {"extra_body": {"stream": True}},
+    ],
+)
+async def test_generate_rejects_protected_request_option_fields(
+    monkeypatch,
+    request_options,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    client = LLMClient("test-model", config_source=_config())
+
+    with pytest.raises(ValueError, match="protected request option"):
+        await client.generate("Hello", request_options=request_options)
+
+
+@pytest.mark.asyncio
+async def test_generate_rejects_protected_provider_request_overrides(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    client = LLMClient(
+        "test-model",
+        config_source=_config(request_overrides={"stream": True}),
+    )
+
+    with pytest.raises(
+        ValueError, match="protected provider request override"
+    ):
+        await client.generate("Hello")
+
+
+@pytest.mark.asyncio
+async def test_max_completion_tokens_suppresses_core_default_max_tokens(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient("test-model", config_source=_config(max_tokens=128))
+        await client.generate(
+            "Hello",
+            request_options={"max_completion_tokens": 512},
+        )
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert payload["max_completion_tokens"] == 512
+    assert "max_tokens" not in payload
+
+
+@pytest.mark.asyncio
+async def test_explicit_max_tokens_survives_with_max_completion_tokens(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                request_overrides={"max_completion_tokens": 1024}
+            ),
+        )
+        await client.generate("Hello", request_options={"max_tokens": 64})
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert payload["max_completion_tokens"] == 1024
+    assert payload["max_tokens"] == 64
+
+
+@pytest.mark.asyncio
+async def test_generate_response_accepts_request_options(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient("test-model", config_source=_config())
+        response, _ = await client.generate_response(
+            "Hello",
+            request_options={"top_p": 0.4},
+        )
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert response == "ok"
+    assert payload["top_p"] == 0.4
+
+
+@pytest.mark.asyncio
+async def test_cache_key_includes_request_options(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.side_effect = [
+            _success_response("schema-a"),
+            _success_response("schema-b"),
+        ]
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient("test-model", config_source=_config())
+        _disable_rate_limit(client)
+        client._cache_enabled = True
+
+        first = await client.generate(
+            "Hello",
+            request_options={"response_format": {"type": "json_object"}},
+        )
+        second = await client.generate(
+            "Hello",
+            request_options={"top_p": 0.2},
+        )
+
+    assert first.text == "schema-a"
+    assert second.text == "schema-b"
+    assert mock_httpx_client.post.await_count == 2
+    assert client.get_cache_stats()["misses"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cache_key_excludes_non_request_metadata(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response("cached")
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient("test-model", config_source=_config())
+        _disable_rate_limit(client)
+        client._cache_enabled = True
+
+        first = await client.generate(
+            "Hello",
+            request_name="first",
+            request_id="req-1",
+            run_id="run-1",
+            trace_context={"attempt": 1},
+            request_options={"top_p": 0.2},
+        )
+        second = await client.generate(
+            "Hello",
+            request_name="second",
+            request_id="req-2",
+            run_id="run-2",
+            trace_context={"attempt": 2},
+            request_options={"top_p": 0.2},
+        )
+
+    assert first.text == "cached"
+    assert second.text == "cached"
+    assert mock_httpx_client.post.await_count == 1
+    assert client.get_cache_stats()["hits"] == 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_merges_stream_options_and_bypasses_cache(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    payloads = []
+
+    async def mock_lines():
+        yield 'data: {"choices": [{"delta": {"content": "A"}}]}'
+        yield 'data: {"usage": {"prompt_tokens": 5, "completion_tokens": 6}}'
+        yield "data: [DONE]"
+
+    @asynccontextmanager
+    async def mock_stream(*args, **kwargs):
+        payloads.append(kwargs["json"])
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.aiter_lines = mock_lines
+        yield response
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.stream = mock_stream
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                request_overrides={
+                    "stream_options": {
+                        "provider_trace": True,
+                        "include_usage": True,
+                    }
+                }
+            ),
+        )
+        _disable_rate_limit(client)
+        client._cache_enabled = True
+
+        first = await client.generate_response(
+            "Hello",
+            stream=True,
+            request_options={
+                "stream_options": {"include_usage": False, "chunk_size": 1}
+            },
+        )
+        second = await client.generate_response(
+            "Hello",
+            stream=True,
+            request_options={
+                "stream_options": {"include_usage": False, "chunk_size": 1}
+            },
+        )
+
+    assert first[0] == "A"
+    assert second[0] == "A"
+    assert len(payloads) == 2
+    assert payloads[0]["stream_options"] == {
+        "provider_trace": True,
+        "include_usage": False,
+        "chunk_size": 1,
+    }
+    assert client.get_cache_stats()["hits"] == 0
+    assert client.get_cache_stats()["misses"] == 0
