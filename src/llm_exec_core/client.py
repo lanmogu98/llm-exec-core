@@ -504,12 +504,7 @@ class LLMClient:
                     and isinstance(data.get("max_tokens"), int)
                     and data["max_tokens"] > retry_policy.max_tokens_limit
                 )
-                if status_code == 429:
-                    logger.warning(
-                        "Rate limit exceeded (429), retrying in %s seconds...",
-                        retry_delay,
-                    )
-                elif should_lower_max_tokens and retry_policy is not None:
+                if should_lower_max_tokens and retry_policy is not None:
                     old_max = data["max_tokens"]
                     data["max_tokens"] = min(
                         retry_policy.max_tokens_limit,
@@ -520,6 +515,11 @@ class LLMClient:
                         "and retrying...",
                         old_max,
                         data["max_tokens"],
+                    )
+                elif status_code == 429:
+                    logger.warning(
+                        "Rate limit exceeded (429), retrying in %s seconds...",
+                        retry_delay,
                     )
                 else:
                     logger.warning("HTTP error %s, retrying...", status_code)
