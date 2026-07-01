@@ -34,6 +34,7 @@ from .types import ExecutionMetadata, LLMResult, TokenUsage
 logger = logging.getLogger(__name__)
 
 _PROTECTED_REQUEST_FIELDS = {"model", "messages", "stream"}
+_MISSING = object()
 
 
 class ResponseCache:
@@ -298,10 +299,12 @@ class LLMClient:
         provider_stream_options: Any,
         request_stream_options: Any,
     ) -> Any:
-        if provider_stream_options is None:
-            return deepcopy(request_stream_options)
-        if request_stream_options is None:
+        if request_stream_options is _MISSING:
+            if provider_stream_options is _MISSING:
+                return _MISSING
             return deepcopy(provider_stream_options)
+        if provider_stream_options is _MISSING:
+            return deepcopy(request_stream_options)
         if isinstance(provider_stream_options, Mapping) and isinstance(
             request_stream_options, Mapping
         ):
@@ -334,8 +337,12 @@ class LLMClient:
         )
         self._validate_no_protected_fields(per_call_options, "request option")
 
-        provider_stream_options = provider_options.pop("stream_options", None)
-        request_stream_options = per_call_options.pop("stream_options", None)
+        provider_stream_options = provider_options.pop(
+            "stream_options", _MISSING
+        )
+        request_stream_options = per_call_options.pop(
+            "stream_options", _MISSING
+        )
         stream_options = self._merge_stream_options(
             provider_stream_options, request_stream_options
         )
@@ -361,11 +368,11 @@ class LLMClient:
         data.update(provider_options)
         data.update(per_call_options)
 
-        if stream_options is not None:
+        if stream_options is not _MISSING:
             data["stream_options"] = stream_options
         if stream:
-            existing_stream_options = data.get("stream_options")
-            if existing_stream_options is None:
+            existing_stream_options = data.get("stream_options", _MISSING)
+            if existing_stream_options is _MISSING:
                 data["stream_options"] = {"include_usage": True}
             elif isinstance(existing_stream_options, Mapping):
                 merged_stream_options = deepcopy(dict(existing_stream_options))

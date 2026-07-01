@@ -367,3 +367,34 @@ async def test_streaming_merges_stream_options_and_bypasses_cache(monkeypatch):
     }
     assert client.get_cache_stats()["hits"] == 0
     assert client.get_cache_stats()["misses"] == 0
+
+
+@pytest.mark.asyncio
+async def test_request_stream_options_none_overrides_provider_options(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                request_overrides={
+                    "stream_options": {
+                        "include_usage": True,
+                        "provider_trace": True,
+                    }
+                }
+            ),
+        )
+        await client.generate(
+            "Hello", request_options={"stream_options": None}
+        )
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert payload["stream_options"] is None
