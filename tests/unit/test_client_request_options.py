@@ -312,6 +312,10 @@ async def test_streaming_merges_stream_options_and_bypasses_cache(monkeypatch):
                     "stream_options": {
                         "provider_trace": True,
                         "include_usage": True,
+                        "nested": {
+                            "provider_value": "kept",
+                            "override_value": "provider",
+                        },
                     }
                 }
             ),
@@ -323,14 +327,28 @@ async def test_streaming_merges_stream_options_and_bypasses_cache(monkeypatch):
             "Hello",
             stream=True,
             request_options={
-                "stream_options": {"include_usage": False, "chunk_size": 1}
+                "stream_options": {
+                    "include_usage": False,
+                    "chunk_size": 1,
+                    "nested": {
+                        "override_value": "request",
+                        "request_value": "added",
+                    },
+                }
             },
         )
         second = await client.generate_response(
             "Hello",
             stream=True,
             request_options={
-                "stream_options": {"include_usage": False, "chunk_size": 1}
+                "stream_options": {
+                    "include_usage": False,
+                    "chunk_size": 1,
+                    "nested": {
+                        "override_value": "request",
+                        "request_value": "added",
+                    },
+                }
             },
         )
 
@@ -341,6 +359,11 @@ async def test_streaming_merges_stream_options_and_bypasses_cache(monkeypatch):
         "provider_trace": True,
         "include_usage": False,
         "chunk_size": 1,
+        "nested": {
+            "provider_value": "kept",
+            "override_value": "request",
+            "request_value": "added",
+        },
     }
     assert client.get_cache_stats()["hits"] == 0
     assert client.get_cache_stats()["misses"] == 0

@@ -306,7 +306,15 @@ class LLMClient:
             request_stream_options, Mapping
         ):
             merged = deepcopy(dict(provider_stream_options))
-            merged.update(deepcopy(dict(request_stream_options)))
+            for key, value in request_stream_options.items():
+                if isinstance(merged.get(key), Mapping) and isinstance(
+                    value, Mapping
+                ):
+                    merged[key] = self._merge_stream_options(
+                        merged[key], value
+                    )
+                else:
+                    merged[key] = deepcopy(value)
             return merged
         return deepcopy(request_stream_options)
 
@@ -496,9 +504,9 @@ class LLMClient:
                     )
                 elif should_lower_max_tokens and retry_policy is not None:
                     old_max = data["max_tokens"]
-                    data["max_tokens"] = max(
-                        1024,
-                        min(retry_policy.max_tokens_limit, old_max // 2),
+                    data["max_tokens"] = min(
+                        retry_policy.max_tokens_limit,
+                        max(1, old_max // 2),
                     )
                     logger.warning(
                         "HTTP error 404; lowering max_tokens %s -> %s "
@@ -535,6 +543,7 @@ class LLMClient:
             request_name: Name of the request for token tracking
             stream: If True, stream the response
             stream_callback: Optional callback for streaming chunks.
+            request_options: Per-call Chat Completions request payload fields.
 
         Returns:
             Tuple containing:
