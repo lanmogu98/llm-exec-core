@@ -402,6 +402,49 @@ async def test_cache_key_uses_normalized_extra_body(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cache_key_preserves_nested_raw_extra_body(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.side_effect = [
+            _success_response("budget-64"),
+            _success_response("budget-128"),
+        ]
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient("test-model", config_source=_config())
+        _disable_rate_limit(client)
+        client._cache_enabled = True
+
+        first = await client.generate(
+            "Hello",
+            request_options={
+                "extra_body": {
+                    "extra_body": {
+                        "google": {"thinking_config": {"thinking_budget": 64}}
+                    }
+                }
+            },
+        )
+        second = await client.generate(
+            "Hello",
+            request_options={
+                "extra_body": {
+                    "extra_body": {
+                        "google": {"thinking_config": {"thinking_budget": 128}}
+                    }
+                }
+            },
+        )
+
+    assert first.text == "budget-64"
+    assert second.text == "budget-128"
+    assert mock_httpx_client.post.await_count == 2
+    assert client.get_cache_stats()["misses"] == 2
+
+
+@pytest.mark.asyncio
 async def test_cache_key_excludes_non_request_metadata(monkeypatch):
     monkeypatch.setenv("TEST_API_KEY", "test-key")
 
