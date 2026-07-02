@@ -276,8 +276,10 @@ async def test_generate_retry_never_increases_existing_max_tokens(
 @pytest.mark.asyncio
 async def test_generate_lowers_max_tokens_before_generic_429_retry(
     monkeypatch,
+    caplog,
 ):
     monkeypatch.setenv("TEST_API_KEY", "test-key")
+    caplog.set_level("WARNING", logger="llm_exec_core.client")
     config = {
         "test-provider": {
             "api_key_env_var": "TEST_API_KEY",
@@ -334,3 +336,4 @@ async def test_generate_lowers_max_tokens_before_generic_429_retry(
 
     assert result.text == "ok"
     assert [payload["max_tokens"] for payload in payloads] == [65536, 8192]
+    assert "HTTP error 429; lowering max_tokens 65536 -> 8192" in caplog.text

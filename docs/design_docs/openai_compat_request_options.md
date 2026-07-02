@@ -11,15 +11,28 @@ responses, or add runtime provider capability filtering.
 
 ## Provider Status
 
-| Provider / route | Structured output status | Notes |
-| --- | --- | --- |
-| OpenAI Chat Completions | Supports strict `response_format.type=json_schema`; JSON mode remains separate. | Also supports common tool and sampling fields. |
-| Gemini OpenAI compatibility | SDK helpers document structured output through `response_format`; direct raw REST support should be probe-tested per model. | Provider raw fields can be sent through SDK-style `extra_body`. |
-| DeepSeek official | Documents JSON mode, not strict response JSON Schema. | Tool parameters can still use JSON Schema. |
-| DashScope / Qwen OpenAI-compatible mode | No documented `response_format` field in the checked compatibility table. | Common controls and `extra_body.enable_search` can pass through. |
-| Zhipu / GLM | Documents JSON mode, not strict response JSON Schema. | Some controls are provider-specific. |
-| OpenRouter | Supports structured outputs for compatible model/provider routes. | Support varies by routed model; routing objects pass through. |
-| Volcengine Ark | OpenAI-compatible API exists, but detailed option support needs a live probe or clearer official table. | Treat as probe-required. |
+Provider research as of 2026-06-30:
+
+| Provider / route | Structured output support | Tools support | Common request controls worth transporting | Evidence / notes |
+| --- | --- | --- | --- | --- |
+| OpenAI Chat Completions | `response_format.type=json_schema` with `json_schema.strict=true` for Structured Outputs; `response_format.type=json_object` is older JSON mode and guarantees valid JSON, not schema adherence. | `tools`, `tool_choice`, `parallel_tool_calls`. | `temperature`, `top_p`, preferred `max_completion_tokens`, legacy/deprecated `max_tokens`, `stream`, `stream_options`, `stop`, `seed`, `logprobs`, `top_logprobs`, penalties. | https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create and https://developers.openai.com/api/docs/guides/structured-outputs |
+| Gemini OpenAI compatibility | OpenAI SDK `parse()` helpers document structured output via `response_format`; direct raw REST `chat.completions.create(response_format={...})` should be probe-tested before treating it as generic payload support. | `tools`, `tool_choice="auto"`. | `stream`, `reasoning_effort`, provider-specific raw top-level `extra_body` fields such as `extra_body.google.thinking_config`. | https://ai.google.dev/gemini-api/docs/openai |
+| DeepSeek official | `response_format.type=text|json_object`; `json_object` is valid-JSON mode only, requires explicit JSON instruction in messages, and has no documented `json_schema` response format. | `tools`, `tool_choice` (`none`/`auto`/`required` or named function), `tools[].function.parameters` as JSON Schema; `tools[].function.strict` is beta. | `thinking`, `reasoning_effort`, `max_tokens`, `stop`, `stream_options`, `temperature`, `top_p`, `logprobs`, `top_logprobs`. | https://api-docs.deepseek.com/api/create-chat-completion |
+| DashScope / Qwen OpenAI-compatible mode | No `response_format` listed on the OpenAI-compatible parameter table. | `tools`; docs say tools cannot currently be used with `stream=True`. | `top_p`, `temperature`, `presence_penalty`, `n`, `max_tokens`, `seed`, `stream`, `stop`, `stream_options`, SDK `extra_body.enable_search`. | https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope |
+| Zhipu / GLM | `response_format={"type":"json_object"}` JSON mode; JSON Schema is shown as caller-side validation/prompt guidance, not strict API schema. | `tools`; `tool_choice` defaults to and only supports `auto`. | `do_sample`, `temperature`, `top_p`, `max_tokens`, `stream`, `thinking`, `reasoning_effort`. | https://docs.bigmodel.cn/cn/guide/capabilities/struct-output, https://docs.bigmodel.cn/cn/guide/capabilities/function-calling, https://docs.bigmodel.cn/cn/guide/start/concept-param |
+| OpenRouter | `response_format.type=json_schema` for compatible models; support varies by selected model/provider route. | Standardized `tools` interface; support varies by model/provider. | Preferred `max_completion_tokens`, deprecated `max_tokens`, `logprobs`, `seed`, `reasoning`, `provider`, `top_k`, `min_p`, `top_a`; check model `supported_parameters` and use `provider.require_parameters=true` when required. | https://openrouter.ai/docs/api/api-reference/chat/send-chat-completion-request, https://openrouter.ai/docs/guides/features/structured-outputs, https://openrouter.ai/docs/guides/features/tool-calling, https://openrouter.ai/docs/api/api-reference/models/get-models |
+| Volcengine Ark | OpenAI SDK/API compatibility is documented, but chat parameter support for `response_format`, tools, streaming options, and common controls remains unknown from fetchable official text. | Unknown/probe-required. | Unknown/probe-required. | https://www.volcengine.com/docs/82379/1494384?lang=zh&redirect=1 |
+
+Important corrections:
+
+- OpenRouter is a routing layer; supported parameters vary by selected
+  upstream provider/model.
+- DeepSeek, Zhipu, and DashScope JSON mode are not equivalent to OpenAI
+  strict `response_format.type=json_schema`.
+- JSON Schema references in tool/function parameters or caller-side validation
+  do not imply strict response schema support.
+- Volcengine Ark remains probe-required until an inspectable official
+  parameter table or live probe confirms behavior.
 
 ## Public API
 
@@ -56,7 +69,13 @@ provider or per-call options remains in the payload and follows normal
 precedence.
 
 `stream_options` is deep-merged as provider first, then per-call. When
-`stream=True`, `include_usage: true` is added only when absent after the merge.
+`stream=True`, `include_usage: true` is added only when the final payload has no
+`stream_options` key after the merge. Mapping-valued `stream_options` keeps
+caller values and receives `include_usage: true` only when that key is absent.
+An explicit per-call `stream_options: None` is considered present: it clears any
+provider `stream_options` and suppresses the core `include_usage` default. Omit
+`stream_options` to receive the default streaming usage request.
+
 For non-streaming calls, `stream_options` is included only when explicitly
 provided by provider or per-call options.
 

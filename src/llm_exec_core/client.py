@@ -511,8 +511,9 @@ class LLMClient:
                         max(1, old_max // 2),
                     )
                     logger.warning(
-                        "HTTP error 404; lowering max_tokens %s -> %s "
+                        "HTTP error %s; lowering max_tokens %s -> %s "
                         "and retrying...",
+                        status_code,
                         old_max,
                         data["max_tokens"],
                     )
