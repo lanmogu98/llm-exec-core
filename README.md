@@ -27,8 +27,9 @@ client = LLMClient("your-model-name")
 ## Request options
 
 Use `request_options` for raw per-call OpenAI-compatible Chat Completions
-payload fields. Core transports these fields; it does not validate that a
-provider/model supports them and does not implement structured-output fallback.
+payload fields. For target models with capability metadata, core validates known
+high-risk fields such as `response_format`, `tools`, tool streaming, and
+reasoning controls before sending the request.
 
 Check the target route's docs or supported-parameter metadata before relying on
 strict schemas, tools, reasoning controls, sampling controls, or routing
@@ -71,9 +72,26 @@ through unchanged. See
 for the current target-model matrix and fallback boundary.
 
 For semantic structured-output fallback, use the explicit `structured_output`
-argument instead of hiding fallback policy inside `request_options`. In this
-release only `structured_output={"mode": "off"}` is accepted as a no-op;
-`mode="require"` and `mode="prefer"` fail fast until the planner is implemented.
+argument instead of hiding fallback policy inside `request_options`.
+
+```python
+result = await client.generate(
+    "Extract the title.",
+    structured_output={
+        "schema": {
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"],
+        },
+        "mode": "prefer",
+    },
+)
+```
+
+`mode="require"` sends strict schema when supported and otherwise fails before
+the request. `mode="prefer"` falls back to JSON mode or prompt-only JSON
+instructions when strict schema is unavailable. The selected strategy and
+fallback status are available on `result.metadata.planning`.
 
 This repo is also used for coordinated local development with sibling
 checkouts during the current extraction/migration work.

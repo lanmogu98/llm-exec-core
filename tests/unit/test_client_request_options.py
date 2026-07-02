@@ -7,24 +7,34 @@ import pytest
 from llm_exec_core.client import LLMClient
 
 
-def _config(request_overrides=None, max_tokens=128):
+def _config(
+    request_overrides=None,
+    max_tokens=128,
+    model_capabilities=None,
+    provider_name="test-provider",
+    api_base_url="https://example.invalid/chat/completions",
+):
+    model_config = {
+        "id": "provider-model-id",
+        "pricing": {"input": 1.0, "output": 2.0},
+    }
+    if model_capabilities is not None:
+        model_config["capabilities"] = model_capabilities
+
     provider_config = {
         "api_key_env_var": "TEST_API_KEY",
-        "api_base_url": "https://example.invalid/chat/completions",
+        "api_base_url": api_base_url,
         "temperature": 0.1,
         "max_tokens": max_tokens,
         "context_window": 4096,
         "pricing_currency": "$",
         "models": {
-            "test-model": {
-                "id": "provider-model-id",
-                "pricing": {"input": 1.0, "output": 2.0},
-            }
+            "test-model": model_config,
         },
     }
     if request_overrides is not None:
         provider_config["request_overrides"] = request_overrides
-    return {"test-provider": provider_config}
+    return {provider_name: provider_config}
 
 
 def _success_response(content="ok"):
@@ -39,6 +49,70 @@ def _success_response(content="ok"):
 
 def _disable_rate_limit(client):
     client._min_interval = 0
+
+
+def _strict_capabilities():
+    return {
+        "version": "unit-strict-2026-07-02",
+        "source": "unit",
+        "source_date": "2026-07-02",
+        "strict_response_schema": True,
+        "json_object_response": True,
+        "tools": True,
+        "tool_streaming": True,
+        "tool_choice": True,
+        "parallel_tool_calls": True,
+        "reasoning_controls": [
+            "reasoning",
+            "include_reasoning",
+            "reasoning_effort",
+        ],
+        "openrouter_supported_parameters": [
+            "response_format",
+            "structured_outputs",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "reasoning",
+            "include_reasoning",
+            "reasoning_effort",
+        ],
+    }
+
+
+def _json_only_capabilities():
+    return {
+        "version": "unit-json-only-2026-07-02",
+        "source": "unit",
+        "source_date": "2026-07-02",
+        "strict_response_schema": False,
+        "json_object_response": True,
+        "tools": True,
+        "tool_streaming": True,
+        "tool_choice": True,
+        "reasoning_controls": ["thinking", "reasoning_effort"],
+    }
+
+
+def _qwen_capabilities():
+    return {
+        "version": "unit-qwen-2026-07-02",
+        "source": "unit",
+        "source_date": "2026-07-02",
+        "strict_response_schema": False,
+        "json_object_response": False,
+        "tools": True,
+        "tool_streaming": False,
+        "tool_choice": True,
+        "reasoning_controls": [],
+    }
+
+
+def _qwen_no_tools_capabilities():
+    capabilities = _qwen_capabilities()
+    capabilities["tools"] = False
+    capabilities["tool_choice"] = False
+    return capabilities
 
 
 @pytest.mark.asyncio
@@ -281,7 +355,32 @@ async def test_generate_passes_reasoning_and_tool_controls(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_structured_output_require_fails_fast_without_http_call(
+async def test_capability_metadata_validates_reasoning_controls(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                model_capabilities=_json_only_capabilities()
+            ),
+        )
+        await client.generate(
+            "Hello",
+            request_options={"reasoning_effort": "high"},
+        )
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert payload["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_capability_metadata_rejects_unknown_reasoning_controls(
     monkeypatch,
 ):
     monkeypatch.setenv("TEST_API_KEY", "test-key")
@@ -290,11 +389,139 @@ async def test_structured_output_require_fails_fast_without_http_call(
         mock_httpx_client = AsyncMock()
         mock_cls.return_value = mock_httpx_client
 
-        client = LLMClient("test-model", config_source=_config())
+        client = LLMClient(
+            "test-model",
+            config_source=_config(model_capabilities=_qwen_capabilities()),
+        )
         with pytest.raises(
-            NotImplementedError,
-            match="semantic structured_output planner is not implemented",
+            ValueError,
+            match="does not support reasoning_effort",
         ):
+            await client.generate(
+                "Hello",
+                request_options={"reasoning_effort": "high"},
+            )
+
+    mock_httpx_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_capability_metadata_rejects_unsupported_verbosity(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(model_capabilities=_strict_capabilities()),
+        )
+        with pytest.raises(ValueError, match="does not support verbosity"):
+            await client.generate(
+                "Hello",
+                request_options={"verbosity": "high"},
+            )
+
+    mock_httpx_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_capability_metadata_allows_supported_verbosity(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    capabilities = _strict_capabilities()
+    capabilities["reasoning_controls"].append("verbosity")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(model_capabilities=capabilities),
+        )
+        await client.generate(
+            "Hello",
+            request_options={"verbosity": "high"},
+        )
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert payload["verbosity"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_structured_output_require_uses_strict_schema_and_metadata(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    schema = {
+        "type": "object",
+        "properties": {"title": {"type": "string"}},
+        "required": ["title"],
+    }
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response(
+            '{"title":"A"}'
+        )
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                model_capabilities=_strict_capabilities(),
+                provider_name="openrouter-test",
+                api_base_url="https://openrouter.ai/api/v1/chat/completions",
+            ),
+        )
+        result = await client.generate(
+            "Hello",
+            structured_output={
+                "schema": schema,
+                "name": "title_result",
+                "mode": "require",
+            },
+        )
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert payload["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "title_result",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+    assert payload["provider"]["require_parameters"] is True
+    assert result.metadata.planning == {
+        "strategy": "strict_schema",
+        "fallback_reason": None,
+        "validation_status": "provider_enforced",
+        "capability_version": "unit-strict-2026-07-02",
+    }
+
+
+@pytest.mark.asyncio
+async def test_structured_output_require_fails_on_json_only_route(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                model_capabilities=_json_only_capabilities()
+            ),
+        )
+        with pytest.raises(ValueError, match="does not support strict schema"):
             await client.generate(
                 "Hello",
                 structured_output={
@@ -307,29 +534,79 @@ async def test_structured_output_require_fails_fast_without_http_call(
 
 
 @pytest.mark.asyncio
-async def test_generate_response_structured_output_prefer_fails_fast(
+async def test_structured_output_prefer_falls_back_to_json_object(
     monkeypatch,
 ):
     monkeypatch.setenv("TEST_API_KEY", "test-key")
+    schema = {"type": "object", "properties": {"title": {"type": "string"}}}
 
     with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
         mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response(
+            '{"title":"A"}'
+        )
         mock_cls.return_value = mock_httpx_client
 
-        client = LLMClient("test-model", config_source=_config())
-        with pytest.raises(
-            NotImplementedError,
-            match="semantic structured_output planner is not implemented",
-        ):
-            await client.generate_response(
-                "Hello",
-                structured_output={
-                    "schema": {"type": "object"},
-                    "mode": "prefer",
-                },
-            )
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                model_capabilities=_json_only_capabilities()
+            ),
+        )
+        result = await client.generate(
+            "Extract the title.",
+            structured_output={"schema": schema, "mode": "prefer"},
+            structured_output_hook=lambda text: {"parsed": text},
+        )
 
-    mock_httpx_client.post.assert_not_awaited()
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert payload["response_format"] == {"type": "json_object"}
+    assert "Respond with valid JSON" in payload["messages"][0]["content"]
+    assert '"title"' in payload["messages"][0]["content"]
+    assert result.structured == {"parsed": '{"title":"A"}'}
+    assert result.metadata.planning == {
+        "strategy": "json_object",
+        "fallback_reason": "strict_schema_not_supported",
+        "validation_status": "hook_validated",
+        "capability_version": "unit-json-only-2026-07-02",
+    }
+
+
+@pytest.mark.asyncio
+async def test_generate_response_structured_output_prefer_uses_prompt_only(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    schema = {"type": "object", "properties": {"title": {"type": "string"}}}
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response(
+            '{"title":"A"}'
+        )
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(model_capabilities=_qwen_capabilities()),
+        )
+        response, usage = await client.generate_response(
+            "Extract the title.",
+            structured_output={"schema": schema, "mode": "prefer"},
+        )
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert response == '{"title":"A"}'
+    assert "response_format" not in payload
+    assert "Respond with valid JSON" in payload["messages"][0]["content"]
+    assert usage["metadata"]["planning"] == {
+        "strategy": "prompt_json",
+        "fallback_reason": "response_format_not_supported",
+        "validation_status": "not_validated",
+        "capability_version": "unit-qwen-2026-07-02",
+    }
 
 
 @pytest.mark.asyncio
@@ -366,6 +643,360 @@ async def test_structured_output_rejects_unknown_mode(monkeypatch):
             "Hello",
             structured_output={"mode": "silent"},
         )
+
+
+@pytest.mark.asyncio
+async def test_qwen_tools_with_streaming_is_rejected(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(model_capabilities=_qwen_capabilities()),
+        )
+        with pytest.raises(ValueError, match="tools with stream=True"):
+            await client.generate_response(
+                "Hello",
+                stream=True,
+                request_options={"tools": [tool]},
+            )
+
+    mock_httpx_client.stream.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_qwen_flash_tools_without_documented_support_is_rejected(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                model_capabilities=_qwen_no_tools_capabilities()
+            ),
+        )
+        with pytest.raises(ValueError, match="does not support tools"):
+            await client.generate(
+                "Hello",
+                request_options={"tools": [tool]},
+            )
+
+    mock_httpx_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_raw_strict_response_format_rejected_on_json_only_route(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                model_capabilities=_json_only_capabilities()
+            ),
+        )
+        with pytest.raises(ValueError, match="strict schema response_format"):
+            await client.generate(
+                "Hello",
+                request_options={
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "answer",
+                            "schema": {"type": "object"},
+                        },
+                    }
+                },
+            )
+
+    mock_httpx_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_raw_response_format_rejected_when_not_documented(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(model_capabilities=_qwen_capabilities()),
+        )
+        with pytest.raises(ValueError, match="json_object response_format"):
+            await client.generate(
+                "Hello",
+                request_options={"response_format": {"type": "json_object"}},
+            )
+
+    mock_httpx_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_openrouter_raw_structured_output_requires_parameters(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    schema = {"type": "object"}
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                request_overrides={"provider": {"only": ["openai"]}},
+                model_capabilities=_strict_capabilities(),
+                provider_name="openrouter-test",
+                api_base_url="https://openrouter.ai/api/v1/chat/completions",
+            ),
+        )
+        await client.generate(
+            "Hello",
+            request_options={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "answer", "schema": schema},
+                }
+            },
+        )
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert payload["provider"] == {
+        "only": ["openai"],
+        "require_parameters": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_openrouter_tools_require_parameters(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                request_overrides={"provider": {"only": ["openai"]}},
+                model_capabilities=_strict_capabilities(),
+                provider_name="openrouter-test",
+                api_base_url="https://openrouter.ai/api/v1/chat/completions",
+            ),
+        )
+        await client.generate(
+            "Hello",
+            request_options={"tools": [tool]},
+        )
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert payload["provider"] == {
+        "only": ["openai"],
+        "require_parameters": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_openrouter_tools_fail_without_supported_parameter(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    capabilities = _strict_capabilities()
+    capabilities["openrouter_supported_parameters"].remove("tools")
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                model_capabilities=capabilities,
+                provider_name="openrouter-test",
+                api_base_url="https://openrouter.ai/api/v1/chat/completions",
+            ),
+        )
+        with pytest.raises(
+            ValueError,
+            match="does not support tools",
+        ):
+            await client.generate(
+                "Hello",
+                request_options={"tools": [tool]},
+            )
+
+    mock_httpx_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_openrouter_strict_schema_requires_structured_outputs_metadata(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    capabilities = _strict_capabilities()
+    capabilities["openrouter_supported_parameters"].remove(
+        "structured_outputs"
+    )
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                model_capabilities=capabilities,
+                provider_name="openrouter-test",
+                api_base_url="https://openrouter.ai/api/v1/chat/completions",
+            ),
+        )
+        with pytest.raises(
+            ValueError,
+            match="does not support structured_outputs",
+        ):
+            await client.generate(
+                "Hello",
+                structured_output={
+                    "schema": {"type": "object"},
+                    "mode": "require",
+                },
+            )
+
+    mock_httpx_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_openrouter_strict_schema_fails_without_supported_parameters(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    capabilities = _strict_capabilities()
+    capabilities["openrouter_supported_parameters"] = []
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                model_capabilities=capabilities,
+                provider_name="openrouter-test",
+                api_base_url="https://openrouter.ai/api/v1/chat/completions",
+            ),
+        )
+        with pytest.raises(
+            ValueError,
+            match="does not support response_format",
+        ):
+            await client.generate(
+                "Hello",
+                structured_output={
+                    "schema": {"type": "object"},
+                    "mode": "require",
+                },
+            )
+
+    mock_httpx_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_structured_output_strategy_separates_cache_from_raw_payload(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    schema = {"type": "object"}
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "answer",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.side_effect = [
+            _success_response("raw"),
+            _success_response("planned"),
+        ]
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                model_capabilities=_strict_capabilities(),
+                provider_name="openrouter-test",
+                api_base_url="https://openrouter.ai/api/v1/chat/completions",
+            ),
+        )
+        _disable_rate_limit(client)
+        client._cache_enabled = True
+
+        raw = await client.generate(
+            "Hello",
+            request_options={"response_format": response_format},
+        )
+        planned = await client.generate(
+            "Hello",
+            structured_output={
+                "schema": schema,
+                "name": "answer",
+                "mode": "require",
+            },
+        )
+
+    assert raw.text == "raw"
+    assert planned.text == "planned"
+    assert mock_httpx_client.post.await_count == 2
+    assert client.get_cache_stats()["misses"] == 2
 
 
 @pytest.mark.asyncio

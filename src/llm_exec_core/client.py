@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import httpx
 
-from .config import get_model_details, get_supported_models
+from .config import ModelCapabilities, get_model_details, get_supported_models
 from .constants import (
     API_REQUEST_TIMEOUT_SECONDS,
     INITIAL_RETRY_DELAY_SECONDS,
@@ -35,6 +35,13 @@ logger = logging.getLogger(__name__)
 
 _PROTECTED_REQUEST_FIELDS = {"model", "messages", "stream"}
 _STRUCTURED_OUTPUT_MODES = {"require", "prefer", "off"}
+_KNOWN_CAPABILITY_CONTROL_FIELDS = {
+    "reasoning_effort",
+    "thinking",
+    "reasoning",
+    "include_reasoning",
+    "verbosity",
+}
 _MISSING = object()
 
 
@@ -148,6 +155,7 @@ class LLMClient:
         self.max_tokens = provider_settings.max_tokens
         self.model_name = model_name
         self.model = model_details.id
+        self.capabilities = model_details.capabilities
         self.provider_name = provider_name
         self.pricing = model_details.pricing
         self.pricing_currency = provider_settings.pricing_currency
@@ -385,9 +393,9 @@ class LLMClient:
     def _validate_structured_output_planner(
         self,
         structured_output: Mapping[str, Any] | None,
-    ) -> None:
+    ) -> str:
         if structured_output is None:
-            return
+            return "off"
         if not isinstance(structured_output, Mapping):
             raise TypeError("structured_output must be a mapping.")
 
@@ -396,14 +404,253 @@ class LLMClient:
             raise ValueError(
                 "structured_output.mode must be one of: require, prefer, off."
             )
-        if mode == "off":
+        return str(mode)
+
+    def _planning_metadata(
+        self,
+        *,
+        strategy: str = "raw",
+        fallback_reason: str | None = None,
+        validation_status: str = "not_applicable",
+    ) -> Dict[str, Any]:
+        capability_version = "untracked"
+        if self.capabilities is not None:
+            capability_version = self.capabilities.version
+        return {
+            "strategy": strategy,
+            "fallback_reason": fallback_reason,
+            "validation_status": validation_status,
+            "capability_version": capability_version,
+        }
+
+    def _is_openrouter_route(self) -> bool:
+        return (
+            "openrouter" in self.provider_name
+            or "openrouter.ai" in self.api_url
+        )
+
+    def _ensure_openrouter_require_parameters(
+        self,
+        data: Dict[str, Any],
+    ) -> None:
+        provider = data.get("provider", {})
+        if provider is None:
+            provider = {}
+        if not isinstance(provider, Mapping):
+            raise ValueError("OpenRouter provider routing must be a mapping.")
+        provider_options = deepcopy(dict(provider))
+        provider_options["require_parameters"] = True
+        data["provider"] = provider_options
+
+    def _has_correctness_dependent_openrouter_options(
+        self,
+        data: Mapping[str, Any],
+    ) -> bool:
+        return "response_format" in data or "tools" in data
+
+    def _validate_openrouter_supported_parameter(
+        self,
+        parameter: str,
+        capabilities: ModelCapabilities,
+    ) -> None:
+        supported = capabilities.openrouter_supported_parameters
+        if parameter not in supported:
+            raise ValueError(
+                f"{self.model_name} does not support {parameter} through "
+                "OpenRouter supported_parameters."
+            )
+
+    def _validate_capability_aware_request(
+        self,
+        data: Dict[str, Any],
+        *,
+        stream: bool,
+    ) -> None:
+        capabilities = self.capabilities
+        if capabilities is None:
             return
 
-        raise NotImplementedError(
-            "semantic structured_output planner is not implemented. "
-            "Use request_options for raw provider/model-specific payload "
-            "fields, or pass structured_output={'mode': 'off'}."
+        response_format = data.get("response_format")
+        if isinstance(response_format, Mapping):
+            response_format_type = response_format.get("type")
+            if response_format_type == "json_schema":
+                if not capabilities.strict_response_schema:
+                    raise ValueError(
+                        f"{self.model_name} does not support strict schema "
+                        "response_format."
+                    )
+                if self._is_openrouter_route():
+                    self._validate_openrouter_supported_parameter(
+                        "response_format", capabilities
+                    )
+                    self._validate_openrouter_supported_parameter(
+                        "structured_outputs", capabilities
+                    )
+            elif response_format_type == "json_object":
+                if not capabilities.json_object_response:
+                    raise ValueError(
+                        f"{self.model_name} does not support json_object "
+                        "response_format."
+                    )
+                if self._is_openrouter_route():
+                    self._validate_openrouter_supported_parameter(
+                        "response_format", capabilities
+                    )
+
+        if "tools" in data:
+            if not capabilities.tools:
+                raise ValueError(f"{self.model_name} does not support tools.")
+            if stream and not capabilities.tool_streaming:
+                raise ValueError(
+                    f"{self.model_name} does not support tools with "
+                    "stream=True."
+                )
+            if self._is_openrouter_route():
+                self._validate_openrouter_supported_parameter(
+                    "tools", capabilities
+                )
+
+        if "tool_choice" in data and not capabilities.tool_choice:
+            raise ValueError(
+                f"{self.model_name} does not support tool_choice."
+            )
+        if (
+            "parallel_tool_calls" in data
+            and not capabilities.parallel_tool_calls
+        ):
+            raise ValueError(
+                f"{self.model_name} does not support parallel_tool_calls."
+            )
+
+        for field in _KNOWN_CAPABILITY_CONTROL_FIELDS:
+            if field in data and field not in capabilities.reasoning_controls:
+                raise ValueError(
+                    f"{self.model_name} does not support {field}."
+                )
+
+        if self._is_openrouter_route() and (
+            self._has_correctness_dependent_openrouter_options(data)
+        ):
+            self._ensure_openrouter_require_parameters(data)
+
+    def _append_json_schema_instruction(
+        self,
+        data: Dict[str, Any],
+        schema: Mapping[str, Any],
+    ) -> None:
+        schema_text = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+        instruction = (
+            "\n\nRespond with valid JSON matching this JSON Schema. "
+            "Do not include markdown fences or explanatory prose.\n"
+            f"JSON Schema: {schema_text}"
         )
+        messages = data.get("messages", [])
+        if messages:
+            messages[0][
+                "content"
+            ] = f"{messages[0].get('content', '')}{instruction}"
+
+    def _plan_structured_output(
+        self,
+        data: Dict[str, Any],
+        structured_output: Mapping[str, Any] | None,
+    ) -> Dict[str, Any]:
+        mode = self._validate_structured_output_planner(structured_output)
+        if mode == "off":
+            return self._planning_metadata()
+
+        if not isinstance(structured_output, Mapping):
+            raise TypeError("structured_output must be a mapping.")
+        if "response_format" in data:
+            raise ValueError(
+                "structured_output cannot be combined with raw "
+                "response_format."
+            )
+
+        schema = structured_output.get("schema")
+        if not isinstance(schema, Mapping):
+            raise ValueError("structured_output.schema must be a mapping.")
+        name = str(structured_output.get("name", "structured_output"))
+
+        capabilities = self.capabilities
+        if capabilities is not None and capabilities.strict_response_schema:
+            data["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": name,
+                    "strict": True,
+                    "schema": deepcopy(dict(schema)),
+                },
+            }
+            if self._is_openrouter_route():
+                self._ensure_openrouter_require_parameters(data)
+            return self._planning_metadata(
+                strategy="strict_schema",
+                validation_status="provider_enforced",
+            )
+
+        if mode == "require":
+            raise ValueError(
+                f"{self.model_name} does not support strict schema "
+                "structured output."
+            )
+
+        if capabilities is not None and capabilities.json_object_response:
+            data["response_format"] = {"type": "json_object"}
+            self._append_json_schema_instruction(data, schema)
+            return self._planning_metadata(
+                strategy="json_object",
+                fallback_reason="strict_schema_not_supported",
+                validation_status="not_validated",
+            )
+
+        self._append_json_schema_instruction(data, schema)
+        return self._planning_metadata(
+            strategy="prompt_json",
+            fallback_reason="response_format_not_supported",
+            validation_status="not_validated",
+        )
+
+    def _build_cache_payload(
+        self,
+        data: Mapping[str, Any],
+        planning_metadata: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        cache_payload = deepcopy(dict(data))
+        cache_payload["_llm_exec_core_plan"] = {
+            "strategy": planning_metadata.get("strategy"),
+            "fallback_reason": planning_metadata.get("fallback_reason"),
+            "capability_version": planning_metadata.get("capability_version"),
+        }
+        return cache_payload
+
+    def _finalize_planning_metadata(
+        self,
+        planning_metadata: Mapping[str, Any],
+        structured_output_hook: Optional[Callable[[str], Any]],
+    ) -> Dict[str, Any]:
+        finalized = deepcopy(dict(planning_metadata))
+        if (
+            structured_output_hook is not None
+            and finalized.get("validation_status") == "not_validated"
+        ):
+            finalized["validation_status"] = "hook_validated"
+        return finalized
+
+    def _build_request_plan(
+        self,
+        prompt: str,
+        stream: bool,
+        request_options: Mapping[str, Any] | None,
+        structured_output: Mapping[str, Any] | None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        data = self._build_request_payload(prompt, stream, request_options)
+        planning_metadata = self._plan_structured_output(
+            data,
+            structured_output,
+        )
+        self._validate_capability_aware_request(data, stream=stream)
+        return data, planning_metadata
 
     async def generate(
         self,
@@ -422,11 +669,16 @@ class LLMClient:
         """Generate a structured LLM result."""
         started_at = datetime.now()
         start_time = time.time()
-        self._validate_structured_output_planner(structured_output)
-        data = self._build_request_payload(prompt, stream, request_options)
+        data, planning_metadata = self._build_request_plan(
+            prompt,
+            stream,
+            request_options,
+            structured_output,
+        )
 
         if self._cache_enabled and not stream:
-            cached_response = self._cache.get(data)
+            cache_payload = self._build_cache_payload(data, planning_metadata)
+            cached_response = self._cache.get(cache_payload)
             if cached_response is not None:
                 logger.info("Cache hit for %s", request_name)
                 finished_at = datetime.now()
@@ -450,6 +702,10 @@ class LLMClient:
                         finished_at=finished_at,
                         duration_seconds=finished_at.timestamp()
                         - started_at.timestamp(),
+                        planning=self._finalize_planning_metadata(
+                            planning_metadata,
+                            structured_output_hook,
+                        ),
                     ),
                 )
                 if structured_output_hook is not None:
@@ -477,7 +733,10 @@ class LLMClient:
                     response_text, legacy_usage = legacy_result
 
                 if self._cache_enabled and not stream:
-                    self._cache.set(data, response_text)
+                    self._cache.set(
+                        self._build_cache_payload(data, planning_metadata),
+                        response_text,
+                    )
 
                 finished_at = datetime.now()
                 result = LLMResult(
@@ -493,6 +752,10 @@ class LLMClient:
                         duration_seconds=legacy_usage["process_times"][
                             "total_time"
                         ],
+                        planning=self._finalize_planning_metadata(
+                            planning_metadata,
+                            structured_output_hook,
+                        ),
                     ),
                 )
                 if structured_output_hook is not None:
@@ -580,8 +843,7 @@ class LLMClient:
             stream_callback: Optional callback for streaming chunks.
             request_options: Per-call Chat Completions request payload fields.
             structured_output: Explicit semantic structured-output planner
-                request. Only mode="off" is currently supported; require/prefer
-                fail fast so fallback is not hidden in raw request_options.
+                request with require/prefer/off modes.
 
         Returns:
             Tuple containing:
@@ -794,6 +1056,7 @@ class LLMClient:
         started_at: datetime,
         finished_at: datetime,
         duration_seconds: float,
+        planning: Mapping[str, Any] | None = None,
     ) -> ExecutionMetadata:
         return ExecutionMetadata(
             request_id=request_id,
@@ -806,6 +1069,7 @@ class LLMClient:
             finished_at=finished_at.isoformat(),
             duration_seconds=duration_seconds,
             trace_context=dict(trace_context or {}),
+            planning=dict(planning or {}),
         )
 
     def get_token_usage(self) -> Dict[str, Any]:
