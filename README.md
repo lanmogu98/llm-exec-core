@@ -26,13 +26,19 @@ client = LLMClient("your-model-name")
 
 ## Request options
 
-Use `request_options` for per-call OpenAI-compatible Chat Completions fields
-such as structured output schemas, sampling controls, tools, and routing
-objects:
+Use `request_options` for raw per-call OpenAI-compatible Chat Completions
+payload fields. Core transports these fields; it does not validate that a
+provider/model supports them and does not implement structured-output fallback.
+
+Check the target route's docs or supported-parameter metadata before relying on
+strict schemas, tools, reasoning controls, sampling controls, or routing
+objects. For example, if an OpenRouter model reports `structured_outputs` /
+`response_format`, pin or require compatible routing when correctness depends on
+that feature:
 
 ```python
 result = await client.generate(
-    "Extract the title as JSON.",
+    "Extract the title.",
     request_options={
         "response_format": {
             "type": "json_schema",
@@ -47,15 +53,22 @@ result = await client.generate(
                 },
             },
         },
-        "top_p": 0.2,
+        "provider": {"require_parameters": True},
     },
 )
 ```
 
+That example is route/model-specific; it should not be read as universal support
+across every configured model. Some routes expose JSON mode without strict
+schema support, some require caller-side validation, and Qwen/Bailian compatible
+docs currently say `tools` cannot be used with `stream=True`.
+
 `generate_response()` accepts the same `request_options` argument for legacy
 tuple-returning call sites. Core-owned fields (`model`, `messages`, and
 `stream`) are rejected in request options; provider-specific fields pass
-through unchanged.
+through unchanged. See
+[`docs/design_docs/openai_compat_request_options.md`](docs/design_docs/openai_compat_request_options.md)
+for the current target-model matrix and fallback boundary.
 
 This repo is also used for coordinated local development with sibling
 checkouts during the current extraction/migration work.
