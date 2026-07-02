@@ -9,13 +9,14 @@ import logging
 import os
 import time
 from collections import OrderedDict, deque
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import httpx
 
-from .config import get_model_details, get_supported_models
+from .config import ModelCapabilities, get_model_details, get_supported_models
 from .constants import (
     API_REQUEST_TIMEOUT_SECONDS,
     INITIAL_RETRY_DELAY_SECONDS,
@@ -32,6 +33,17 @@ from .types import ExecutionMetadata, LLMResult, TokenUsage
 
 logger = logging.getLogger(__name__)
 
+_PROTECTED_REQUEST_FIELDS = {"model", "messages", "stream"}
+_STRUCTURED_OUTPUT_MODES = {"require", "prefer", "off"}
+_KNOWN_CAPABILITY_CONTROL_FIELDS = {
+    "reasoning_effort",
+    "thinking",
+    "reasoning",
+    "include_reasoning",
+    "verbosity",
+}
+_MISSING = object()
+
 
 class ResponseCache:
     """LRU cache for LLM responses with TTL support."""
@@ -43,14 +55,18 @@ class ResponseCache:
         self._hits = 0
         self._misses = 0
 
-    def _make_key(self, prompt: str, model: str) -> str:
-        """Create a cache key from prompt and model."""
-        content = f"{model}:{prompt}"
+    def _make_key(self, request_payload: Mapping[str, Any]) -> str:
+        """Create a cache key from a deterministic request payload."""
+        content = json.dumps(
+            request_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         return hashlib.sha256(content.encode()).hexdigest()
 
-    def get(self, prompt: str, model: str) -> Optional[str]:
+    def get(self, request_payload: Mapping[str, Any]) -> Optional[str]:
         """Get cached response if exists and not expired."""
-        key = self._make_key(prompt, model)
+        key = self._make_key(request_payload)
 
         if key not in self._cache:
             self._misses += 1
@@ -70,9 +86,9 @@ class ResponseCache:
         self._hits += 1
         return response
 
-    def set(self, prompt: str, model: str, response: str) -> None:
+    def set(self, request_payload: Mapping[str, Any], response: str) -> None:
         """Store response in cache."""
-        key = self._make_key(prompt, model)
+        key = self._make_key(request_payload)
 
         if len(self._cache) >= self._max_size:
             self._cache.popitem(last=False)
@@ -139,6 +155,7 @@ class LLMClient:
         self.max_tokens = provider_settings.max_tokens
         self.model_name = model_name
         self.model = model_details.id
+        self.capabilities = model_details.capabilities
         self.provider_name = provider_name
         self.pricing = model_details.pricing
         self.pricing_currency = provider_settings.pricing_currency
@@ -254,6 +271,434 @@ class LLMClient:
         self._last_request_time = current_time
         self._request_timestamps.append(current_time)
 
+    def _normalize_request_options(
+        self,
+        options: Mapping[str, Any] | None,
+    ) -> Dict[str, Any]:
+        if not options:
+            return {}
+
+        normalized: Dict[str, Any] = {}
+        if "extra_body" in options:
+            extra_body = options["extra_body"]
+            if isinstance(extra_body, Mapping):
+                normalized.update(deepcopy(dict(extra_body)))
+            else:
+                normalized["extra_body"] = deepcopy(extra_body)
+
+        for key, value in options.items():
+            if key == "extra_body":
+                continue
+            normalized[key] = deepcopy(value)
+
+        return normalized
+
+    def _validate_no_protected_fields(
+        self,
+        options: Mapping[str, Any],
+        source: str,
+    ) -> None:
+        protected = _PROTECTED_REQUEST_FIELDS.intersection(options)
+        if protected:
+            field_list = ", ".join(sorted(protected))
+            raise ValueError(f"{field_list} is a protected {source} field.")
+
+    def _merge_stream_options(
+        self,
+        provider_stream_options: Any,
+        request_stream_options: Any,
+    ) -> Any:
+        if request_stream_options is _MISSING:
+            if provider_stream_options is _MISSING:
+                return _MISSING
+            return deepcopy(provider_stream_options)
+        if provider_stream_options is _MISSING:
+            return deepcopy(request_stream_options)
+        if isinstance(provider_stream_options, Mapping) and isinstance(
+            request_stream_options, Mapping
+        ):
+            merged = deepcopy(dict(provider_stream_options))
+            for key, value in request_stream_options.items():
+                if isinstance(merged.get(key), Mapping) and isinstance(
+                    value, Mapping
+                ):
+                    merged[key] = self._merge_stream_options(
+                        merged[key], value
+                    )
+                else:
+                    merged[key] = deepcopy(value)
+            return merged
+        return deepcopy(request_stream_options)
+
+    def _build_request_payload(
+        self,
+        prompt: str,
+        stream: bool,
+        request_options: Mapping[str, Any] | None,
+    ) -> Tuple[Dict[str, Any], set[str]]:
+        provider_options = self._normalize_request_options(
+            self.request_overrides
+        )
+        per_call_options = self._normalize_request_options(request_options)
+
+        self._validate_no_protected_fields(
+            provider_options, "provider request override"
+        )
+        self._validate_no_protected_fields(per_call_options, "request option")
+
+        provider_stream_options = provider_options.pop(
+            "stream_options", _MISSING
+        )
+        request_stream_options = per_call_options.pop(
+            "stream_options", _MISSING
+        )
+        stream_options = self._merge_stream_options(
+            provider_stream_options, request_stream_options
+        )
+
+        has_explicit_max_tokens = (
+            "max_tokens" in provider_options
+            or "max_tokens" in per_call_options
+        )
+        has_max_completion_tokens = (
+            "max_completion_tokens" in provider_options
+            or "max_completion_tokens" in per_call_options
+        )
+        has_explicit_temperature = (
+            "temperature" in provider_options
+            or "temperature" in per_call_options
+        )
+
+        data: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature,
+            "stream": stream,
+        }
+        core_default_fields = {"temperature"}
+        if not has_max_completion_tokens or has_explicit_max_tokens:
+            data["max_tokens"] = self.max_tokens
+            if not has_explicit_max_tokens:
+                core_default_fields.add("max_tokens")
+
+        data.update(provider_options)
+        data.update(per_call_options)
+        if has_explicit_temperature:
+            core_default_fields.discard("temperature")
+
+        if stream_options is not _MISSING:
+            data["stream_options"] = stream_options
+        if stream:
+            existing_stream_options = data.get("stream_options", _MISSING)
+            if existing_stream_options is _MISSING:
+                data["stream_options"] = {"include_usage": True}
+            elif isinstance(existing_stream_options, Mapping):
+                merged_stream_options = deepcopy(dict(existing_stream_options))
+                merged_stream_options.setdefault("include_usage", True)
+                data["stream_options"] = merged_stream_options
+
+        return data, core_default_fields
+
+    def _validate_structured_output_planner(
+        self,
+        structured_output: Mapping[str, Any] | None,
+    ) -> str:
+        if structured_output is None:
+            return "off"
+        if not isinstance(structured_output, Mapping):
+            raise TypeError("structured_output must be a mapping.")
+
+        mode = structured_output.get("mode", "require")
+        if mode not in _STRUCTURED_OUTPUT_MODES:
+            raise ValueError(
+                "structured_output.mode must be one of: require, prefer, off."
+            )
+        return str(mode)
+
+    def _planning_metadata(
+        self,
+        *,
+        strategy: str = "raw",
+        fallback_reason: str | None = None,
+        validation_status: str = "not_applicable",
+    ) -> Dict[str, Any]:
+        capability_version = "untracked"
+        if self.capabilities is not None:
+            capability_version = self.capabilities.version
+        return {
+            "strategy": strategy,
+            "fallback_reason": fallback_reason,
+            "validation_status": validation_status,
+            "capability_version": capability_version,
+        }
+
+    def _is_openrouter_route(self) -> bool:
+        return (
+            "openrouter" in self.provider_name
+            or "openrouter.ai" in self.api_url
+        )
+
+    def _ensure_openrouter_require_parameters(
+        self,
+        data: Dict[str, Any],
+    ) -> None:
+        provider = data.get("provider", {})
+        if provider is None:
+            provider = {}
+        if not isinstance(provider, Mapping):
+            raise ValueError("OpenRouter provider routing must be a mapping.")
+        provider_options = deepcopy(dict(provider))
+        provider_options["require_parameters"] = True
+        data["provider"] = provider_options
+
+    def _has_correctness_dependent_openrouter_options(
+        self,
+        data: Mapping[str, Any],
+    ) -> bool:
+        return "response_format" in data or "tools" in data
+
+    def _validate_openrouter_supported_parameter(
+        self,
+        parameter: str,
+        capabilities: ModelCapabilities,
+    ) -> None:
+        supported = capabilities.openrouter_supported_parameters
+        if parameter not in supported:
+            raise ValueError(
+                f"{self.model_name} does not support {parameter} through "
+                "OpenRouter supported_parameters."
+            )
+
+    def _plan_openrouter_core_parameters(
+        self,
+        data: Dict[str, Any],
+        core_default_fields: set[str],
+    ) -> None:
+        capabilities = self.capabilities
+        if capabilities is None or not self._is_openrouter_route():
+            return
+
+        supported = capabilities.openrouter_supported_parameters
+        for parameter in (
+            "temperature",
+            "max_tokens",
+            "max_completion_tokens",
+        ):
+            if parameter not in data or parameter in supported:
+                continue
+            if parameter not in core_default_fields:
+                self._validate_openrouter_supported_parameter(
+                    parameter,
+                    capabilities,
+                )
+
+            value = data.pop(parameter)
+            if (
+                parameter == "max_tokens"
+                and "max_completion_tokens" in supported
+                and "max_completion_tokens" not in data
+            ):
+                data["max_completion_tokens"] = value
+                core_default_fields.add("max_completion_tokens")
+            core_default_fields.discard(parameter)
+
+    def _validate_capability_aware_request(
+        self,
+        data: Dict[str, Any],
+        *,
+        stream: bool,
+    ) -> None:
+        capabilities = self.capabilities
+        if capabilities is None:
+            return
+
+        response_format = data.get("response_format")
+        if isinstance(response_format, Mapping):
+            response_format_type = response_format.get("type")
+            if response_format_type == "json_schema":
+                if not capabilities.strict_response_schema:
+                    raise ValueError(
+                        f"{self.model_name} does not support strict schema "
+                        "response_format."
+                    )
+                if self._is_openrouter_route():
+                    self._validate_openrouter_supported_parameter(
+                        "response_format", capabilities
+                    )
+                    self._validate_openrouter_supported_parameter(
+                        "structured_outputs", capabilities
+                    )
+            elif response_format_type == "json_object":
+                if not capabilities.json_object_response:
+                    raise ValueError(
+                        f"{self.model_name} does not support json_object "
+                        "response_format."
+                    )
+                if self._is_openrouter_route():
+                    self._validate_openrouter_supported_parameter(
+                        "response_format", capabilities
+                    )
+
+        if "tools" in data:
+            if not capabilities.tools:
+                raise ValueError(f"{self.model_name} does not support tools.")
+            if stream and not capabilities.tool_streaming:
+                raise ValueError(
+                    f"{self.model_name} does not support tools with "
+                    "stream=True."
+                )
+            if self._is_openrouter_route():
+                self._validate_openrouter_supported_parameter(
+                    "tools", capabilities
+                )
+
+        if "tool_choice" in data and not capabilities.tool_choice:
+            raise ValueError(
+                f"{self.model_name} does not support tool_choice."
+            )
+        if (
+            "parallel_tool_calls" in data
+            and not capabilities.parallel_tool_calls
+        ):
+            raise ValueError(
+                f"{self.model_name} does not support parallel_tool_calls."
+            )
+
+        for field in _KNOWN_CAPABILITY_CONTROL_FIELDS:
+            if field in data and field not in capabilities.reasoning_controls:
+                raise ValueError(
+                    f"{self.model_name} does not support {field}."
+                )
+
+        if self._is_openrouter_route() and (
+            self._has_correctness_dependent_openrouter_options(data)
+        ):
+            self._ensure_openrouter_require_parameters(data)
+
+    def _append_json_schema_instruction(
+        self,
+        data: Dict[str, Any],
+        schema: Mapping[str, Any],
+    ) -> None:
+        schema_text = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+        instruction = (
+            "\n\nRespond with valid JSON matching this JSON Schema. "
+            "Do not include markdown fences or explanatory prose.\n"
+            f"JSON Schema: {schema_text}"
+        )
+        messages = data.get("messages", [])
+        if messages:
+            messages[0][
+                "content"
+            ] = f"{messages[0].get('content', '')}{instruction}"
+
+    def _plan_structured_output(
+        self,
+        data: Dict[str, Any],
+        structured_output: Mapping[str, Any] | None,
+    ) -> Dict[str, Any]:
+        mode = self._validate_structured_output_planner(structured_output)
+        if mode == "off":
+            return self._planning_metadata()
+
+        if not isinstance(structured_output, Mapping):
+            raise TypeError("structured_output must be a mapping.")
+        if "response_format" in data:
+            raise ValueError(
+                "structured_output cannot be combined with raw "
+                "response_format."
+            )
+
+        schema = structured_output.get("schema")
+        if not isinstance(schema, Mapping):
+            raise ValueError("structured_output.schema must be a mapping.")
+        name = str(structured_output.get("name", "structured_output"))
+
+        capabilities = self.capabilities
+        if capabilities is not None and capabilities.strict_response_schema:
+            data["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": name,
+                    "strict": True,
+                    "schema": deepcopy(dict(schema)),
+                },
+            }
+            if self._is_openrouter_route():
+                self._ensure_openrouter_require_parameters(data)
+            return self._planning_metadata(
+                strategy="strict_schema",
+                validation_status="provider_enforced",
+            )
+
+        if mode == "require":
+            raise ValueError(
+                f"{self.model_name} does not support strict schema "
+                "structured output."
+            )
+
+        if capabilities is not None and capabilities.json_object_response:
+            data["response_format"] = {"type": "json_object"}
+            self._append_json_schema_instruction(data, schema)
+            return self._planning_metadata(
+                strategy="json_object",
+                fallback_reason="strict_schema_not_supported",
+                validation_status="not_validated",
+            )
+
+        self._append_json_schema_instruction(data, schema)
+        return self._planning_metadata(
+            strategy="prompt_json",
+            fallback_reason="response_format_not_supported",
+            validation_status="not_validated",
+        )
+
+    def _build_cache_payload(
+        self,
+        data: Mapping[str, Any],
+        planning_metadata: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        cache_payload = deepcopy(dict(data))
+        cache_payload["_llm_exec_core_plan"] = {
+            "strategy": planning_metadata.get("strategy"),
+            "fallback_reason": planning_metadata.get("fallback_reason"),
+            "capability_version": planning_metadata.get("capability_version"),
+        }
+        return cache_payload
+
+    def _finalize_planning_metadata(
+        self,
+        planning_metadata: Mapping[str, Any],
+        structured_output_hook: Optional[Callable[[str], Any]],
+    ) -> Dict[str, Any]:
+        finalized = deepcopy(dict(planning_metadata))
+        if (
+            structured_output_hook is not None
+            and finalized.get("validation_status") == "not_validated"
+        ):
+            finalized["validation_status"] = "hook_validated"
+        return finalized
+
+    def _build_request_plan(
+        self,
+        prompt: str,
+        stream: bool,
+        request_options: Mapping[str, Any] | None,
+        structured_output: Mapping[str, Any] | None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        data, core_default_fields = self._build_request_payload(
+            prompt,
+            stream,
+            request_options,
+        )
+        planning_metadata = self._plan_structured_output(
+            data,
+            structured_output,
+        )
+        self._plan_openrouter_core_parameters(data, core_default_fields)
+        self._validate_capability_aware_request(data, stream=stream)
+        return data, planning_metadata
+
     async def generate(
         self,
         prompt: str,
@@ -264,13 +709,23 @@ class LLMClient:
         trace_context: Optional[Dict[str, Any]] = None,
         run_id: str | None = None,
         request_id: str | None = None,
+        *,
+        request_options: Mapping[str, Any] | None = None,
+        structured_output: Mapping[str, Any] | None = None,
     ) -> LLMResult:
         """Generate a structured LLM result."""
         started_at = datetime.now()
         start_time = time.time()
+        data, planning_metadata = self._build_request_plan(
+            prompt,
+            stream,
+            request_options,
+            structured_output,
+        )
 
-        if self._cache_enabled:
-            cached_response = self._cache.get(prompt, self.model)
+        if self._cache_enabled and not stream:
+            cache_payload = self._build_cache_payload(data, planning_metadata)
+            cached_response = self._cache.get(cache_payload)
             if cached_response is not None:
                 logger.info("Cache hit for %s", request_name)
                 finished_at = datetime.now()
@@ -294,6 +749,10 @@ class LLMClient:
                         finished_at=finished_at,
                         duration_seconds=finished_at.timestamp()
                         - started_at.timestamp(),
+                        planning=self._finalize_planning_metadata(
+                            planning_metadata,
+                            structured_output_hook,
+                        ),
                     ),
                 )
                 if structured_output_hook is not None:
@@ -301,18 +760,6 @@ class LLMClient:
                 return result
 
         await self._wait_for_rate_limit()
-
-        data = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "stream": stream,
-            **self.request_overrides,
-        }
-
-        if stream:
-            data["stream_options"] = {"include_usage": True}
 
         retry_delay = INITIAL_RETRY_DELAY_SECONDS
         client = await self._get_client()
@@ -332,8 +779,11 @@ class LLMClient:
                     )
                     response_text, legacy_usage = legacy_result
 
-                if self._cache_enabled:
-                    self._cache.set(prompt, self.model, response_text)
+                if self._cache_enabled and not stream:
+                    self._cache.set(
+                        self._build_cache_payload(data, planning_metadata),
+                        response_text,
+                    )
 
                 finished_at = datetime.now()
                 result = LLMResult(
@@ -349,6 +799,10 @@ class LLMClient:
                         duration_seconds=legacy_usage["process_times"][
                             "total_time"
                         ],
+                        planning=self._finalize_planning_metadata(
+                            planning_metadata,
+                            structured_output_hook,
+                        ),
                     ),
                 )
                 if structured_output_hook is not None:
@@ -386,22 +840,23 @@ class LLMClient:
                     and isinstance(data.get("max_tokens"), int)
                     and data["max_tokens"] > retry_policy.max_tokens_limit
                 )
-                if status_code == 429:
+                if should_lower_max_tokens and retry_policy is not None:
+                    old_max = data["max_tokens"]
+                    data["max_tokens"] = min(
+                        retry_policy.max_tokens_limit,
+                        max(1, old_max // 2),
+                    )
+                    logger.warning(
+                        "HTTP error %s; lowering max_tokens %s -> %s "
+                        "and retrying...",
+                        status_code,
+                        old_max,
+                        data["max_tokens"],
+                    )
+                elif status_code == 429:
                     logger.warning(
                         "Rate limit exceeded (429), retrying in %s seconds...",
                         retry_delay,
-                    )
-                elif should_lower_max_tokens and retry_policy is not None:
-                    old_max = data["max_tokens"]
-                    data["max_tokens"] = max(
-                        1024,
-                        min(retry_policy.max_tokens_limit, old_max // 2),
-                    )
-                    logger.warning(
-                        "HTTP error 404; lowering max_tokens %s -> %s "
-                        "and retrying...",
-                        old_max,
-                        data["max_tokens"],
                     )
                 else:
                     logger.warning("HTTP error %s, retrying...", status_code)
@@ -421,6 +876,9 @@ class LLMClient:
         request_name: str = "unnamed_request",
         stream: bool = False,
         stream_callback: Optional[Callable[[str], None]] = None,
+        *,
+        request_options: Mapping[str, Any] | None = None,
+        structured_output: Mapping[str, Any] | None = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Generate a response using the LLM API (Async).
@@ -430,6 +888,9 @@ class LLMClient:
             request_name: Name of the request for token tracking
             stream: If True, stream the response
             stream_callback: Optional callback for streaming chunks.
+            request_options: Per-call Chat Completions request payload fields.
+            structured_output: Explicit semantic structured-output planner
+                request with require/prefer/off modes.
 
         Returns:
             Tuple containing:
@@ -441,6 +902,8 @@ class LLMClient:
             request_name=request_name,
             stream=stream,
             stream_callback=stream_callback,
+            request_options=request_options,
+            structured_output=structured_output,
         )
         return result.to_legacy_tuple()
 
@@ -640,6 +1103,7 @@ class LLMClient:
         started_at: datetime,
         finished_at: datetime,
         duration_seconds: float,
+        planning: Mapping[str, Any] | None = None,
     ) -> ExecutionMetadata:
         return ExecutionMetadata(
             request_id=request_id,
@@ -652,6 +1116,7 @@ class LLMClient:
             finished_at=finished_at.isoformat(),
             duration_seconds=duration_seconds,
             trace_context=dict(trace_context or {}),
+            planning=dict(planning or {}),
         )
 
     def get_token_usage(self) -> Dict[str, Any]:

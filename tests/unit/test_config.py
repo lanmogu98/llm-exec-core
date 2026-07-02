@@ -45,6 +45,236 @@ def test_get_model_details_returns_provider_name_settings_and_model():
     assert model_details.id == "provider-model-id"
 
 
+def test_model_details_accepts_capability_metadata():
+    config = {
+        "test-provider": {
+            **CUSTOM_CONFIG["test-provider"],
+            "models": {
+                "test-model": {
+                    "id": "provider-model-id",
+                    "pricing": {"input": 1.0, "output": 2.0},
+                    "capabilities": {
+                        "version": "unit-2026-07-02",
+                        "source": "unit",
+                        "source_date": "2026-07-02",
+                        "strict_response_schema": True,
+                        "json_object_response": True,
+                        "tools": True,
+                        "tool_streaming": False,
+                        "tool_choice": True,
+                        "parallel_tool_calls": True,
+                        "reasoning_controls": ["reasoning_effort"],
+                        "openrouter_supported_parameters": [
+                            "response_format",
+                            "tools",
+                        ],
+                    },
+                }
+            },
+        }
+    }
+
+    _, _, model_details = get_model_details("test-model", config)
+
+    assert model_details.capabilities is not None
+    assert model_details.capabilities.version == "unit-2026-07-02"
+    assert model_details.capabilities.strict_response_schema is True
+    assert model_details.capabilities.tool_streaming is False
+    assert model_details.capabilities.reasoning_controls == [
+        "reasoning_effort"
+    ]
+
+
+def test_default_config_includes_review_target_capabilities():
+    expected_models = {
+        "deepseek-v3.2": {
+            "id": "deepseek-v3-2-251201",
+            "strict": False,
+            "json": True,
+            "tools": True,
+            "tool_streaming": True,
+            "tool_choice": True,
+            "parallel": False,
+        },
+        "deepseek-r1": {
+            "id": "deepseek-r1-250528",
+            "strict": False,
+            "json": True,
+            "tools": True,
+            "tool_streaming": True,
+            "tool_choice": True,
+            "parallel": False,
+        },
+        "deepseek-v4-flash": {
+            "id": "deepseek-v4-flash",
+            "strict": False,
+            "json": True,
+            "tools": True,
+            "tool_streaming": True,
+            "tool_choice": True,
+            "parallel": False,
+        },
+        "deepseek-v4-pro": {
+            "id": "deepseek-v4-pro",
+            "strict": False,
+            "json": True,
+            "tools": True,
+            "tool_streaming": True,
+            "tool_choice": True,
+            "parallel": False,
+        },
+        "glm-5.2": {
+            "id": "glm-5.2",
+            "strict": False,
+            "json": True,
+            "tools": True,
+            "tool_streaming": True,
+            "tool_choice": True,
+            "parallel": False,
+        },
+        "glm-5.2-or": {
+            "id": "z-ai/glm-5.2",
+            "strict": True,
+            "json": True,
+            "tools": True,
+            "tool_streaming": True,
+            "tool_choice": True,
+            "parallel": True,
+        },
+        "qwen3.6-flash": {
+            "id": "qwen3.6-flash",
+            "strict": False,
+            "json": False,
+            "tools": False,
+            "tool_streaming": False,
+            "tool_choice": False,
+            "parallel": False,
+        },
+        "qwen-max": {
+            "id": "qwen-max",
+            "strict": False,
+            "json": False,
+            "tools": True,
+            "tool_streaming": False,
+            "tool_choice": True,
+            "parallel": False,
+        },
+        "gemini-3-flash": {
+            "id": "gemini-3-flash-preview",
+            "strict": True,
+            "json": True,
+            "tools": True,
+            "tool_streaming": True,
+            "tool_choice": True,
+            "parallel": False,
+        },
+        "gemini-3.1-flash-lite": {
+            "id": "gemini-3.1-flash-lite-preview",
+            "strict": True,
+            "json": True,
+            "tools": True,
+            "tool_streaming": True,
+            "tool_choice": True,
+            "parallel": False,
+        },
+        "gpt-5.5-or": {
+            "id": "openai/gpt-5.5",
+            "strict": True,
+            "json": True,
+            "tools": True,
+            "tool_streaming": True,
+            "tool_choice": True,
+            "parallel": False,
+        },
+        "claude-sonnet-5-or": {
+            "id": "anthropic/claude-sonnet-5",
+            "strict": True,
+            "json": True,
+            "tools": True,
+            "tool_streaming": True,
+            "tool_choice": True,
+            "parallel": False,
+        },
+        "claude-opus-4.8-or": {
+            "id": "anthropic/claude-opus-4.8",
+            "strict": True,
+            "json": True,
+            "tools": True,
+            "tool_streaming": True,
+            "tool_choice": True,
+            "parallel": False,
+        },
+        "doubao-seed-2.1-pro": {
+            "id": "doubao-seed-2-1-pro-260628",
+            "strict": True,
+            "json": True,
+            "tools": True,
+            "tool_streaming": True,
+            "tool_choice": True,
+            "parallel": False,
+        },
+    }
+
+    settings = load_all_settings()
+    models = {
+        model_name: model_details
+        for provider_settings in settings.values()
+        for model_name, model_details in provider_settings.models.items()
+    }
+
+    assert set(expected_models).issubset(models)
+    for model_name, expected in expected_models.items():
+        model_details = models[model_name]
+        capabilities = models[model_name].capabilities
+        assert capabilities is not None
+        assert model_details.id == expected["id"]
+        assert capabilities.version
+        assert capabilities.source
+        assert capabilities.source_date
+        assert capabilities.strict_response_schema is expected["strict"]
+        assert capabilities.json_object_response is expected["json"]
+        assert capabilities.tools is expected["tools"]
+        assert capabilities.tool_streaming is expected["tool_streaming"]
+        assert capabilities.tool_choice is expected["tool_choice"]
+        assert capabilities.parallel_tool_calls is expected["parallel"]
+
+
+def test_default_openrouter_capabilities_match_supported_parameters():
+    openrouter_models = {
+        "glm-5.2-or": {"max_tokens", "temperature"},
+        "gpt-5.5-or": {"max_tokens", "max_completion_tokens"},
+        "claude-sonnet-5-or": {"max_tokens", "max_completion_tokens"},
+        "claude-opus-4.8-or": {"max_tokens"},
+    }
+
+    settings = load_all_settings()
+    models = {
+        model_name: model_details
+        for provider_settings in settings.values()
+        for model_name, model_details in provider_settings.models.items()
+    }
+
+    for model_name, required_parameters in openrouter_models.items():
+        capabilities = models[model_name].capabilities
+        assert capabilities is not None
+        supported = capabilities.openrouter_supported_parameters
+        assert "response_format" in supported
+        assert "structured_outputs" in supported
+        assert "provider" not in supported
+        assert required_parameters.issubset(supported)
+
+    for model_name in (
+        "gpt-5.5-or",
+        "claude-sonnet-5-or",
+        "claude-opus-4.8-or",
+    ):
+        capabilities = models[model_name].capabilities
+        assert capabilities is not None
+        assert "temperature" not in (
+            capabilities.openrouter_supported_parameters
+        )
+
+
 def test_provider_settings_accepts_configured_max_tokens_retry_policy():
     config = {
         "test-provider": {

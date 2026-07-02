@@ -52,6 +52,7 @@ class ExecutionMetadata:
     finished_at: str
     duration_seconds: float
     trace_context: Dict[str, Any]
+    planning: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
