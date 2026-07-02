@@ -12,6 +12,8 @@
   `structured_output` fallback modes: strict schema when supported, JSON mode or
   prompt-only fallback for `prefer`, and fail-fast behavior for unsupported
   `require`.
+- Add OpenRouter supported-parameter planning for core-generated
+  `temperature`, `max_tokens`, and `max_completion_tokens` defaults.
 - Cache non-streaming responses by deterministic request payload instead of
   only model and prompt, and bypass response cache for streaming calls.
 

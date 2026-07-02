@@ -875,6 +875,99 @@ async def test_openrouter_tools_fail_without_supported_parameter(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_name", "api_key_env_var"),
+    [
+        ("gpt-5.5-or", "OPENAI_API_KEY_OPENROUTER"),
+        ("claude-sonnet-5-or", "ANTHROPIC_API_KEY_OPENROUTER"),
+        ("claude-opus-4.8-or", "ANTHROPIC_API_KEY_OPENROUTER"),
+    ],
+)
+async def test_openrouter_target_models_omit_unsupported_temperature_default(
+    monkeypatch,
+    model_name,
+    api_key_env_var,
+):
+    monkeypatch.setenv(api_key_env_var, "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(model_name)
+        assert client.capabilities is not None
+        assert "temperature" not in (
+            client.capabilities.openrouter_supported_parameters
+        )
+        await client.generate("Hello")
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert "temperature" not in payload
+
+
+@pytest.mark.asyncio
+async def test_openrouter_core_max_tokens_uses_supported_completion_tokens(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    capabilities = _strict_capabilities()
+    if "max_tokens" in capabilities["openrouter_supported_parameters"]:
+        capabilities["openrouter_supported_parameters"].remove("max_tokens")
+    capabilities["openrouter_supported_parameters"].append(
+        "max_completion_tokens"
+    )
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                model_capabilities=capabilities,
+                provider_name="openrouter-test",
+                api_base_url="https://openrouter.ai/api/v1/chat/completions",
+            ),
+        )
+        await client.generate("Hello")
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert "max_tokens" not in payload
+    assert payload["max_completion_tokens"] == 128
+
+
+@pytest.mark.asyncio
+async def test_openrouter_explicit_unsupported_temperature_fails(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    capabilities = _strict_capabilities()
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                model_capabilities=capabilities,
+                provider_name="openrouter-test",
+                api_base_url="https://openrouter.ai/api/v1/chat/completions",
+            ),
+        )
+        with pytest.raises(ValueError, match="does not support temperature"):
+            await client.generate(
+                "Hello",
+                request_options={"temperature": 0.2},
+            )
+
+    mock_httpx_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_openrouter_strict_schema_requires_structured_outputs_metadata(
     monkeypatch,
 ):

@@ -330,6 +330,8 @@ zhipu-openrouter:
           - tools
           - tool_choice
           - parallel_tool_calls
+          - max_tokens
+          - temperature
           - reasoning
           - include_reasoning
           - reasoning_effort
@@ -418,6 +420,7 @@ openai-openrouter:
           - structured_outputs
           - tools
           - tool_choice
+          - max_tokens
           - reasoning
           - include_reasoning
           - max_completion_tokens
@@ -452,6 +455,8 @@ anthropic-openrouter:
           - structured_outputs
           - tools
           - tool_choice
+          - max_tokens
+          - max_completion_tokens
           - reasoning
           - include_reasoning
           - verbosity
@@ -473,6 +478,7 @@ anthropic-openrouter:
           - structured_outputs
           - tools
           - tool_choice
+          - max_tokens
           - reasoning
           - include_reasoning
           - verbosity

@@ -50,13 +50,13 @@ passthrough routes and are outside the capability-aware guarantee.
 | Route / model | Strict response schema | JSON mode | Tools | Reasoning / thinking | Important constraints |
 | --- | --- | --- | --- | --- | --- |
 | Zhipu official `glm-5.2` | No official strict API `json_schema` response format found. | Yes: `response_format={"type":"json_object"}`. | Yes, with provider/model-specific tool-choice semantics. | Yes: `thinking` and `reasoning_effort`. | JSON Schema in Zhipu structured-output docs is caller-side prompt/validation guidance, not OpenAI-style strict API schema. |
-| OpenRouter `z-ai/glm-5.2` | Yes: OpenRouter models API reports `structured_outputs` and `response_format`. | Yes via `response_format`. | Yes: `tools`, `tool_choice`, `parallel_tool_calls`. | Yes: `reasoning`, `include_reasoning`, `reasoning_effort`. | Check `supported_parameters`; use `provider.require_parameters=true` or pin routing when correctness depends on schema/tools. |
+| OpenRouter `z-ai/glm-5.2` | Yes: OpenRouter models API reports `structured_outputs` and `response_format`. | Yes via `response_format`. | Yes: `tools`, `tool_choice`, `parallel_tool_calls`. | Yes: `reasoning`, `include_reasoning`, `reasoning_effort`. | Check `supported_parameters`; use `provider.require_parameters=true` or pin routing when correctness depends on schema/tools. `temperature` and `max_tokens` are listed. |
 | Qwen / Bailian `qwen3.6-flash` | No positive evidence in the Bailian OpenAI-compatible table. | No `response_format` listed in the compatible parameter table. | No confirmed tool support in the compatible table. | Provider/model-specific; do not assume OpenAI `reasoning_effort`. | Keep `tools` disabled until the Bailian migration issue confirms support. |
 | Qwen / Bailian `qwen-max` | No positive evidence for strict schema in the compatible table. | No `response_format` listed in the compatible table. | Yes for the `qwen-max` family in the documented compatible table. | Provider/model-specific. | Treat `qwen-max` as a moving latest-max alias, not a frozen historical model id; `tools + stream=True` is unsupported and fails fast. |
 | Gemini OpenAI compatibility `gemini-3-flash-preview` | Use compatibility-layer `response_format` / SDK parse support where documented. | Compatibility-layer behavior only. | Yes through OpenAI-compatible tool-calling examples. | Yes: `reasoning_effort` maps to Gemini thinking controls for the Gemini 3 family. | Do not mix OpenAI `reasoning_effort` with Gemini-specific `extra_body.google.thinking_config` in the same request. |
 | Gemini OpenAI compatibility `gemini-3.1-flash-lite-preview` | Same compatibility-layer boundary as Gemini 3 Flash. | Same as Gemini 3 Flash. | Same as Gemini 3 Flash. | Yes: documented compatibility mapping includes Gemini 3.1 Flash-Lite. | Use exactly what the compatibility framework exposes. |
-| OpenRouter `openai/gpt-5.5` | Yes: OpenRouter models API reports `structured_outputs` and `response_format`. | Yes. | Yes: `tools`, `tool_choice`. | Yes: `reasoning`, `include_reasoning`. | Current `supported_parameters` do not include generic `temperature/top_p`; docs/examples must not claim sampling controls are universal. |
-| OpenRouter `anthropic/claude-sonnet-5` | Yes: OpenRouter models API reports `structured_outputs` and `response_format`. | Yes. | Yes: `tools`, `tool_choice`. | Yes: `reasoning`, `include_reasoning`; also `verbosity`. | Use `supported_parameters`; do not assume OpenAI sampling knobs unless listed. |
+| OpenRouter `openai/gpt-5.5` | Yes: OpenRouter models API reports `structured_outputs` and `response_format`. | Yes. | Yes: `tools`, `tool_choice`. | Yes: `reasoning`, `include_reasoning`. | Current `supported_parameters` include token-limit controls but not generic `temperature/top_p`; docs/examples must not claim sampling controls are universal. |
+| OpenRouter `anthropic/claude-sonnet-5` | Yes: OpenRouter models API reports `structured_outputs` and `response_format`. | Yes. | Yes: `tools`, `tool_choice`. | Yes: `reasoning`, `include_reasoning`; also `verbosity`. | Token-limit controls are listed, but generic sampling knobs are not assumed unless listed. |
 | OpenRouter `anthropic/claude-opus-4.8` | Yes: OpenRouter models API reports `structured_outputs` and `response_format`. | Yes. | Yes: `tools`, `tool_choice`. | Yes: `reasoning`, `include_reasoning`; also `verbosity`. | `max_completion_tokens` support differs between Anthropic OpenRouter variants; use model-specific `supported_parameters`. |
 | Volcengine `doubao-seed-2-1-pro-260628` | Yes: Volcengine Chat API documents `response_format.json_schema`; model list marks this model with structured-output support. | Yes: `json_object` mode documented. | Yes: model list marks tool support; Chat API documents `tools` / `tool_choice`. | Yes: model list marks deep thinking; Chat API documents thinking/reasoning controls. | Support is model-specific; API-level support does not imply all Ark models support the same extension set. |
 | DeepSeek official `deepseek-v4-flash`, `deepseek-v4-pro` | No strict API `json_schema` response format. | Yes: `response_format.type=json_object`. | Yes: tools/tool_choice and JSON Schema tool parameters are documented. | Yes: `thinking` and `reasoning_effort`. | JSON mode requires explicit JSON instruction; schema adherence must be caller-validated. |
@@ -103,6 +103,13 @@ core-generated default `max_tokens` is omitted. An explicit `max_tokens` in
 provider or per-call options remains in the payload and follows normal
 precedence.
 
+On OpenRouter routes with capability metadata, core-generated `temperature`,
+`max_tokens`, and `max_completion_tokens` are planned against
+`supported_parameters`. Unsupported generated defaults are omitted; a generated
+`max_tokens` is converted to `max_completion_tokens` when only that token-limit
+parameter is listed. Explicit provider/per-call values for unsupported fields
+fail fast instead of being sent silently.
+
 `stream_options` is deep-merged as provider first, then per-call. When
 `stream=True`, `include_usage: true` is added when final `stream_options` is
 absent. Mapping-valued `stream_options` keeps caller values and receives
@@ -130,6 +137,9 @@ capability metadata. Raw unknown/provider-specific fields still pass through.
   requests set `provider.require_parameters=true` in the planned payload.
   Missing OpenRouter `supported_parameters` metadata fails closed for those
   correctness-dependent fields.
+- On OpenRouter routes, core defaults for `temperature`, `max_tokens`, and
+  `max_completion_tokens` are also checked against `supported_parameters` before
+  sending the request.
 
 `structured_output` planning chooses one of these strategies:
 

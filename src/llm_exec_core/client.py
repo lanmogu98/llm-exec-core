@@ -335,7 +335,7 @@ class LLMClient:
         prompt: str,
         stream: bool,
         request_options: Mapping[str, Any] | None,
-    ) -> Dict[str, Any]:
+    ) -> Tuple[Dict[str, Any], set[str]]:
         provider_options = self._normalize_request_options(
             self.request_overrides
         )
@@ -364,6 +364,10 @@ class LLMClient:
             "max_completion_tokens" in provider_options
             or "max_completion_tokens" in per_call_options
         )
+        has_explicit_temperature = (
+            "temperature" in provider_options
+            or "temperature" in per_call_options
+        )
 
         data: Dict[str, Any] = {
             "model": self.model,
@@ -371,11 +375,16 @@ class LLMClient:
             "temperature": self.temperature,
             "stream": stream,
         }
+        core_default_fields = {"temperature"}
         if not has_max_completion_tokens or has_explicit_max_tokens:
             data["max_tokens"] = self.max_tokens
+            if not has_explicit_max_tokens:
+                core_default_fields.add("max_tokens")
 
         data.update(provider_options)
         data.update(per_call_options)
+        if has_explicit_temperature:
+            core_default_fields.discard("temperature")
 
         if stream_options is not _MISSING:
             data["stream_options"] = stream_options
@@ -388,7 +397,7 @@ class LLMClient:
                 merged_stream_options.setdefault("include_usage", True)
                 data["stream_options"] = merged_stream_options
 
-        return data
+        return data, core_default_fields
 
     def _validate_structured_output_planner(
         self,
@@ -459,6 +468,39 @@ class LLMClient:
                 f"{self.model_name} does not support {parameter} through "
                 "OpenRouter supported_parameters."
             )
+
+    def _plan_openrouter_core_parameters(
+        self,
+        data: Dict[str, Any],
+        core_default_fields: set[str],
+    ) -> None:
+        capabilities = self.capabilities
+        if capabilities is None or not self._is_openrouter_route():
+            return
+
+        supported = capabilities.openrouter_supported_parameters
+        for parameter in (
+            "temperature",
+            "max_tokens",
+            "max_completion_tokens",
+        ):
+            if parameter not in data or parameter in supported:
+                continue
+            if parameter not in core_default_fields:
+                self._validate_openrouter_supported_parameter(
+                    parameter,
+                    capabilities,
+                )
+
+            value = data.pop(parameter)
+            if (
+                parameter == "max_tokens"
+                and "max_completion_tokens" in supported
+                and "max_completion_tokens" not in data
+            ):
+                data["max_completion_tokens"] = value
+                core_default_fields.add("max_completion_tokens")
+            core_default_fields.discard(parameter)
 
     def _validate_capability_aware_request(
         self,
@@ -644,11 +686,16 @@ class LLMClient:
         request_options: Mapping[str, Any] | None,
         structured_output: Mapping[str, Any] | None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        data = self._build_request_payload(prompt, stream, request_options)
+        data, core_default_fields = self._build_request_payload(
+            prompt,
+            stream,
+            request_options,
+        )
         planning_metadata = self._plan_structured_output(
             data,
             structured_output,
         )
+        self._plan_openrouter_core_parameters(data, core_default_fields)
         self._validate_capability_aware_request(data, stream=stream)
         return data, planning_metadata
 

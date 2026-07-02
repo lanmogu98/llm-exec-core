@@ -63,6 +63,9 @@ That example is route/model-specific; it should not be read as universal support
 across every configured model. Some routes expose JSON mode without strict
 schema support, some require caller-side validation, and Qwen/Bailian compatible
 docs currently say `tools` cannot be used with `stream=True`.
+On OpenRouter routes with capability metadata, unsupported core defaults such as
+`temperature` are omitted before sending; explicit unsupported per-call values
+fail fast.
 
 `generate_response()` accepts the same `request_options` argument for legacy
 tuple-returning call sites. Core-owned fields (`model`, `messages`, and
