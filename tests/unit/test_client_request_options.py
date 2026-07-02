@@ -131,13 +131,25 @@ async def test_generate_rejects_protected_request_option_fields(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "request_overrides",
+    [
+        {"model": "other-model"},
+        {"messages": [{"role": "user", "content": "override"}]},
+        {"stream": True},
+        {"extra_body": {"model": "other-model"}},
+        {"extra_body": {"messages": []}},
+        {"extra_body": {"stream": True}},
+    ],
+)
 async def test_generate_rejects_protected_provider_request_overrides(
     monkeypatch,
+    request_overrides,
 ):
     monkeypatch.setenv("TEST_API_KEY", "test-key")
     client = LLMClient(
         "test-model",
-        config_source=_config(request_overrides={"stream": True}),
+        config_source=_config(request_overrides=request_overrides),
     )
 
     with pytest.raises(
@@ -216,6 +228,25 @@ async def test_generate_response_accepts_request_options(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_non_streaming_without_stream_options_omits_stream_options(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient("test-model", config_source=_config())
+        await client.generate("Hello")
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert "stream_options" not in payload
+
+
+@pytest.mark.asyncio
 async def test_generate_passes_reasoning_and_tool_controls(monkeypatch):
     monkeypatch.setenv("TEST_API_KEY", "test-key")
     tool = {
@@ -281,6 +312,37 @@ async def test_cache_key_includes_request_options(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cache_key_includes_reasoning_effort(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.side_effect = [
+            _success_response("low-reasoning"),
+            _success_response("high-reasoning"),
+        ]
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient("test-model", config_source=_config())
+        _disable_rate_limit(client)
+        client._cache_enabled = True
+
+        first = await client.generate(
+            "Hello",
+            request_options={"reasoning_effort": "low"},
+        )
+        second = await client.generate(
+            "Hello",
+            request_options={"reasoning_effort": "high"},
+        )
+
+    assert first.text == "low-reasoning"
+    assert second.text == "high-reasoning"
+    assert mock_httpx_client.post.await_count == 2
+    assert client.get_cache_stats()["misses"] == 2
+
+
+@pytest.mark.asyncio
 async def test_cache_key_includes_openrouter_provider_routing(monkeypatch):
     monkeypatch.setenv("TEST_API_KEY", "test-key")
 
@@ -309,6 +371,34 @@ async def test_cache_key_includes_openrouter_provider_routing(monkeypatch):
     assert second.text == "anthropic-route"
     assert mock_httpx_client.post.await_count == 2
     assert client.get_cache_stats()["misses"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cache_key_uses_normalized_extra_body(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response("cached")
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient("test-model", config_source=_config())
+        _disable_rate_limit(client)
+        client._cache_enabled = True
+
+        first = await client.generate(
+            "Hello",
+            request_options={"extra_body": {"top_p": 0.2}},
+        )
+        second = await client.generate(
+            "Hello",
+            request_options={"top_p": 0.2},
+        )
+
+    assert first.text == "cached"
+    assert second.text == "cached"
+    assert mock_httpx_client.post.await_count == 1
+    assert client.get_cache_stats()["hits"] == 1
 
 
 @pytest.mark.asyncio
@@ -469,6 +559,46 @@ async def test_streaming_merges_stream_options_and_bypasses_cache(monkeypatch):
     }
     assert client.get_cache_stats()["hits"] == 0
     assert client.get_cache_stats()["misses"] == 0
+
+
+@pytest.mark.asyncio
+async def test_streaming_adds_usage_to_mapping_stream_options_when_absent(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    payloads = []
+
+    async def mock_lines():
+        yield 'data: {"choices": [{"delta": {"content": "A"}}]}'
+        yield 'data: {"usage": {"prompt_tokens": 5, "completion_tokens": 6}}'
+        yield "data: [DONE]"
+
+    @asynccontextmanager
+    async def mock_stream(*args, **kwargs):
+        payloads.append(kwargs["json"])
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.aiter_lines = mock_lines
+        yield response
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.stream = mock_stream
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient("test-model", config_source=_config())
+        _disable_rate_limit(client)
+
+        await client.generate_response(
+            "Hello",
+            stream=True,
+            request_options={"stream_options": {"chunk_size": 1}},
+        )
+
+    assert payloads[0]["stream_options"] == {
+        "chunk_size": 1,
+        "include_usage": True,
+    }
 
 
 @pytest.mark.asyncio

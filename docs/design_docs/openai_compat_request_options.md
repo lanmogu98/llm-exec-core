@@ -69,12 +69,13 @@ provider or per-call options remains in the payload and follows normal
 precedence.
 
 `stream_options` is deep-merged as provider first, then per-call. When
-`stream=True`, `include_usage: true` is added only when the final payload has no
-`stream_options` key after the merge. Mapping-valued `stream_options` keeps
-caller values and receives `include_usage: true` only when that key is absent.
-An explicit per-call `stream_options: None` is considered present: it clears any
-provider `stream_options` and suppresses the core `include_usage` default. Omit
-`stream_options` to receive the default streaming usage request.
+`stream=True`, `include_usage: true` is added when final `stream_options` is
+absent. Mapping-valued `stream_options` keeps caller values and receives
+`include_usage: true` only when that key is absent. Other explicit values are
+considered present and are not modified. An explicit per-call
+`stream_options: None` clears any provider `stream_options` and suppresses the
+core `include_usage` default. Omit `stream_options` to receive the default
+streaming usage request.
 
 For non-streaming calls, `stream_options` is included only when explicitly
 provided by provider or per-call options.
