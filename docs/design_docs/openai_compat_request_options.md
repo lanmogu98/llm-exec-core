@@ -13,7 +13,9 @@ protected-field semantics.
 This feature is not a semantic structured-output planner. It does not choose
 strict schema vs. JSON mode vs. tool-call extraction, rewrite unsupported fields,
 execute tools, parse tool-call responses, add runtime capability filtering, or
-implement the OpenAI Responses API.
+implement the OpenAI Responses API. The explicit `structured_output` argument is
+a guardrail for that future planner: `mode="off"` is a no-op, while
+`mode="require"` and `mode="prefer"` fail fast until the semantic planner exists.
 
 ## Target Model Scope
 
@@ -60,12 +62,18 @@ raw `request_options`. Core does not enforce these capabilities.
 
 ## Public API
 
-Both request methods accept keyword-only `request_options:
-Mapping[str, Any] | None = None`.
+Both request methods accept keyword-only
+`request_options: Mapping[str, Any] | None = None` and
+`structured_output: Mapping[str, Any] | None = None`.
 
 `request_options` is for HTTP request payload fields only. Metadata such as
 `request_name`, callbacks, `trace_context`, `run_id`, `request_id`, and
 `structured_output_hook` never enters the HTTP payload or cache key.
+
+`structured_output` is an explicit semantic-planner entry point, not raw
+transport. In this PR only `{"mode": "off"}` is accepted as a no-op. The
+`require` and `prefer` modes raise `NotImplementedError` before any HTTP request
+so callers cannot mistake raw passthrough for graceful fallback.
 
 ## Payload Construction
 
@@ -118,7 +126,8 @@ and `stream` are included. Non-request metadata is excluded.
 ## Semantic Fallback Boundary
 
 Graceful structured-output fallback should be a separate semantic layer, not
-hidden inside raw `request_options`.
+hidden inside raw `request_options`. PR #4 reserves that boundary with a
+fail-fast `structured_output` argument, but does not implement the planner.
 
 A future API can make that policy explicit, for example:
 

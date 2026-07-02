@@ -34,6 +34,7 @@ from .types import ExecutionMetadata, LLMResult, TokenUsage
 logger = logging.getLogger(__name__)
 
 _PROTECTED_REQUEST_FIELDS = {"model", "messages", "stream"}
+_STRUCTURED_OUTPUT_MODES = {"require", "prefer", "off"}
 _MISSING = object()
 
 
@@ -381,6 +382,29 @@ class LLMClient:
 
         return data
 
+    def _validate_structured_output_planner(
+        self,
+        structured_output: Mapping[str, Any] | None,
+    ) -> None:
+        if structured_output is None:
+            return
+        if not isinstance(structured_output, Mapping):
+            raise TypeError("structured_output must be a mapping.")
+
+        mode = structured_output.get("mode", "require")
+        if mode not in _STRUCTURED_OUTPUT_MODES:
+            raise ValueError(
+                "structured_output.mode must be one of: require, prefer, off."
+            )
+        if mode == "off":
+            return
+
+        raise NotImplementedError(
+            "semantic structured_output planner is not implemented. "
+            "Use request_options for raw provider/model-specific payload "
+            "fields, or pass structured_output={'mode': 'off'}."
+        )
+
     async def generate(
         self,
         prompt: str,
@@ -393,10 +417,12 @@ class LLMClient:
         request_id: str | None = None,
         *,
         request_options: Mapping[str, Any] | None = None,
+        structured_output: Mapping[str, Any] | None = None,
     ) -> LLMResult:
         """Generate a structured LLM result."""
         started_at = datetime.now()
         start_time = time.time()
+        self._validate_structured_output_planner(structured_output)
         data = self._build_request_payload(prompt, stream, request_options)
 
         if self._cache_enabled and not stream:
@@ -542,6 +568,7 @@ class LLMClient:
         stream_callback: Optional[Callable[[str], None]] = None,
         *,
         request_options: Mapping[str, Any] | None = None,
+        structured_output: Mapping[str, Any] | None = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Generate a response using the LLM API (Async).
@@ -552,6 +579,9 @@ class LLMClient:
             stream: If True, stream the response
             stream_callback: Optional callback for streaming chunks.
             request_options: Per-call Chat Completions request payload fields.
+            structured_output: Explicit semantic structured-output planner
+                request. Only mode="off" is currently supported; require/prefer
+                fail fast so fallback is not hidden in raw request_options.
 
         Returns:
             Tuple containing:
@@ -564,6 +594,7 @@ class LLMClient:
             stream=stream,
             stream_callback=stream_callback,
             request_options=request_options,
+            structured_output=structured_output,
         )
         return result.to_legacy_tuple()
 

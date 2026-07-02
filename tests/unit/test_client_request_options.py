@@ -281,6 +281,94 @@ async def test_generate_passes_reasoning_and_tool_controls(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_structured_output_require_fails_fast_without_http_call(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient("test-model", config_source=_config())
+        with pytest.raises(
+            NotImplementedError,
+            match="semantic structured_output planner is not implemented",
+        ):
+            await client.generate(
+                "Hello",
+                structured_output={
+                    "schema": {"type": "object"},
+                    "mode": "require",
+                },
+            )
+
+    mock_httpx_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generate_response_structured_output_prefer_fails_fast(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient("test-model", config_source=_config())
+        with pytest.raises(
+            NotImplementedError,
+            match="semantic structured_output planner is not implemented",
+        ):
+            await client.generate_response(
+                "Hello",
+                structured_output={
+                    "schema": {"type": "object"},
+                    "mode": "prefer",
+                },
+            )
+
+    mock_httpx_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_structured_output_off_leaves_raw_payload_unchanged(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient("test-model", config_source=_config())
+        await client.generate(
+            "Hello",
+            request_options={"top_p": 0.2},
+            structured_output={"mode": "off"},
+        )
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert payload["top_p"] == 0.2
+    assert "structured_output" not in payload
+
+
+@pytest.mark.asyncio
+async def test_structured_output_rejects_unknown_mode(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    client = LLMClient("test-model", config_source=_config())
+
+    with pytest.raises(ValueError, match="structured_output.mode"):
+        await client.generate(
+            "Hello",
+            structured_output={"mode": "silent"},
+        )
+
+
+@pytest.mark.asyncio
 async def test_cache_key_includes_request_options(monkeypatch):
     monkeypatch.setenv("TEST_API_KEY", "test-key")
 

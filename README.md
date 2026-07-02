@@ -70,6 +70,11 @@ through unchanged. See
 [`docs/design_docs/openai_compat_request_options.md`](docs/design_docs/openai_compat_request_options.md)
 for the current target-model matrix and fallback boundary.
 
+For semantic structured-output fallback, use the explicit `structured_output`
+argument instead of hiding fallback policy inside `request_options`. In this
+release only `structured_output={"mode": "off"}` is accepted as a no-op;
+`mode="require"` and `mode="prefer"` fail fast until the planner is implemented.
+
 This repo is also used for coordinated local development with sibling
 checkouts during the current extraction/migration work.
 
