@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class Pricing(BaseModel):
@@ -12,9 +12,24 @@ class Pricing(BaseModel):
     output: float
 
 
+class ModelCapabilities(BaseModel):
+    version: str
+    source: str
+    source_date: str
+    strict_response_schema: bool = False
+    json_object_response: bool = False
+    tools: bool = False
+    tool_streaming: bool = True
+    tool_choice: bool = False
+    parallel_tool_calls: bool = False
+    reasoning_controls: List[str] = Field(default_factory=list)
+    openrouter_supported_parameters: List[str] = Field(default_factory=list)
+
+
 class ModelDetails(BaseModel):
     id: str
     pricing: Pricing
+    capabilities: Optional[ModelCapabilities] = None
 
 
 class RateLimitSettings(BaseModel):

@@ -4,7 +4,7 @@ from llm_exec_core.types import ExecutionMetadata, LLMResult, TokenUsage
 def test_package_imports_with_version():
     import llm_exec_core
 
-    assert llm_exec_core.__version__ == "0.1.0"
+    assert llm_exec_core.__version__ == "0.2.0"
 
 
 def test_llm_result_to_legacy_tuple_preserves_existing_usage_shape():
