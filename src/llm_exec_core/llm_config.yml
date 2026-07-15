@@ -124,7 +124,7 @@ gemini:
     gemini-3-flash:
       id: "gemini-3-flash-preview"
       pricing: { input: 0.5, output: 3.00 }
-      capabilities:
+      capabilities: &gemini_3_flash_capabilities
         version: "gemini-openai-compat-2026-07-02"
         source: "https://ai.google.dev/gemini-api/docs/openai"
         source_date: "2026-07-02"
@@ -137,7 +137,7 @@ gemini:
     gemini-3.1-flash-lite:
       id: "gemini-3.1-flash-lite-preview"
       pricing: { input: 0.25, output: 1.50 }
-      capabilities:
+      capabilities: &gemini_3_1_flash_lite_capabilities
         version: "gemini-openai-compat-2026-07-02"
         source: "https://ai.google.dev/gemini-api/docs/openai"
         source_date: "2026-07-02"
@@ -182,9 +182,11 @@ gemini-free:
     gemini-3-flash-free:
       id: "gemini-3-flash-preview"
       pricing: { input: 0.0, output: 0.0 }
+      capabilities: *gemini_3_flash_capabilities
     gemini-3.1-flash-lite-free:
       id: "gemini-3.1-flash-lite-preview"
       pricing: { input: 0.0, output: 0.0 }
+      capabilities: *gemini_3_1_flash_lite_capabilities
 
 # kimi-volcengine: sunset by Volcengine (model id "kimi-k2-250905" returns 404
 # as of 2026-05-09; Moonshot's official K2 series sunset is 2026-05-25). Block
@@ -314,9 +316,9 @@ zhipu-openrouter:
       id: "z-ai/glm-5.2"
       pricing: {input: 1.05, output: 3.50}
       capabilities:
-        version: "openrouter-z-ai-glm-5.2-2026-07-02"
+        version: "openrouter-z-ai-glm-5.2-2026-07-15"
         source: "https://openrouter.ai/api/v1/models"
-        source_date: "2026-07-02"
+        source_date: "2026-07-15"
         strict_response_schema: true
         json_object_response: true
         tools: true
@@ -406,15 +408,15 @@ openai-openrouter:
       id: "openai/gpt-5.5"
       pricing: {input: 5.00, output: 30.00}
       capabilities:
-        version: "openrouter-openai-gpt-5.5-2026-07-02"
+        version: "openrouter-openai-gpt-5.5-2026-07-15"
         source: "https://openrouter.ai/api/v1/models"
-        source_date: "2026-07-02"
+        source_date: "2026-07-15"
         strict_response_schema: true
         json_object_response: true
         tools: true
         tool_streaming: true
         tool_choice: true
-        reasoning_controls: ["reasoning", "include_reasoning"]
+        reasoning_controls: ["reasoning", "include_reasoning", "reasoning_effort"]
         openrouter_supported_parameters:
           - response_format
           - structured_outputs
@@ -423,6 +425,7 @@ openai-openrouter:
           - max_tokens
           - reasoning
           - include_reasoning
+          - reasoning_effort
           - max_completion_tokens
 
 anthropic-openrouter:
@@ -441,15 +444,15 @@ anthropic-openrouter:
       id: "anthropic/claude-sonnet-5"
       pricing: {input: 3.00, output: 15.00}
       capabilities:
-        version: "openrouter-anthropic-sonnet-5-2026-07-02"
+        version: "openrouter-anthropic-sonnet-5-2026-07-15"
         source: "https://openrouter.ai/api/v1/models"
-        source_date: "2026-07-02"
+        source_date: "2026-07-15"
         strict_response_schema: true
         json_object_response: true
         tools: true
         tool_streaming: true
         tool_choice: true
-        reasoning_controls: ["reasoning", "include_reasoning", "verbosity"]
+        reasoning_controls: ["reasoning", "include_reasoning", "reasoning_effort", "verbosity"]
         openrouter_supported_parameters:
           - response_format
           - structured_outputs
@@ -459,28 +462,32 @@ anthropic-openrouter:
           - max_completion_tokens
           - reasoning
           - include_reasoning
+          - reasoning_effort
           - verbosity
     claude-opus-4.8-or:
       id: "anthropic/claude-opus-4.8"
       pricing: {input: 5.00, output: 25.00}
       capabilities:
-        version: "openrouter-anthropic-opus-4.8-2026-07-02"
+        version: "openrouter-anthropic-opus-4.8-2026-07-15"
         source: "https://openrouter.ai/api/v1/models"
-        source_date: "2026-07-02"
+        source_date: "2026-07-15"
         strict_response_schema: true
         json_object_response: true
         tools: true
         tool_streaming: true
         tool_choice: true
-        reasoning_controls: ["reasoning", "include_reasoning", "verbosity"]
+        reasoning_controls: ["reasoning", "include_reasoning", "reasoning_effort", "verbosity"]
         openrouter_supported_parameters:
           - response_format
           - structured_outputs
           - tools
           - tool_choice
           - max_tokens
+          - max_completion_tokens
+          - temperature
           - reasoning
           - include_reasoning
+          - reasoning_effort
           - verbosity
     claude-sonnet-4-or:
       id: "anthropic/claude-sonnet-4"

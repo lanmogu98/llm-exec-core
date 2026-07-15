@@ -12,6 +12,7 @@ license = "LicenseRef-Proprietary"
 authors = [{ name = "mogu" }]
 dependencies = [
     "httpx>=0.25.0",
+    "jsonschema>=4.26.0",
     "pydantic>=2",
     "pyyaml",
 ]
@@ -24,6 +25,7 @@ dev = [
     "flake8>=6.0.0",
     "mypy>=1.0.0",
     "types-PyYAML",
+    "types-jsonschema>=4.26.0.20260518",
 ]
 
 [tool.black]
