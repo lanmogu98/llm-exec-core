@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import httpx
+import jsonschema
 
 from .config import ModelCapabilities, get_model_details, get_supported_models
 from .constants import (
@@ -43,6 +44,14 @@ _KNOWN_CAPABILITY_CONTROL_FIELDS = {
     "verbosity",
 }
 _MISSING = object()
+
+
+def _reject_non_finite_json_constant(value: str) -> None:
+    raise ValueError(f"{value} is not valid JSON.")
+
+
+class StructuredOutputValidationError(ValueError):
+    """Raised when a structured response fails client-side validation."""
 
 
 class ResponseCache:
@@ -94,6 +103,11 @@ class ResponseCache:
             self._cache.popitem(last=False)
 
         self._cache[key] = (response, time.time())
+
+    def delete(self, request_payload: Mapping[str, Any]) -> None:
+        """Delete a cached response if present."""
+        key = self._make_key(request_payload)
+        self._cache.pop(key, None)
 
     def get_stats(self) -> Dict[str, Any]:
         """Return cache statistics."""
@@ -430,6 +444,7 @@ class LLMClient:
             "fallback_reason": fallback_reason,
             "validation_status": validation_status,
             "capability_version": capability_version,
+            "hook_applied": False,
         }
 
     def _is_openrouter_route(self) -> bool:
@@ -437,6 +452,38 @@ class LLMClient:
             "openrouter" in self.provider_name
             or "openrouter.ai" in self.api_url
         )
+
+    def _is_gemini_route(self) -> bool:
+        return self.provider_name.startswith("gemini") or (
+            "generativelanguage.googleapis.com" in self.api_url
+        )
+
+    def _validate_gemini_thinking_controls(
+        self,
+        data: Mapping[str, Any],
+    ) -> None:
+        if not self._is_gemini_route() or "reasoning_effort" not in data:
+            return
+
+        google_options = [data.get("google")]
+        extra_body = data.get("extra_body")
+        if isinstance(extra_body, Mapping):
+            google_options.append(extra_body.get("google"))
+
+        for google in google_options:
+            if not isinstance(google, Mapping):
+                continue
+            thinking_config = google.get("thinking_config")
+            if not isinstance(thinking_config, Mapping):
+                continue
+            if "thinking_level" in thinking_config or (
+                "thinking_budget" in thinking_config
+            ):
+                raise ValueError(
+                    "reasoning_effort cannot be combined with "
+                    "google.thinking_config thinking_level or "
+                    "thinking_budget."
+                )
 
     def _ensure_openrouter_require_parameters(
         self,
@@ -666,18 +713,45 @@ class LLMClient:
         }
         return cache_payload
 
-    def _finalize_planning_metadata(
+    def _process_response(
         self,
+        response_text: str,
         planning_metadata: Mapping[str, Any],
+        structured_output: Mapping[str, Any] | None,
         structured_output_hook: Optional[Callable[[str], Any]],
-    ) -> Dict[str, Any]:
+    ) -> Tuple[Any | None, Dict[str, Any]]:
         finalized = deepcopy(dict(planning_metadata))
-        if (
-            structured_output_hook is not None
-            and finalized.get("validation_status") == "not_validated"
-        ):
-            finalized["validation_status"] = "hook_validated"
-        return finalized
+        structured: Any | None = None
+        mode = self._validate_structured_output_planner(structured_output)
+
+        if mode != "off":
+            if not isinstance(structured_output, Mapping):
+                raise TypeError("structured_output must be a mapping.")
+            schema = structured_output.get("schema")
+            if not isinstance(schema, Mapping):
+                raise ValueError("structured_output.schema must be a mapping.")
+            try:
+                structured = json.loads(
+                    response_text,
+                    parse_constant=_reject_non_finite_json_constant,
+                )
+                jsonschema.validate(instance=structured, schema=schema)
+            except (
+                ValueError,
+                jsonschema.exceptions.SchemaError,
+                jsonschema.exceptions.ValidationError,
+            ) as error:
+                raise StructuredOutputValidationError(
+                    "Structured output validation failed: response is not "
+                    "valid JSON matching the requested schema."
+                ) from error
+            finalized["validation_status"] = "client_validated"
+
+        if structured_output_hook is not None:
+            structured = structured_output_hook(response_text)
+            finalized["hook_applied"] = True
+
+        return structured, finalized
 
     def _build_request_plan(
         self,
@@ -696,6 +770,7 @@ class LLMClient:
             structured_output,
         )
         self._plan_openrouter_core_parameters(data, core_default_fields)
+        self._validate_gemini_thinking_controls(data)
         self._validate_capability_aware_request(data, stream=stream)
         return data, planning_metadata
 
@@ -728,6 +803,16 @@ class LLMClient:
             cached_response = self._cache.get(cache_payload)
             if cached_response is not None:
                 logger.info("Cache hit for %s", request_name)
+                try:
+                    structured, finalized_planning = self._process_response(
+                        cached_response,
+                        planning_metadata,
+                        structured_output,
+                        structured_output_hook,
+                    )
+                except Exception:
+                    self._cache.delete(cache_payload)
+                    raise
                 finished_at = datetime.now()
                 result = LLMResult(
                     text=cached_response,
@@ -749,14 +834,10 @@ class LLMClient:
                         finished_at=finished_at,
                         duration_seconds=finished_at.timestamp()
                         - started_at.timestamp(),
-                        planning=self._finalize_planning_metadata(
-                            planning_metadata,
-                            structured_output_hook,
-                        ),
+                        planning=finalized_planning,
                     ),
+                    structured=structured,
                 )
-                if structured_output_hook is not None:
-                    result.structured = structured_output_hook(result.text)
                 return result
 
         await self._wait_for_rate_limit()
@@ -779,6 +860,12 @@ class LLMClient:
                     )
                     response_text, legacy_usage = legacy_result
 
+                structured, finalized_planning = self._process_response(
+                    response_text,
+                    planning_metadata,
+                    structured_output,
+                    structured_output_hook,
+                )
                 if self._cache_enabled and not stream:
                     self._cache.set(
                         self._build_cache_payload(data, planning_metadata),
@@ -799,14 +886,10 @@ class LLMClient:
                         duration_seconds=legacy_usage["process_times"][
                             "total_time"
                         ],
-                        planning=self._finalize_planning_metadata(
-                            planning_metadata,
-                            structured_output_hook,
-                        ),
+                        planning=finalized_planning,
                     ),
+                    structured=structured,
                 )
-                if structured_output_hook is not None:
-                    result.structured = structured_output_hook(result.text)
                 return result
             except asyncio.CancelledError:
                 raise

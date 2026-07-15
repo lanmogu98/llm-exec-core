@@ -56,6 +56,8 @@ async def test_generate_applies_structured_output_hook(monkeypatch):
     assert result.metadata.model_id == "provider-model-id"
     assert result.metadata.duration_seconds > 0
     assert result.metadata.trace_context == {"source": "unit"}
+    assert result.metadata.planning["validation_status"] == "not_applicable"
+    assert result.metadata.planning["hook_applied"] is True
 
 
 @pytest.mark.asyncio

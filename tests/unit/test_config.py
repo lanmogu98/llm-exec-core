@@ -241,10 +241,23 @@ def test_default_config_includes_review_target_capabilities():
 
 def test_default_openrouter_capabilities_match_supported_parameters():
     openrouter_models = {
-        "glm-5.2-or": {"max_tokens", "temperature"},
-        "gpt-5.5-or": {"max_tokens", "max_completion_tokens"},
-        "claude-sonnet-5-or": {"max_tokens", "max_completion_tokens"},
-        "claude-opus-4.8-or": {"max_tokens"},
+        "glm-5.2-or": {"max_tokens", "temperature", "reasoning_effort"},
+        "gpt-5.5-or": {
+            "max_tokens",
+            "max_completion_tokens",
+            "reasoning_effort",
+        },
+        "claude-sonnet-5-or": {
+            "max_tokens",
+            "max_completion_tokens",
+            "reasoning_effort",
+        },
+        "claude-opus-4.8-or": {
+            "max_tokens",
+            "max_completion_tokens",
+            "reasoning_effort",
+            "temperature",
+        },
     }
 
     settings = load_all_settings()
@@ -262,17 +275,34 @@ def test_default_openrouter_capabilities_match_supported_parameters():
         assert "structured_outputs" in supported
         assert "provider" not in supported
         assert required_parameters.issubset(supported)
+        assert capabilities.source_date == "2026-07-15"
+        assert capabilities.version.endswith("2026-07-15")
 
     for model_name in (
         "gpt-5.5-or",
         "claude-sonnet-5-or",
-        "claude-opus-4.8-or",
     ):
         capabilities = models[model_name].capabilities
         assert capabilities is not None
         assert "temperature" not in (
             capabilities.openrouter_supported_parameters
         )
+
+
+def test_paid_and_free_gemini_aliases_share_model_capabilities():
+    settings = load_all_settings()
+
+    for paid_name, free_name in (
+        ("gemini-3-flash", "gemini-3-flash-free"),
+        ("gemini-3.1-flash-lite", "gemini-3.1-flash-lite-free"),
+    ):
+        paid = settings["gemini"].models[paid_name]
+        free = settings["gemini-free"].models[free_name]
+
+        assert paid.id == free.id
+        assert paid.capabilities is not None
+        assert free.capabilities == paid.capabilities
+        assert free.pricing != paid.pricing
 
 
 def test_provider_settings_accepts_configured_max_tokens_retry_policy():
