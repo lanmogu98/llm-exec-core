@@ -674,6 +674,8 @@ async def test_structured_output_validation_failure_does_not_populate_cache(
                 structured_output=structured_output,
             )
 
+        assert client.get_cache_stats()["size"] == 0
+
         result = await client.generate(
             "Extract the count.",
             structured_output=structured_output,
@@ -689,6 +691,57 @@ async def test_structured_output_validation_failure_does_not_populate_cache(
         "size": 1,
         "max_size": 100,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "capabilities_factory",
+    [_json_only_capabilities, _qwen_capabilities],
+    ids=["json-object", "prompt-json"],
+)
+@pytest.mark.parametrize(
+    "constant",
+    ["NaN", "Infinity", "-Infinity"],
+    ids=["nan", "infinity", "negative-infinity"],
+)
+async def test_structured_output_rejects_non_finite_json_numbers(
+    monkeypatch,
+    capabilities_factory,
+    constant,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    structured_output = {
+        "schema": {
+            "type": "object",
+            "properties": {"value": {"type": "number"}},
+            "required": ["value"],
+        },
+        "mode": "prefer",
+    }
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response(
+            f'{{"value":{constant}}}'
+        )
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(model_capabilities=capabilities_factory()),
+        )
+        _disable_rate_limit(client)
+        client._cache_enabled = True
+
+        with pytest.raises(StructuredOutputValidationError) as exc_info:
+            await client.generate(
+                "Extract the value.",
+                structured_output=structured_output,
+            )
+
+    assert type(exc_info.value.__cause__).__name__ == "ValueError"
+    assert mock_httpx_client.post.await_count == 1
+    assert client.get_cache_stats()["size"] == 0
 
 
 @pytest.mark.asyncio
@@ -883,9 +936,15 @@ async def test_cached_structured_response_is_parsed_and_validated_again(
                 structured_output=structured_output,
             )
 
+        recovered_result = await client.generate(
+            "Extract the title.",
+            structured_output=structured_output,
+        )
+
     assert network_result.structured == {"title": "network"}
+    assert recovered_result.structured == {"title": "network"}
     assert type(exc_info.value.__cause__).__name__ == "JSONDecodeError"
-    assert mock_httpx_client.post.await_count == 1
+    assert mock_httpx_client.post.await_count == 2
 
 
 @pytest.mark.asyncio

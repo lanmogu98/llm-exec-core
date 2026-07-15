@@ -46,6 +46,10 @@ _KNOWN_CAPABILITY_CONTROL_FIELDS = {
 _MISSING = object()
 
 
+def _reject_non_finite_json_constant(value: str) -> None:
+    raise ValueError(f"{value} is not valid JSON.")
+
+
 class StructuredOutputValidationError(ValueError):
     """Raised when a structured response fails client-side validation."""
 
@@ -99,6 +103,11 @@ class ResponseCache:
             self._cache.popitem(last=False)
 
         self._cache[key] = (response, time.time())
+
+    def delete(self, request_payload: Mapping[str, Any]) -> None:
+        """Delete a cached response if present."""
+        key = self._make_key(request_payload)
+        self._cache.pop(key, None)
 
     def get_stats(self) -> Dict[str, Any]:
         """Return cache statistics."""
@@ -722,10 +731,13 @@ class LLMClient:
             if not isinstance(schema, Mapping):
                 raise ValueError("structured_output.schema must be a mapping.")
             try:
-                structured = json.loads(response_text)
+                structured = json.loads(
+                    response_text,
+                    parse_constant=_reject_non_finite_json_constant,
+                )
                 jsonschema.validate(instance=structured, schema=schema)
             except (
-                json.JSONDecodeError,
+                ValueError,
                 jsonschema.exceptions.SchemaError,
                 jsonschema.exceptions.ValidationError,
             ) as error:
@@ -791,12 +803,16 @@ class LLMClient:
             cached_response = self._cache.get(cache_payload)
             if cached_response is not None:
                 logger.info("Cache hit for %s", request_name)
-                structured, finalized_planning = self._process_response(
-                    cached_response,
-                    planning_metadata,
-                    structured_output,
-                    structured_output_hook,
-                )
+                try:
+                    structured, finalized_planning = self._process_response(
+                        cached_response,
+                        planning_metadata,
+                        structured_output,
+                        structured_output_hook,
+                    )
+                except Exception:
+                    self._cache.delete(cache_payload)
+                    raise
                 finished_at = datetime.now()
                 result = LLMResult(
                     text=cached_response,
