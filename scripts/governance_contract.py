@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 import hashlib
 from typing import Any, Mapping
+from urllib.parse import urlparse
 
 import yaml
 
@@ -179,7 +180,10 @@ def gate0_action_allowed(
 def _parse_timestamp(value: object) -> datetime:
     if not isinstance(value, str):
         raise ValueError("timestamp must be a string")
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("timestamp must include a timezone offset")
+    return parsed
 
 
 def contribution_is_authorized(
@@ -302,10 +306,52 @@ def _comment_matches_frozen_provenance(
 ) -> bool:
     if not _exact_mapping(frozen, _PRIVATE_PROVENANCE_FIELDS):
         return False
+    assert isinstance(frozen, Mapping)
+    stable_id = frozen.get("id")
+    url = frozen.get("url")
+    author = frozen.get("author")
+    author_association = frozen.get("author_association")
+    digest = frozen.get("sha256")
+    if (
+        not isinstance(stable_id, int)
+        or isinstance(stable_id, bool)
+        or stable_id <= 0
+    ):
+        return False
+    if not isinstance(url, str) or not url.strip():
+        return False
+    parsed_url = urlparse(url)
+    if (
+        parsed_url.scheme != "https"
+        or not parsed_url.netloc
+        or not parsed_url.path
+    ):
+        return False
+    if not isinstance(author, str) or not author.strip():
+        return False
+    if (
+        not isinstance(author_association, str)
+        or not author_association.strip()
+    ):
+        return False
+    if owner_required and author_association != "OWNER":
+        return False
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        return False
+    try:
+        created_at = _parse_timestamp(frozen.get("created_at"))
+        updated_at = _parse_timestamp(frozen.get("updated_at"))
+    except (TypeError, ValueError):
+        return False
+    if created_at != updated_at:
+        return False
     if not _comment_is_unchanged(comment, owner_required=owner_required):
         return False
     assert isinstance(comment, Mapping)
-    assert isinstance(frozen, Mapping)
     return all(
         comment.get(field) == frozen.get(field)
         for field in _PRIVATE_PROVENANCE_FIELDS

@@ -285,6 +285,83 @@ def test_external_authorization_must_strictly_predate_earliest_event() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("mutation", "earliest_event_at", "completed_at"),
+    [
+        (
+            {
+                "created_at": "2026-07-01T09:00:00",
+                "issued_at": "2026-07-01T09:00:00",
+                "updated_at": "2026-07-01T09:00:00",
+            },
+            "2026-07-02T09:00:00+00:00",
+            None,
+        ),
+        (
+            {"created_at": "2026-07-01T09:00:00"},
+            "2026-07-02T09:00:00+00:00",
+            None,
+        ),
+        (
+            {"issued_at": "2026-07-01T09:00:00"},
+            "2026-07-02T09:00:00+00:00",
+            None,
+        ),
+        (
+            {"expires_at": "2026-07-03T09:00:00"},
+            "2026-07-02T09:00:00+00:00",
+            None,
+        ),
+        ({}, "2026-07-02T09:00:00", None),
+        (
+            {"expires_at": "completion"},
+            "2026-07-02T09:00:00+00:00",
+            "2026-07-03T09:00:00",
+        ),
+        (
+            {"created_at": "2026-07-01T09:00:00+25:00"},
+            "2026-07-02T09:00:00+00:00",
+            None,
+        ),
+        (
+            {"issued_at": "2026-07-01T09:00:00+25:00"},
+            "2026-07-02T09:00:00+00:00",
+            None,
+        ),
+        (
+            {"expires_at": "2026-07-03T09:00:00+25:00"},
+            "2026-07-02T09:00:00+00:00",
+            None,
+        ),
+    ],
+)
+def test_external_authorization_invalid_timestamps_fail_closed(
+    mutation: dict[str, str],
+    earliest_event_at: str,
+    completed_at: str | None,
+) -> None:
+    authorization = {**_authorization(), **mutation}
+
+    try:
+        result = contribution_is_authorized(
+            authorization,
+            contributor="external-user",
+            work_item=authorization["work_item"],
+            expected_scope="src/example.py",
+            expected_delivery="fork PR",
+            earliest_event_at=datetime.fromisoformat(earliest_event_at),
+            completed_at=(
+                datetime.fromisoformat(completed_at)
+                if completed_at is not None
+                else None
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        pytest.fail(f"authorization must fail closed, raised {exc!r}")
+
+    assert not result
+
+
 def test_workflow_change_authorization_is_owner_authored_and_head_exact() -> (
     None
 ):
@@ -576,6 +653,119 @@ def test_private_gate_missing_frozen_provenance_fails_closed(
     provenance = frozen[comment_name]
     assert isinstance(provenance, dict)
     provenance.pop(field)
+
+    assert not private_gate_is_valid(snapshot)
+
+
+def _rebind_private_provenance(
+    snapshot: dict[str, object],
+    comment_name: str,
+    field: str,
+    value: object,
+) -> None:
+    comment = snapshot[comment_name]
+    frozen = snapshot["frozen_evidence"]
+    verification = snapshot["verification"]
+    assert isinstance(comment, dict)
+    assert isinstance(frozen, dict)
+    assert isinstance(verification, dict)
+    expected = frozen[comment_name]
+    assert isinstance(expected, dict)
+
+    fields = (
+        ("created_at", "updated_at")
+        if field in {"created_at", "updated_at"}
+        else (field,)
+    )
+    for rebound_field in fields:
+        comment[rebound_field] = value
+        expected[rebound_field] = value
+
+    if comment_name == "report":
+        attestation = snapshot["attestation"]
+        assert isinstance(attestation, dict)
+        attestation_document = yaml.safe_load(attestation["body"])
+        attestation_data = attestation_document[
+            "PRIVATE-GATE0-MAINTAINER-ATTESTATION"
+        ]
+        report_fields = {
+            "id": "report_comment_id",
+            "url": "report_comment_url",
+            "author": "report_author",
+            "author_association": "report_author_association",
+            "created_at": "report_created_at",
+            "updated_at": "report_updated_at",
+            "sha256": "report_comment_sha256",
+        }
+        for rebound_field in fields:
+            attestation_data[report_fields[rebound_field]] = value
+        attestation_body = yaml.safe_dump(
+            attestation_document, sort_keys=False
+        )
+        attestation["body"] = attestation_body
+        attestation["sha256"] = comment_sha256(attestation_body)
+        frozen_attestation = frozen["attestation"]
+        assert isinstance(frozen_attestation, dict)
+        frozen_attestation["sha256"] = attestation["sha256"]
+
+    if comment_name != "verification":
+        verification_document = yaml.safe_load(verification["body"])
+        evidence = verification_document[
+            "PRIVATE-GATE0-OWNER-VERIFICATION-V1"
+        ]["evidence"]
+        for rebound_field in fields:
+            evidence[comment_name][rebound_field] = value
+        if comment_name == "report":
+            attestation = snapshot["attestation"]
+            assert isinstance(attestation, dict)
+            evidence["attestation"]["sha256"] = attestation["sha256"]
+        verification_body = yaml.safe_dump(
+            verification_document, sort_keys=False
+        )
+        verification["body"] = verification_body
+        verification["sha256"] = comment_sha256(verification_body)
+        frozen_verification = frozen["verification"]
+        assert isinstance(frozen_verification, dict)
+        frozen_verification["sha256"] = verification["sha256"]
+
+
+@pytest.mark.parametrize(
+    "comment_name", ["contract", "report", "attestation", "verification"]
+)
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("id", None),
+        ("id", True),
+        ("id", "101"),
+        ("url", None),
+        ("url", ""),
+        ("url", 101),
+        ("url", "github.com/no-scheme"),
+        ("author", None),
+        ("author", ""),
+        ("author", 101),
+        ("author_association", None),
+        ("author_association", ""),
+        ("author_association", 101),
+        ("created_at", None),
+        ("created_at", ""),
+        ("created_at", 101),
+        ("created_at", "2026-07-02T09:00:00"),
+        ("created_at", "2026-07-02T09:00:00+25:00"),
+        ("sha256", None),
+        ("sha256", ""),
+        ("sha256", 101),
+        ("sha256", "A" * 64),
+        ("sha256", "a" * 63),
+        ("sha256", "g" * 64),
+    ],
+)
+def test_private_gate_rejects_rebound_unusable_provenance(
+    comment_name: str, field: str, value: object
+) -> None:
+    snapshot = _private_gate_snapshot()
+    _rebind_private_provenance(snapshot, comment_name, field, value)
 
     assert not private_gate_is_valid(snapshot)
 
