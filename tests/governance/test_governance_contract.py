@@ -842,6 +842,120 @@ def _mutate_comment_body(
     comment["sha256"] = comment_sha256(body)
 
 
+def _rebind_private_identity(
+    snapshot: dict[str, object],
+    *,
+    head_sha: object = "b" * 40,
+    auditor_run_id: object = "auditor-run-1",
+    orchestrator_task_id: object = "orchestrator-task-1",
+) -> None:
+    snapshot["expected_head_sha"] = head_sha
+    snapshot["current_head_sha"] = head_sha
+    snapshot["expected_auditor_run_id"] = auditor_run_id
+    snapshot["expected_orchestrator_task_id"] = orchestrator_task_id
+
+    report = snapshot["report"]
+    attestation = snapshot["attestation"]
+    verification = snapshot["verification"]
+    frozen = snapshot["frozen_evidence"]
+    assert isinstance(report, dict)
+    assert isinstance(attestation, dict)
+    assert isinstance(verification, dict)
+    assert isinstance(frozen, dict)
+
+    report_document = yaml.safe_load(report["body"])
+    report_document["roles"]["auditor_run_id"] = auditor_run_id
+    report_document["roles"]["orchestrator_task_id"] = orchestrator_task_id
+    report_body = yaml.safe_dump(report_document, sort_keys=False)
+    report["body"] = report_body
+    report["sha256"] = comment_sha256(report_body)
+    frozen_report = frozen["report"]
+    assert isinstance(frozen_report, dict)
+    frozen_report["sha256"] = report["sha256"]
+
+    attestation_document = yaml.safe_load(attestation["body"])
+    attestation_data = attestation_document[
+        "PRIVATE-GATE0-MAINTAINER-ATTESTATION"
+    ]
+    attestation_data["auditor_run_id"] = auditor_run_id
+    attestation_data["orchestrator_task_id"] = orchestrator_task_id
+    attestation_data["roles"]["auditor_run_id"] = auditor_run_id
+    attestation_data["roles"]["orchestrator_task_id"] = orchestrator_task_id
+    attestation_data["report_comment_sha256"] = report["sha256"]
+    attestation_data["head_sha"] = head_sha
+    attestation_body = yaml.safe_dump(attestation_document, sort_keys=False)
+    attestation["body"] = attestation_body
+    attestation["sha256"] = comment_sha256(attestation_body)
+    frozen_attestation = frozen["attestation"]
+    assert isinstance(frozen_attestation, dict)
+    frozen_attestation["sha256"] = attestation["sha256"]
+
+    verification_document = yaml.safe_load(verification["body"])
+    verification_data = verification_document[
+        "PRIVATE-GATE0-OWNER-VERIFICATION-V1"
+    ]
+    verification_data["roles"]["auditor_run_id"] = auditor_run_id
+    verification_data["roles"]["orchestrator_task_id"] = orchestrator_task_id
+    verification_data["head_sha"] = head_sha
+    verification_data["evidence"]["report"]["sha256"] = report["sha256"]
+    verification_data["evidence"]["attestation"]["sha256"] = attestation[
+        "sha256"
+    ]
+    verification_body = yaml.safe_dump(verification_document, sort_keys=False)
+    verification["body"] = verification_body
+    verification["sha256"] = comment_sha256(verification_body)
+    frozen_verification = frozen["verification"]
+    assert isinstance(frozen_verification, dict)
+    frozen_verification["sha256"] = verification["sha256"]
+
+
+@pytest.mark.parametrize(
+    "head_sha", [None, "", 1, "B" * 40, "g" * 40, "b" * 39]
+)
+def test_private_gate_rejects_consistently_rebound_invalid_head_sha(
+    head_sha: object,
+) -> None:
+    snapshot = _private_gate_snapshot()
+    _rebind_private_identity(snapshot, head_sha=head_sha)
+
+    assert not private_gate_is_valid(snapshot)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("auditor_run_id", None),
+        ("auditor_run_id", ""),
+        ("auditor_run_id", "   "),
+        ("auditor_run_id", 1),
+        ("orchestrator_task_id", None),
+        ("orchestrator_task_id", ""),
+        ("orchestrator_task_id", "   "),
+        ("orchestrator_task_id", 1),
+    ],
+)
+def test_private_gate_rejects_consistently_rebound_invalid_run_ids(
+    field: str, value: object
+) -> None:
+    snapshot = _private_gate_snapshot()
+    _rebind_private_identity(snapshot, **{field: value})
+
+    assert not private_gate_is_valid(snapshot)
+
+
+@pytest.mark.parametrize(
+    "collaborators", [["reporter", 1], ["reporter", None]]
+)
+def test_private_gate_rejects_non_string_collaborators_without_raising(
+    collaborators: list[object],
+) -> None:
+    snapshot = _private_gate_snapshot()
+    snapshot["expected_collaborators"] = collaborators
+    snapshot["current_collaborators"] = collaborators
+
+    assert not private_gate_is_valid(snapshot)
+
+
 @pytest.mark.parametrize(
     ("comment_name", "path", "value"),
     [

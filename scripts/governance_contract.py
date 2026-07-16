@@ -290,6 +290,14 @@ def _sorted_string_list(value: object) -> bool:
     )
 
 
+def _lowercase_hex_string(value: object, *, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _parse_yaml_mapping(comment: object) -> Mapping[str, Any] | None:
     if not isinstance(comment, Mapping):
         return None
@@ -376,19 +384,26 @@ def private_gate_is_valid(snapshot: Mapping[str, Any]) -> bool:
         return False
     expected_collaborators = snapshot.get("expected_collaborators")
     current_collaborators = snapshot.get("current_collaborators")
+    if not _sorted_string_list(expected_collaborators):
+        return False
+    if not _sorted_string_list(current_collaborators):
+        return False
     if expected_collaborators != current_collaborators:
         return False
-    if not isinstance(
-        current_collaborators, list
-    ) or current_collaborators != sorted(current_collaborators):
+    expected_authorizations = snapshot.get("expected_authorizations")
+    current_authorizations = snapshot.get("current_authorizations")
+    if not _sorted_string_list(expected_authorizations):
         return False
-    if snapshot.get("expected_authorizations") != snapshot.get(
-        "current_authorizations"
-    ):
+    if not _sorted_string_list(current_authorizations):
         return False
-    if not _sorted_string_list(snapshot.get("current_authorizations")):
+    if expected_authorizations != current_authorizations:
         return False
-    if snapshot.get("expected_head_sha") != current_head:
+    expected_head = snapshot.get("expected_head_sha")
+    if not _lowercase_hex_string(expected_head, length=40):
+        return False
+    if not _lowercase_hex_string(current_head, length=40):
+        return False
+    if expected_head != current_head:
         return False
     if not _exact_mapping(
         frozen_evidence,
@@ -494,13 +509,24 @@ def private_gate_is_valid(snapshot: Mapping[str, Any]) -> bool:
         return False
     contract_digest = comment_sha256(contract_body)
     report_digest = comment_sha256(report_body)
+    expected_auditor_run_id = snapshot.get("expected_auditor_run_id")
+    expected_orchestrator_task_id = snapshot.get(
+        "expected_orchestrator_task_id"
+    )
+    if (
+        not isinstance(expected_auditor_run_id, str)
+        or not expected_auditor_run_id.strip()
+        or not isinstance(expected_orchestrator_task_id, str)
+        or not expected_orchestrator_task_id.strip()
+    ):
+        return False
     expected_roles = {
         "reporter": contract_data.get("reporter"),
         "collaborators_sorted": contract_collaborators,
         "authorized_code_contributors": contract_authorizations,
         "intended_implementer": contract_data.get("intended_implementer"),
-        "auditor_run_id": snapshot.get("expected_auditor_run_id"),
-        "orchestrator_task_id": snapshot.get("expected_orchestrator_task_id"),
+        "auditor_run_id": expected_auditor_run_id,
+        "orchestrator_task_id": expected_orchestrator_task_id,
     }
     report_roles = report_document.get("roles")
     if not _exact_mapping(report_roles, _PRIVATE_ROLE_FIELDS):
