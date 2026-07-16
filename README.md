@@ -123,6 +123,32 @@ uv run python scripts/check_openrouter_capabilities.py
 This repo is also used for coordinated local development with sibling
 checkouts during the current extraction/migration work.
 
+## Development
+
+The package supports Python 3.10 and newer. Required CI runs on Python 3.10 and
+3.13 and is deterministic, locked, and mock-only.
+
+```bash
+uv sync --locked --group dev
+uv run --frozen pytest -q
+uv run --frozen black --check src tests
+uv run --frozen flake8 src tests
+uv run --frozen mypy src
+uv build
+```
+
+See [AGENTS.md](AGENTS.md) for the project workflow and quality contract.
+
+## Issues and contributions
+
+This repository accepts public Issues only; code contributions require prior
+written maintainer authorization. Do not prepare or submit an outside fork,
+patch, or pull request until an owner-authored authorization exists in the
+accepted Issue. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Report vulnerabilities through GitHub's private vulnerability reporting path,
+not a public Issue. See [SECURITY.md](SECURITY.md).
+
 ## License
 
 Proprietary. See [LICENSE](LICENSE).

@@ -1,0 +1,71 @@
+name: Change request
+description: Propose a scoped feature, compatibility, or governance change.
+title: "[Change]: "
+labels: [enhancement, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Public Issues are the only public intake channel. Code contributions
+        require prior written maintainer authorization in the accepted Issue.
+  - type: textarea
+    id: objective
+    attributes:
+      label: Objective
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation and evidence
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Proposed scope
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Compatibility and security impact
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+    validations:
+      required: true
+  - type: textarea
+    id: risk
+    attributes:
+      label: Risks and dependencies
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation plan
+    validations:
+      required: true
+  - type: textarea
+    id: rollback
+    attributes:
+      label: Rollback and recovery
+    validations:
+      required: true
+  - type: checkboxes
+    id: contribution_boundary
+    attributes:
+      label: Contribution boundary
+      options:
+        - label: I will wait for written authorization before preparing code.
+          required: true
