@@ -80,6 +80,11 @@ work item, scope, and delivery. It does not relicense the project. Do not
 checkout, download, inspect substantively, build, test, execute, or approve a
 workflow for unauthorized external code. Close the PR with a link to
 `CONTRIBUTING.md`. Previously known external contributors follow the same rule.
+The owner comment must remain unedited (`created_at == updated_at`), its declared
+`issued_at` must equal the API `created_at`, and that durable timestamp must be
+no later than the earliest preparation/delivery event being authorized.
+Timestamp expiry is inclusive. For `expires_at: completion`, record completion
+state explicitly and reject any new preparation/delivery after completion.
 
 Maintainer/API-created or incomplete Issues may exist for triage, but they do
 not authorize implementation. Accepted work must be audit-ready and carry one
@@ -105,6 +110,12 @@ A valid dispatch requires all of the following on the exact Issue revision:
 4. report and attestation comments that still exist and have
    `created_at == updated_at`; and
 5. `gate0:passed` as the single Gate 0 label.
+
+PASS establishes readiness only; it grants no operation by itself. Every
+implementation action must also be in the dispatched task and the contribution
+plane for that actor. Merge, auto-merge, settings, secrets, bypass, and
+publishing remain denied to implementation agents even if a callable tool or a
+malformed task-action set names them.
 
 Any missing, edited, deleted, stale, mismatched, or unverified blocking evidence
 fails closed. A FAIL is remediated in the Issue body, then a new independent run
@@ -234,6 +245,15 @@ PRIVATE-GATE0-CONTRACT-V1:
   intended_implementer: identity-or-unassigned
 ```
 
+The adapted report must parse as a complete schema and bind the exact contract
+digest, advisory, access roles, intended implementer, auditor run ID,
+orchestrator task ID, and PASS verdict. The immutable owner attestation binds
+those same values plus the report permalink/digest/API timestamp and exact head.
+Its re-verification block repeats the current contract/report digests, reporter,
+sorted collaborators, authorized contributors, head, and a timestamp no earlier
+than the report or attestation. Matching substrings or locally self-consistent
+replacement hashes are never sufficient.
+
 Any contract/report/attestation edit, deletion, missing comment, author
 mismatch, reporter/collaborator change, authorization change, contract change,
 or private-fork head change invalidates PASS. Immediately before merge, the
@@ -308,6 +328,9 @@ failed/error, duplicate/wrong check names, wrong SHA/source, or a final-setting
 readback failure freezes all merges. Owner `lanmogu98` may retry once, then uses
 a focused repair PR. If not green and fully verified within 24 hours of bootstrap
 merge, revert through a PR and leave protected `main` as default.
+If preliminary-ruleset readback itself fails, treat the anchor as unverified and
+restore-required: freeze both merges and PR recovery until the exact exported
+preliminary configuration is restored and verified.
 
 The final required-check ruleset is separate. If it is wrong or cannot be read
 back, disable/delete only that final ruleset through the authorized settings

@@ -6,11 +6,30 @@ from datetime import datetime
 import hashlib
 from typing import Any, Mapping
 
+import yaml
+
 _PRE_PASS_ACTIONS = {
     "contract_read",
     "contract_edit",
     "audit",
     "audit_remediation",
+}
+_PRE_PASS_ROLES = {
+    "contract_read": {"auditor", "contract_remediator"},
+    "contract_edit": {"contract_remediator"},
+    "audit": {"auditor"},
+    "audit_remediation": {"contract_remediator"},
+}
+_IMPLEMENTATION_CONTRIBUTION_ACTIONS = {
+    "read_evidence",
+    "issue_comment",
+    "topic_branch",
+    "commit",
+    "push_topic_branch",
+    "tracked_file_write",
+    "workflow_file_write",
+    "pr_update",
+    "mock_ci_control",
 }
 _NON_SUCCESS_CONDITIONS = {
     "missing",
@@ -48,6 +67,59 @@ _FINAL_RULESET_FAILURES = {
     "wrong_source",
     "mismatch",
 }
+_PRIVATE_CONTRACT_FIELDS = {
+    "advisory_id",
+    "objective",
+    "scope",
+    "non_goals",
+    "compatibility_security_impact",
+    "acceptance_criteria",
+    "validation",
+    "rollback_recovery",
+    "reporter",
+    "collaborators_sorted",
+    "authorized_code_contributors",
+    "intended_implementer",
+}
+_PRIVATE_REPORT_FIELDS = {
+    "private_gate0_version",
+    "advisory_id",
+    "private_contract_sha256",
+    "roles",
+    "independence_attestation",
+    "verdict",
+    "findings",
+    "blocking_findings",
+}
+_PRIVATE_ROLE_FIELDS = {
+    "reporter",
+    "collaborators_sorted",
+    "authorized_code_contributors",
+    "intended_implementer",
+    "auditor_run_id",
+    "orchestrator_task_id",
+}
+_PRIVATE_ATTESTATION_FIELDS = {
+    "private_contract_sha256",
+    "auditor_run_id",
+    "orchestrator_task_id",
+    "report_comment_url",
+    "report_comment_sha256",
+    "report_created_at",
+    "roles",
+    "verdict",
+    "head_sha",
+    "reverification",
+}
+_PRIVATE_REVERIFICATION_FIELDS = {
+    "verified_at",
+    "contract_sha256",
+    "report_sha256",
+    "reporter",
+    "collaborators_sorted",
+    "authorized_code_contributors",
+    "head_sha",
+}
 
 
 def _normalize_newlines(value: str) -> str:
@@ -70,9 +142,27 @@ def comment_sha256(body: str) -> str:
     return _sha256(_normalize_newlines(body))
 
 
-def gate0_action_allowed(state: str, action: str) -> bool:
-    """Return whether an action is allowed by the public Gate 0 state."""
-    return state == "passed" or action in _PRE_PASS_ACTIONS
+def gate0_is_ready(state: str) -> bool:
+    """Return whether immutable Gate 0 evidence is ready for dispatch."""
+    return state == "passed"
+
+
+def gate0_action_allowed(
+    state: str,
+    action: str,
+    *,
+    actor_role: str,
+    task_authorized_actions: set[str],
+) -> bool:
+    """Apply Gate 0, actor-role, task-scope, and contribution-plane gates."""
+    if action in _PRE_PASS_ACTIONS:
+        return actor_role in _PRE_PASS_ROLES[action]
+    if not gate0_is_ready(state) or actor_role != "implementation_agent":
+        return False
+    return (
+        action in _IMPLEMENTATION_CONTRIBUTION_ACTIONS
+        and action in task_authorized_actions
+    )
 
 
 def _parse_timestamp(value: object) -> datetime:
@@ -86,14 +176,37 @@ def contribution_is_authorized(
     *,
     contributor: str,
     work_item: str,
+    expected_scope: str,
+    expected_delivery: str,
     delivery_at: datetime,
+    completed_at: datetime | None = None,
 ) -> bool:
     """Check a synthetic outside-contribution authorization record."""
     try:
         issued_at = _parse_timestamp(authorization.get("issued_at"))
-        expires_at = _parse_timestamp(authorization.get("expires_at"))
+        created_at = _parse_timestamp(authorization.get("created_at"))
     except (TypeError, ValueError):
         return False
+
+    if delivery_at.tzinfo is None or delivery_at.utcoffset() is None:
+        return False
+    if issued_at != created_at or created_at > delivery_at:
+        return False
+
+    expires_at_value = authorization.get("expires_at")
+    if expires_at_value == "completion":
+        if completed_at is not None:
+            if completed_at.tzinfo is None or completed_at.utcoffset() is None:
+                return False
+            if delivery_at > completed_at:
+                return False
+    else:
+        try:
+            expires_at = _parse_timestamp(expires_at_value)
+        except (TypeError, ValueError):
+            return False
+        if delivery_at > expires_at:
+            return False
 
     return all(
         (
@@ -102,9 +215,8 @@ def contribution_is_authorized(
             authorization.get("created_at") == authorization.get("updated_at"),
             authorization.get("contributor") == contributor,
             authorization.get("work_item") == work_item,
-            bool(authorization.get("allowed_scope")),
-            bool(authorization.get("allowed_delivery")),
-            issued_at <= delivery_at <= expires_at,
+            authorization.get("allowed_scope") == expected_scope,
+            authorization.get("allowed_delivery") == expected_delivery,
         )
     )
 
@@ -142,8 +254,34 @@ def _comment_is_unchanged(
     return True
 
 
+def _exact_mapping(value: object, fields: set[str]) -> bool:
+    return isinstance(value, Mapping) and set(value) == fields
+
+
+def _sorted_string_list(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and all(isinstance(item, str) for item in value)
+        and value == sorted(value)
+        and len(value) == len(set(value))
+    )
+
+
+def _parse_yaml_mapping(comment: object) -> Mapping[str, Any] | None:
+    if not isinstance(comment, Mapping):
+        return None
+    body = comment.get("body")
+    if not isinstance(body, str):
+        return None
+    try:
+        parsed = yaml.safe_load(body)
+    except yaml.YAMLError:
+        return None
+    return parsed if isinstance(parsed, Mapping) else None
+
+
 def private_gate_is_valid(snapshot: Mapping[str, Any]) -> bool:
-    """Validate an unchanged synthetic private-advisory evidence snapshot."""
+    """Validate a fully cross-bound synthetic private-advisory snapshot."""
     contract = snapshot.get("contract")
     report = snapshot.get("report")
     attestation = snapshot.get("attestation")
@@ -163,6 +301,8 @@ def private_gate_is_valid(snapshot: Mapping[str, Any]) -> bool:
         "current_authorizations"
     ):
         return False
+    if not _sorted_string_list(snapshot.get("current_authorizations")):
+        return False
     if snapshot.get("expected_head_sha") != current_head:
         return False
     if not _comment_is_unchanged(contract, owner_required=True):
@@ -171,15 +311,169 @@ def private_gate_is_valid(snapshot: Mapping[str, Any]) -> bool:
         return False
     if not _comment_is_unchanged(attestation, owner_required=True):
         return False
-    if not isinstance(report, Mapping) or "verdict: PASS" not in str(
-        report.get("body")
+
+    contract_document = _parse_yaml_mapping(contract)
+    report_document = _parse_yaml_mapping(report)
+    attestation_document = _parse_yaml_mapping(attestation)
+    if not _exact_mapping(contract_document, {"PRIVATE-GATE0-CONTRACT-V1"}):
+        return False
+    if not _exact_mapping(report_document, _PRIVATE_REPORT_FIELDS):
+        return False
+    if not _exact_mapping(
+        attestation_document, {"PRIVATE-GATE0-MAINTAINER-ATTESTATION"}
     ):
         return False
-    if not isinstance(attestation, Mapping):
+
+    assert contract_document is not None
+    assert report_document is not None
+    assert attestation_document is not None
+    contract_data = contract_document["PRIVATE-GATE0-CONTRACT-V1"]
+    attestation_data = attestation_document[
+        "PRIVATE-GATE0-MAINTAINER-ATTESTATION"
+    ]
+    if not _exact_mapping(contract_data, _PRIVATE_CONTRACT_FIELDS):
         return False
-    return "verdict: PASS" in str(attestation.get("body")) and str(
-        current_head
-    ) in str(attestation.get("body"))
+    if not _exact_mapping(attestation_data, _PRIVATE_ATTESTATION_FIELDS):
+        return False
+    assert isinstance(contract_data, Mapping)
+    assert isinstance(attestation_data, Mapping)
+
+    string_contract_fields = {
+        "advisory_id",
+        "objective",
+        "compatibility_security_impact",
+        "rollback_recovery",
+        "reporter",
+        "intended_implementer",
+    }
+    if any(
+        not isinstance(contract_data.get(field), str)
+        or not contract_data.get(field)
+        for field in string_contract_fields
+    ):
+        return False
+    if any(
+        not isinstance(contract_data.get(field), list)
+        for field in {
+            "scope",
+            "non_goals",
+            "acceptance_criteria",
+            "validation",
+        }
+    ):
+        return False
+    contract_collaborators = contract_data.get("collaborators_sorted")
+    contract_authorizations = contract_data.get("authorized_code_contributors")
+    if not _sorted_string_list(contract_collaborators):
+        return False
+    if not _sorted_string_list(contract_authorizations):
+        return False
+    if contract_data.get("reporter") != snapshot.get("current_reporter"):
+        return False
+    if contract_collaborators != snapshot.get("current_collaborators"):
+        return False
+    if contract_authorizations != snapshot.get("current_authorizations"):
+        return False
+
+    contract_body = (
+        contract.get("body") if isinstance(contract, Mapping) else None
+    )
+    report_body = report.get("body") if isinstance(report, Mapping) else None
+    if not isinstance(contract_body, str) or not isinstance(report_body, str):
+        return False
+    contract_digest = comment_sha256(contract_body)
+    report_digest = comment_sha256(report_body)
+    expected_roles = {
+        "reporter": contract_data.get("reporter"),
+        "collaborators_sorted": contract_collaborators,
+        "authorized_code_contributors": contract_authorizations,
+        "intended_implementer": contract_data.get("intended_implementer"),
+        "auditor_run_id": snapshot.get("expected_auditor_run_id"),
+        "orchestrator_task_id": snapshot.get("expected_orchestrator_task_id"),
+    }
+    report_roles = report_document.get("roles")
+    if not _exact_mapping(report_roles, _PRIVATE_ROLE_FIELDS):
+        return False
+    if report_roles != expected_roles:
+        return False
+    if report_document.get("private_gate0_version") != 1:
+        return False
+    if report_document.get("advisory_id") != contract_data.get("advisory_id"):
+        return False
+    if report_document.get("private_contract_sha256") != contract_digest:
+        return False
+    if not isinstance(report_document.get("independence_attestation"), str):
+        return False
+    if not report_document.get("independence_attestation"):
+        return False
+    if report_document.get("verdict") != "PASS":
+        return False
+    if not isinstance(report_document.get("findings"), list):
+        return False
+    if report_document.get("blocking_findings") != []:
+        return False
+
+    attestation_roles = attestation_data.get("roles")
+    reverification = attestation_data.get("reverification")
+    if not _exact_mapping(attestation_roles, _PRIVATE_ROLE_FIELDS):
+        return False
+    if not _exact_mapping(reverification, _PRIVATE_REVERIFICATION_FIELDS):
+        return False
+    assert isinstance(reverification, Mapping)
+    if attestation_roles != expected_roles:
+        return False
+    if (
+        attestation_data.get("auditor_run_id")
+        != expected_roles["auditor_run_id"]
+    ):
+        return False
+    if (
+        attestation_data.get("orchestrator_task_id")
+        != expected_roles["orchestrator_task_id"]
+    ):
+        return False
+    if attestation_data.get("private_contract_sha256") != contract_digest:
+        return False
+    if not isinstance(report, Mapping):
+        return False
+    if attestation_data.get("report_comment_url") != report.get("url"):
+        return False
+    if attestation_data.get("report_comment_sha256") != report_digest:
+        return False
+    report_created_at = report.get("created_at")
+    if attestation_data.get("report_created_at") != report_created_at:
+        return False
+    if attestation_data.get("verdict") != "PASS":
+        return False
+    if attestation_data.get("head_sha") != current_head:
+        return False
+
+    if reverification.get("contract_sha256") != contract_digest:
+        return False
+    if reverification.get("report_sha256") != report_digest:
+        return False
+    if reverification.get("reporter") != snapshot.get("current_reporter"):
+        return False
+    if reverification.get("collaborators_sorted") != snapshot.get(
+        "current_collaborators"
+    ):
+        return False
+    if reverification.get("authorized_code_contributors") != snapshot.get(
+        "current_authorizations"
+    ):
+        return False
+    if reverification.get("head_sha") != current_head:
+        return False
+
+    try:
+        report_created = _parse_timestamp(report_created_at)
+        attestation_created = _parse_timestamp(attestation.get("created_at"))
+        reverified_at = _parse_timestamp(reverification.get("verified_at"))
+    except (TypeError, ValueError):
+        return False
+    if reverified_at < report_created or reverified_at < attestation_created:
+        return False
+    return True
 
 
 def assess_ci_evidence(
@@ -192,13 +486,17 @@ def assess_ci_evidence(
     """Return the fail-closed recovery state for CI/settings non-success."""
     if condition not in _NON_SUCCESS_CONDITIONS:
         raise ValueError(f"unknown non-success condition: {condition}")
-    return {
+    result: dict[str, object] = {
         "merge_frozen": True,
         "preliminary_ruleset": "active",
         "owner": owner,
         "detection_minutes": elapsed_minutes,
         "repair_deadline_hours": repair_deadline_hours,
     }
+    if condition == "preliminary_ruleset_readback_failed":
+        result["preliminary_ruleset"] = "unverified_restore_required"
+        result["pr_repair_allowed"] = False
+    return result
 
 
 def assess_final_ruleset_failure(condition: str) -> dict[str, object]:

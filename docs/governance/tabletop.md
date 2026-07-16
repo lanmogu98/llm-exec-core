@@ -14,9 +14,11 @@ exercise a live security advisory. Executable cases live in
 | Previously-known external | No | Awaiting approval | Do not inspect/execute; close the PR |
 | Previously-known external | Yes, current | Awaiting approval | Re-check author/scope/time and workflow diff, then owner may approve |
 
-The offline authorization fixture proves that an owner-authored record must
-predate hypothetical delivery and match contributor and work item. Repository
-setting readback, not this table, proves GitHub is configured with
+The offline authorization fixture proves that an immutable owner-authored
+record must predate hypothetical delivery, cannot backdate `issued_at`, and must
+exactly match contributor, work item, scope, and delivery. It covers timestamp
+expiry and completion-bound expiry before and after recorded completion.
+Repository setting readback, not this table, proves GitHub is configured with
 `approval_policy=all_external_contributors` before CI is reachable.
 
 ## Gate 0 and workflow-change cases
@@ -25,6 +27,8 @@ setting readback, not this table, proves GitHub is configured with
 - Pending Gate 0 rejects implementation assignment/branch, tracked writes,
   settings changes, and external-code execution.
 - PASS permits scoped implementation only after all immutable evidence matches.
+- PASS is readiness, not authority: actor role, explicit task actions, and the
+  contribution-plane allowlist must also permit the operation.
 - A synthetic CI replacement that returns success is still not mergeable unless
   the owner posts exactly `WORKFLOW-CHANGE-AUTHORIZED: <current head SHA>`.
 - A new head SHA, edited comment, non-owner comment, or extra comment text
@@ -43,6 +47,12 @@ mutations fails closed independently:
 - authorized contributor set changes; or
 - private-fork head SHA changes.
 
+The contract, report, and owner attestation are parsed as complete schemas and
+cross-bind contract/report digests, access roles, run/task IDs, report identity
+and timestamp, exact head, and re-verification evidence. Mutation cases
+recompute local body digests—and one also updates downstream digest fields—to
+prove self-consistent replacement data still fails the frozen cross-bindings.
+
 The tabletop does not claim normal GitHub checks run in a temporary private
 security fork. The required path is isolated execution of the canonical command
 set against the recorded head, private evidence, maintainer-only advisory merge,
@@ -57,6 +67,7 @@ and sanitized coordinated disclosure.
 | Failure or error | Immediate / 30 minutes max | Retry once, then focused repair PR |
 | Wrong or duplicate check name | 30 minutes | Freeze merges; repair workflow through PR |
 | Check bound to wrong SHA | 30 minutes | Freeze merges; require exact-head evidence |
+| Preliminary ruleset readback fails | Final readback | Mark anchor unverified; freeze PR recovery until restored |
 | Nonexistent/wrong-source final required check | Final readback | Disable/delete only final ruleset; verify preliminary anchor |
 | Any other final-setting readback failure | Final readback | Freeze merges; retry/repair/revert path |
 

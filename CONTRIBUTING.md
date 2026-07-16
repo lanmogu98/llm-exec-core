@@ -19,6 +19,12 @@ CONTRIBUTION-AUTHORIZATION:
   expires_at: timestamp-or-completion
 ```
 
+The owner comment must be unedited. Its declared `issued_at` must exactly match
+GitHub's immutable comment `created_at`, which must predate the earliest code
+preparation or delivery. The authorization must exactly match the proposed
+scope and delivery. A timestamp expiry is inclusive; `expires_at: completion`
+requires recorded completion state and rejects any later preparation/delivery.
+
 After authorization, the Issue must be completed as an audit-ready work
 contract, pass an independent adversarial Gate 0 audit, and receive a separate
 maintainer attestation before implementation starts. Authorization for one

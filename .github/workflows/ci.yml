@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   test:
-    name: python-${{ matrix.python-version }}
+    name: CI / python-${{ matrix.python-version }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
