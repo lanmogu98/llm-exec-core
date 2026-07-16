@@ -204,7 +204,8 @@ def contribution_is_authorized(
         return False
 
     if (
-        earliest_event_at.tzinfo is None
+        not isinstance(earliest_event_at, datetime)
+        or earliest_event_at.tzinfo is None
         or earliest_event_at.utcoffset() is None
     ):
         return False
@@ -214,7 +215,11 @@ def contribution_is_authorized(
     expires_at_value = authorization.get("expires_at")
     if expires_at_value == "completion":
         if completed_at is not None:
-            if completed_at.tzinfo is None or completed_at.utcoffset() is None:
+            if (
+                not isinstance(completed_at, datetime)
+                or completed_at.tzinfo is None
+                or completed_at.utcoffset() is None
+            ):
                 return False
             if earliest_event_at > completed_at:
                 return False

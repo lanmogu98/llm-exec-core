@@ -362,6 +362,34 @@ def test_external_authorization_invalid_timestamps_fail_closed(
     assert not result
 
 
+@pytest.mark.parametrize(
+    ("earliest_event_at", "completed_at"),
+    [
+        ("2026-07-02T09:00:00Z", None),
+        (datetime(2026, 7, 2, 9, tzinfo=timezone.utc), "completion"),
+    ],
+)
+def test_external_authorization_wrong_timestamp_types_fail_closed(
+    earliest_event_at: object, completed_at: object | None
+) -> None:
+    authorization = {**_authorization(), "expires_at": "completion"}
+
+    try:
+        result = contribution_is_authorized(
+            authorization,
+            contributor="external-user",
+            work_item=authorization["work_item"],
+            expected_scope="src/example.py",
+            expected_delivery="fork PR",
+            earliest_event_at=earliest_event_at,  # type: ignore[arg-type]
+            completed_at=completed_at,  # type: ignore[arg-type]
+        )
+    except (AttributeError, TypeError, ValueError) as exc:
+        pytest.fail(f"authorization must fail closed, raised {exc!r}")
+
+    assert not result
+
+
 def test_workflow_change_authorization_is_owner_authored_and_head_exact() -> (
     None
 ):
