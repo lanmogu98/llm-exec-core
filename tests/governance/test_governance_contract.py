@@ -138,7 +138,7 @@ def _authorization() -> dict[str, str]:
 
 def test_external_delivery_requires_prior_exact_owner_authorization() -> None:
     authorization = _authorization()
-    delivery_at = datetime(2026, 7, 2, tzinfo=timezone.utc)
+    earliest_event_at = datetime(2026, 7, 2, tzinfo=timezone.utc)
 
     assert contribution_is_authorized(
         authorization,
@@ -146,7 +146,7 @@ def test_external_delivery_requires_prior_exact_owner_authorization() -> None:
         work_item=authorization["work_item"],
         expected_scope="src/example.py",
         expected_delivery="fork PR",
-        delivery_at=delivery_at,
+        earliest_event_at=earliest_event_at,
     )
     assert not contribution_is_authorized(
         authorization,
@@ -154,7 +154,7 @@ def test_external_delivery_requires_prior_exact_owner_authorization() -> None:
         work_item=authorization["work_item"],
         expected_scope="src/example.py",
         expected_delivery="fork PR",
-        delivery_at=delivery_at,
+        earliest_event_at=earliest_event_at,
     )
     assert not contribution_is_authorized(
         authorization,
@@ -162,12 +162,17 @@ def test_external_delivery_requires_prior_exact_owner_authorization() -> None:
         work_item=authorization["work_item"],
         expected_scope="src/example.py",
         expected_delivery="fork PR",
-        delivery_at=datetime(2026, 6, 30, tzinfo=timezone.utc),
+        earliest_event_at=datetime(2026, 6, 30, tzinfo=timezone.utc),
     )
 
 
 @pytest.mark.parametrize(
-    ("mutation", "expected_scope", "expected_delivery", "delivery_at"),
+    (
+        "mutation",
+        "expected_scope",
+        "expected_delivery",
+        "earliest_event_at",
+    ),
     [
         ({}, "different scope", "fork PR", "2026-07-02T00:00:00Z"),
         ({}, "src/example.py", "direct patch", "2026-07-02T00:00:00Z"),
@@ -205,7 +210,7 @@ def test_external_authorization_rejects_mismatch_or_stale_record(
     mutation: dict[str, str],
     expected_scope: str,
     expected_delivery: str,
-    delivery_at: str,
+    earliest_event_at: str,
 ) -> None:
     authorization = {**_authorization(), **mutation}
 
@@ -215,13 +220,15 @@ def test_external_authorization_rejects_mismatch_or_stale_record(
         work_item=authorization["work_item"],
         expected_scope=expected_scope,
         expected_delivery=expected_delivery,
-        delivery_at=datetime.fromisoformat(delivery_at.replace("Z", "+00:00")),
+        earliest_event_at=datetime.fromisoformat(
+            earliest_event_at.replace("Z", "+00:00")
+        ),
     )
 
 
 def test_completion_bound_authorization_tracks_completion_state() -> None:
     authorization = {**_authorization(), "expires_at": "completion"}
-    delivery_at = datetime(2026, 7, 2, tzinfo=timezone.utc)
+    earliest_event_at = datetime(2026, 7, 2, tzinfo=timezone.utc)
 
     assert contribution_is_authorized(
         authorization,
@@ -229,7 +236,7 @@ def test_completion_bound_authorization_tracks_completion_state() -> None:
         work_item=authorization["work_item"],
         expected_scope="src/example.py",
         expected_delivery="fork PR",
-        delivery_at=delivery_at,
+        earliest_event_at=earliest_event_at,
         completed_at=None,
     )
     assert contribution_is_authorized(
@@ -238,8 +245,8 @@ def test_completion_bound_authorization_tracks_completion_state() -> None:
         work_item=authorization["work_item"],
         expected_scope="src/example.py",
         expected_delivery="fork PR",
-        delivery_at=delivery_at,
-        completed_at=datetime(2026, 7, 2, 1, tzinfo=timezone.utc),
+        earliest_event_at=earliest_event_at,
+        completed_at=earliest_event_at,
     )
     assert not contribution_is_authorized(
         authorization,
@@ -247,8 +254,34 @@ def test_completion_bound_authorization_tracks_completion_state() -> None:
         work_item=authorization["work_item"],
         expected_scope="src/example.py",
         expected_delivery="fork PR",
-        delivery_at=delivery_at,
+        earliest_event_at=earliest_event_at,
         completed_at=datetime(2026, 7, 1, 23, tzinfo=timezone.utc),
+    )
+
+
+def test_timestamp_authorization_expiry_is_inclusive() -> None:
+    authorization = _authorization()
+
+    assert contribution_is_authorized(
+        authorization,
+        contributor="external-user",
+        work_item=authorization["work_item"],
+        expected_scope="src/example.py",
+        expected_delivery="fork PR",
+        earliest_event_at=datetime(2026, 7, 3, 9, tzinfo=timezone.utc),
+    )
+
+
+def test_external_authorization_must_strictly_predate_earliest_event() -> None:
+    authorization = _authorization()
+
+    assert not contribution_is_authorized(
+        authorization,
+        contributor="external-user",
+        work_item=authorization["work_item"],
+        expected_scope="src/example.py",
+        expected_delivery="fork PR",
+        earliest_event_at=datetime(2026, 7, 1, 9, tzinfo=timezone.utc),
     )
 
 
@@ -272,7 +305,10 @@ def test_workflow_change_authorization_is_owner_authored_and_head_exact() -> (
 
 def _private_gate_snapshot() -> dict[str, object]:
     head = "b" * 40
-    report_url = "https://github.com/advisories/GHSA-test/comments/2"
+    contract_url = "https://github.com/advisories/GHSA-test/comments/101"
+    report_url = "https://github.com/advisories/GHSA-test/comments/102"
+    attestation_url = "https://github.com/advisories/GHSA-test/comments/103"
+    verification_url = "https://github.com/advisories/GHSA-test/comments/104"
     contract_data = {
         "PRIVATE-GATE0-CONTRACT-V1": {
             "advisory_id": "GHSA-test",
@@ -316,24 +352,73 @@ def _private_gate_snapshot() -> dict[str, object]:
             "private_contract_sha256": contract_digest,
             "auditor_run_id": "auditor-run-1",
             "orchestrator_task_id": "orchestrator-task-1",
+            "report_comment_id": 102,
             "report_comment_url": report_url,
             "report_comment_sha256": report_digest,
+            "report_author": "gate0-auditor",
+            "report_author_association": "CONTRIBUTOR",
             "report_created_at": "2026-07-02T09:01:00Z",
+            "report_updated_at": "2026-07-02T09:01:00Z",
             "roles": roles,
             "verdict": "PASS",
             "head_sha": head,
-            "reverification": {
-                "verified_at": "2026-07-02T09:03:00Z",
-                "contract_sha256": contract_digest,
-                "report_sha256": report_digest,
-                "reporter": "reporter",
-                "collaborators_sorted": ["helper", "reporter"],
-                "authorized_code_contributors": ["helper"],
-                "head_sha": head,
-            },
         }
     }
     attestation_body = yaml.safe_dump(attestation_data, sort_keys=False)
+    attestation_digest = comment_sha256(attestation_body)
+    evidence = {
+        "contract": {
+            "id": 101,
+            "url": contract_url,
+            "author": "lanmogu98",
+            "author_association": "OWNER",
+            "created_at": "2026-07-02T09:00:00Z",
+            "updated_at": "2026-07-02T09:00:00Z",
+            "sha256": contract_digest,
+        },
+        "report": {
+            "id": 102,
+            "url": report_url,
+            "author": "gate0-auditor",
+            "author_association": "CONTRIBUTOR",
+            "created_at": "2026-07-02T09:01:00Z",
+            "updated_at": "2026-07-02T09:01:00Z",
+            "sha256": report_digest,
+        },
+        "attestation": {
+            "id": 103,
+            "url": attestation_url,
+            "author": "lanmogu98",
+            "author_association": "OWNER",
+            "created_at": "2026-07-02T09:02:00Z",
+            "updated_at": "2026-07-02T09:02:00Z",
+            "sha256": attestation_digest,
+        },
+    }
+    verification_data = {
+        "PRIVATE-GATE0-OWNER-VERIFICATION-V1": {
+            "evidence": evidence,
+            "reporter": "reporter",
+            "collaborators_sorted": ["helper", "reporter"],
+            "authorized_code_contributors": ["helper"],
+            "roles": roles,
+            "head_sha": head,
+        }
+    }
+    verification_body = yaml.safe_dump(verification_data, sort_keys=False)
+    verification_digest = comment_sha256(verification_body)
+    frozen_evidence = {
+        **evidence,
+        "verification": {
+            "id": 104,
+            "url": verification_url,
+            "author": "lanmogu98",
+            "author_association": "OWNER",
+            "created_at": "2026-07-02T09:03:00Z",
+            "updated_at": "2026-07-02T09:03:00Z",
+            "sha256": verification_digest,
+        },
+    }
     return {
         "expected_reporter": "reporter",
         "current_reporter": "reporter",
@@ -345,8 +430,11 @@ def _private_gate_snapshot() -> dict[str, object]:
         "current_head_sha": head,
         "expected_auditor_run_id": "auditor-run-1",
         "expected_orchestrator_task_id": "orchestrator-task-1",
+        "frozen_evidence": frozen_evidence,
         "contract": {
             "exists": True,
+            "id": 101,
+            "url": contract_url,
             "author": "lanmogu98",
             "author_association": "OWNER",
             "body": contract_body,
@@ -356,7 +444,10 @@ def _private_gate_snapshot() -> dict[str, object]:
         },
         "report": {
             "exists": True,
+            "id": 102,
             "url": report_url,
+            "author": "gate0-auditor",
+            "author_association": "CONTRIBUTOR",
             "body": report_body,
             "sha256": report_digest,
             "created_at": "2026-07-02T09:01:00Z",
@@ -364,12 +455,25 @@ def _private_gate_snapshot() -> dict[str, object]:
         },
         "attestation": {
             "exists": True,
+            "id": 103,
+            "url": attestation_url,
             "author": "lanmogu98",
             "author_association": "OWNER",
             "body": attestation_body,
             "sha256": comment_sha256(attestation_body),
             "created_at": "2026-07-02T09:02:00Z",
             "updated_at": "2026-07-02T09:02:00Z",
+        },
+        "verification": {
+            "exists": True,
+            "id": 104,
+            "url": verification_url,
+            "author": "lanmogu98",
+            "author_association": "OWNER",
+            "body": verification_body,
+            "sha256": verification_digest,
+            "created_at": "2026-07-02T09:03:00Z",
+            "updated_at": "2026-07-02T09:03:00Z",
         },
     }
 
@@ -379,17 +483,17 @@ def _private_gate_snapshot() -> dict[str, object]:
     [
         (("current_reporter",), "other"),
         (("current_collaborators",), ["reporter"]),
-        (("contract", "updated_at"), "2026-07-02T09:03:00Z"),
-        (("report", "exists"), False),
         (("current_authorizations",), []),
         (("current_head_sha",), "c" * 40),
-        (("contract", "sha256"), "0" * 64),
-        (("report", "sha256"), "1" * 64),
-        (("report", "created_at"), "2026-07-02T09:04:00Z"),
-        (("report", "url"), "https://example.invalid/wrong-report"),
+        (("expected_reporter",), "other"),
+        (("expected_collaborators",), ["reporter"]),
+        (("expected_authorizations",), []),
+        (("expected_head_sha",), "c" * 40),
+        (("expected_auditor_run_id",), "different-auditor"),
+        (("expected_orchestrator_task_id",), "different-orchestrator"),
     ],
 )
-def test_private_gate_metadata_mutations_fail_closed(
+def test_private_gate_access_or_head_mutations_fail_closed(
     path: tuple[str, ...], value: object
 ) -> None:
     snapshot = _private_gate_snapshot()
@@ -397,6 +501,107 @@ def test_private_gate_metadata_mutations_fail_closed(
     for key in path[:-1]:
         target = target[key]  # type: ignore[index,assignment]
     target[path[-1]] = value  # type: ignore[index]
+
+    assert not private_gate_is_valid(snapshot)
+
+
+@pytest.mark.parametrize(
+    "comment_name", ["contract", "report", "attestation", "verification"]
+)
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("exists", False),
+        ("id", 999),
+        ("url", "https://example.invalid/wrong"),
+        ("author", "wrong-author"),
+        ("author_association", "NONE"),
+        ("created_at", "2026-07-02T09:09:00Z"),
+        ("updated_at", "2026-07-02T09:09:00Z"),
+        ("sha256", "0" * 64),
+    ],
+)
+def test_private_gate_comment_provenance_mutations_fail_closed(
+    comment_name: str, field: str, value: object
+) -> None:
+    snapshot = _private_gate_snapshot()
+    comment = snapshot[comment_name]
+    assert isinstance(comment, dict)
+    comment[field] = value
+
+    assert not private_gate_is_valid(snapshot)
+
+
+@pytest.mark.parametrize(
+    "comment_name", ["contract", "report", "attestation", "verification"]
+)
+@pytest.mark.parametrize(
+    "field",
+    [
+        "id",
+        "url",
+        "author",
+        "author_association",
+        "created_at",
+        "updated_at",
+        "sha256",
+    ],
+)
+def test_private_gate_missing_comment_provenance_fails_closed(
+    comment_name: str, field: str
+) -> None:
+    snapshot = _private_gate_snapshot()
+    comment = snapshot[comment_name]
+    assert isinstance(comment, dict)
+    comment.pop(field)
+
+    assert not private_gate_is_valid(snapshot)
+
+
+@pytest.mark.parametrize(
+    ("comment_name", "field"),
+    [
+        ("contract", "sha256"),
+        ("report", "id"),
+        ("attestation", "url"),
+        ("verification", "author"),
+    ],
+)
+def test_private_gate_missing_frozen_provenance_fails_closed(
+    comment_name: str, field: str
+) -> None:
+    snapshot = _private_gate_snapshot()
+    frozen = snapshot["frozen_evidence"]
+    assert isinstance(frozen, dict)
+    provenance = frozen[comment_name]
+    assert isinstance(provenance, dict)
+    provenance.pop(field)
+
+    assert not private_gate_is_valid(snapshot)
+
+
+@pytest.mark.parametrize(
+    ("comment_name", "created_at"),
+    [
+        ("report", "2026-07-02T08:59:00Z"),
+        ("attestation", "2026-07-02T09:00:30Z"),
+        ("verification", "2026-07-02T09:02:00Z"),
+    ],
+)
+def test_private_gate_comment_order_mutations_fail_closed(
+    comment_name: str, created_at: str
+) -> None:
+    snapshot = _private_gate_snapshot()
+    comment = snapshot[comment_name]
+    frozen = snapshot["frozen_evidence"]
+    assert isinstance(comment, dict)
+    assert isinstance(frozen, dict)
+    expected = frozen[comment_name]
+    assert isinstance(expected, dict)
+    comment["created_at"] = created_at
+    comment["updated_at"] = created_at
+    expected["created_at"] = created_at
+    expected["updated_at"] = created_at
 
     assert not private_gate_is_valid(snapshot)
 
@@ -475,46 +680,52 @@ def _mutate_comment_body(
             "c" * 40,
         ),
         (
-            "attestation",
+            "verification",
             (
-                "PRIVATE-GATE0-MAINTAINER-ATTESTATION",
-                "reverification",
-                "verified_at",
-            ),
-            "2026-07-02T09:00:00Z",
-        ),
-        (
-            "attestation",
-            (
-                "PRIVATE-GATE0-MAINTAINER-ATTESTATION",
-                "reverification",
+                "PRIVATE-GATE0-OWNER-VERIFICATION-V1",
                 "reporter",
             ),
             "other-reporter",
         ),
         (
-            "attestation",
+            "verification",
             (
-                "PRIVATE-GATE0-MAINTAINER-ATTESTATION",
-                "reverification",
+                "PRIVATE-GATE0-OWNER-VERIFICATION-V1",
                 "collaborators_sorted",
             ),
             ["reporter"],
         ),
         (
-            "attestation",
+            "verification",
             (
-                "PRIVATE-GATE0-MAINTAINER-ATTESTATION",
-                "reverification",
+                "PRIVATE-GATE0-OWNER-VERIFICATION-V1",
                 "authorized_code_contributors",
             ),
             [],
         ),
         (
-            "attestation",
+            "verification",
             (
-                "PRIVATE-GATE0-MAINTAINER-ATTESTATION",
-                "reverification",
+                "PRIVATE-GATE0-OWNER-VERIFICATION-V1",
+                "roles",
+                "auditor_run_id",
+            ),
+            "different-auditor",
+        ),
+        (
+            "verification",
+            (
+                "PRIVATE-GATE0-OWNER-VERIFICATION-V1",
+                "evidence",
+                "report",
+                "author",
+            ),
+            "wrong-author",
+        ),
+        (
+            "verification",
+            (
+                "PRIVATE-GATE0-OWNER-VERIFICATION-V1",
                 "head_sha",
             ),
             "c" * 40,
@@ -547,15 +758,79 @@ def test_private_report_cross_binding_survives_local_rehash_attempt() -> None:
         ),
         report_digest,
     )
+    assert not private_gate_is_valid(snapshot)
+
+
+def test_private_gate_rejects_fully_rehashed_evidence_replacement() -> None:
+    snapshot = _private_gate_snapshot()
+    _mutate_comment_body(
+        snapshot,
+        "contract",
+        ("PRIVATE-GATE0-CONTRACT-V1", "objective"),
+        "Coordinated replacement contract.",
+    )
+    contract = snapshot["contract"]
+    assert isinstance(contract, dict)
+    contract_digest = contract["sha256"]
+    _mutate_comment_body(
+        snapshot, "report", ("private_contract_sha256",), contract_digest
+    )
+    report = snapshot["report"]
+    assert isinstance(report, dict)
+    report_digest = report["sha256"]
     _mutate_comment_body(
         snapshot,
         "attestation",
         (
             "PRIVATE-GATE0-MAINTAINER-ATTESTATION",
-            "reverification",
-            "report_sha256",
+            "private_contract_sha256",
+        ),
+        contract_digest,
+    )
+    _mutate_comment_body(
+        snapshot,
+        "attestation",
+        (
+            "PRIVATE-GATE0-MAINTAINER-ATTESTATION",
+            "report_comment_sha256",
         ),
         report_digest,
+    )
+    _mutate_comment_body(
+        snapshot,
+        "verification",
+        (
+            "PRIVATE-GATE0-OWNER-VERIFICATION-V1",
+            "evidence",
+            "contract",
+            "sha256",
+        ),
+        contract_digest,
+    )
+    _mutate_comment_body(
+        snapshot,
+        "verification",
+        (
+            "PRIVATE-GATE0-OWNER-VERIFICATION-V1",
+            "evidence",
+            "report",
+            "sha256",
+        ),
+        report_digest,
+    )
+    attestation = snapshot["attestation"]
+    assert isinstance(attestation, dict)
+    attestation_digest = attestation["sha256"]
+    _mutate_comment_body(
+        snapshot,
+        "verification",
+        (
+            "PRIVATE-GATE0-OWNER-VERIFICATION-V1",
+            "evidence",
+            "attestation",
+            "sha256",
+        ),
+        attestation_digest,
     )
 
     assert not private_gate_is_valid(snapshot)

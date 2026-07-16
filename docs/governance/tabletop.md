@@ -15,9 +15,10 @@ exercise a live security advisory. Executable cases live in
 | Previously-known external | Yes, current | Awaiting approval | Re-check author/scope/time and workflow diff, then owner may approve |
 
 The offline authorization fixture proves that an immutable owner-authored
-record must predate hypothetical delivery, cannot backdate `issued_at`, and must
-exactly match contributor, work item, scope, and delivery. It covers timestamp
-expiry and completion-bound expiry before and after recorded completion.
+record's API `created_at` and declared `issued_at` must be equal and strictly
+earlier than the earliest hypothetical preparation/delivery event. It cannot
+backdate `issued_at` and must exactly match contributor, work item, scope, and
+delivery. Timestamp and completion-bound expiry remain inclusive.
 Repository setting readback, not this table, proves GitHub is configured with
 `approval_policy=all_external_contributors` before CI is reachable.
 
@@ -42,16 +43,20 @@ mutations fails closed independently:
 
 - reporter changes;
 - sorted collaborator snapshot changes;
-- contract/report/attestation is edited or deleted;
+- contract/report/attestation/verification is edited or deleted;
+- any stable comment ID, URL, author, association, or timestamp changes;
 - contract body changes without matching immutable evidence;
 - authorized contributor set changes; or
 - private-fork head SHA changes.
 
-The contract, report, and owner attestation are parsed as complete schemas and
-cross-bind contract/report digests, access roles, run/task IDs, report identity
-and timestamp, exact head, and re-verification evidence. Mutation cases
-recompute local body digests—and one also updates downstream digest fields—to
-prove self-consistent replacement data still fails the frozen cross-bindings.
+The contract, report, owner attestation, and separate owner verification comment
+are parsed as complete schemas. An independently supplied frozen snapshot binds
+all four comments' immutable digests and provenance. The verification comment
+binds the first three comments' exact digests, IDs, URLs, authors, associations,
+and timestamps, plus access roles, run/task IDs, and exact head; it must be
+strictly later than the attestation. Mutation cases include a coordinated rewrite
+that recomputes every local body hash and downstream digest, proving that a
+self-consistent replacement still fails the independent frozen snapshot.
 
 The tabletop does not claim normal GitHub checks run in a temporary private
 security fork. The required path is isolated execution of the canonical command

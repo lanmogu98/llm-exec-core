@@ -82,7 +82,7 @@ workflow for unauthorized external code. Close the PR with a link to
 `CONTRIBUTING.md`. Previously known external contributors follow the same rule.
 The owner comment must remain unedited (`created_at == updated_at`), its declared
 `issued_at` must equal the API `created_at`, and that durable timestamp must be
-no later than the earliest preparation/delivery event being authorized.
+strictly earlier than the earliest preparation/delivery event being authorized.
 Timestamp expiry is inclusive. For `expires_at: completion`, record completion
 state explicitly and reject any new preparation/delivery after completion.
 
@@ -248,21 +248,30 @@ PRIVATE-GATE0-CONTRACT-V1:
 The adapted report must parse as a complete schema and bind the exact contract
 digest, advisory, access roles, intended implementer, auditor run ID,
 orchestrator task ID, and PASS verdict. The immutable owner attestation binds
-those same values plus the report permalink/digest/API timestamp and exact head.
-Its re-verification block repeats the current contract/report digests, reporter,
-sorted collaborators, authorized contributors, head, and a timestamp no earlier
-than the report or attestation. Matching substrings or locally self-consistent
-replacement hashes are never sufficient.
+those same values plus the report's stable API comment ID, permalink, immutable
+body digest, author and association, created/updated timestamps, and exact head.
 
-Any contract/report/attestation edit, deletion, missing comment, author
-mismatch, reporter/collaborator change, authorization change, contract change,
-or private-fork head change invalidates PASS. Immediately before merge, the
-owner re-fetches and re-hashes all evidence, checks sorted access and exact head,
-and records verification. Temporary private security forks do not supply normal
-required-check evidence; run the canonical commands in an isolated local
-environment against the recorded head, record base/head/commands/results and
-rollback privately, and let only the maintainer use the advisory merge action.
-Publish only sanitized notes after coordinated disclosure.
+Immediately before merge, the owner re-fetches and re-hashes the contract,
+report, and attestation, checks sorted access and exact head, then posts a fourth
+immutable owner-authored `PRIVATE-GATE0-OWNER-VERIFICATION-V1` comment. Its body
+binds the exact frozen digest, API comment ID, URL, author, association, and
+created/updated timestamps for the contract, report, and attestation; reporter,
+sorted collaborators, authorized contributors; the complete role map including
+auditor/orchestrator IDs; and the exact head. Its `created_at` must be strictly
+later than the attestation's. The supplied independent snapshot also freezes the
+verification comment's own digest, ID, URL, author, association, and timestamp.
+All four evidence comments must exist and satisfy `created_at == updated_at`.
+Matching substrings or a coordinated replacement that recomputes every local
+body and downstream digest never satisfies the independent frozen snapshot.
+
+Any contract/report/attestation/verification edit, deletion, missing comment,
+provenance mismatch, reporter/collaborator change, authorization change,
+contract change, or private-fork head change invalidates PASS. Temporary private
+security forks do not supply normal required-check evidence; run the canonical
+commands in an isolated local environment against the recorded head, record
+base/head/commands/results and rollback privately, and let only the maintainer
+use the advisory merge action. Publish only sanitized notes after coordinated
+disclosure.
 
 An active-exploitation exception must be private, owner-authored, time-bounded,
 name the waived step and reason, owner, expiry, rollback, and retrospective

@@ -103,21 +103,32 @@ _PRIVATE_ATTESTATION_FIELDS = {
     "private_contract_sha256",
     "auditor_run_id",
     "orchestrator_task_id",
+    "report_comment_id",
     "report_comment_url",
     "report_comment_sha256",
+    "report_author",
+    "report_author_association",
     "report_created_at",
+    "report_updated_at",
     "roles",
     "verdict",
     "head_sha",
-    "reverification",
 }
-_PRIVATE_REVERIFICATION_FIELDS = {
-    "verified_at",
-    "contract_sha256",
-    "report_sha256",
+_PRIVATE_PROVENANCE_FIELDS = {
+    "id",
+    "url",
+    "author",
+    "author_association",
+    "created_at",
+    "updated_at",
+    "sha256",
+}
+_PRIVATE_VERIFICATION_FIELDS = {
+    "evidence",
     "reporter",
     "collaborators_sorted",
     "authorized_code_contributors",
+    "roles",
     "head_sha",
 }
 
@@ -178,7 +189,7 @@ def contribution_is_authorized(
     work_item: str,
     expected_scope: str,
     expected_delivery: str,
-    delivery_at: datetime,
+    earliest_event_at: datetime,
     completed_at: datetime | None = None,
 ) -> bool:
     """Check a synthetic outside-contribution authorization record."""
@@ -188,9 +199,12 @@ def contribution_is_authorized(
     except (TypeError, ValueError):
         return False
 
-    if delivery_at.tzinfo is None or delivery_at.utcoffset() is None:
+    if (
+        earliest_event_at.tzinfo is None
+        or earliest_event_at.utcoffset() is None
+    ):
         return False
-    if issued_at != created_at or created_at > delivery_at:
+    if issued_at != created_at or created_at >= earliest_event_at:
         return False
 
     expires_at_value = authorization.get("expires_at")
@@ -198,14 +212,14 @@ def contribution_is_authorized(
         if completed_at is not None:
             if completed_at.tzinfo is None or completed_at.utcoffset() is None:
                 return False
-            if delivery_at > completed_at:
+            if earliest_event_at > completed_at:
                 return False
     else:
         try:
             expires_at = _parse_timestamp(expires_at_value)
         except (TypeError, ValueError):
             return False
-        if delivery_at > expires_at:
+        if earliest_event_at > expires_at:
             return False
 
     return all(
@@ -280,11 +294,31 @@ def _parse_yaml_mapping(comment: object) -> Mapping[str, Any] | None:
     return parsed if isinstance(parsed, Mapping) else None
 
 
+def _comment_matches_frozen_provenance(
+    comment: object,
+    frozen: object,
+    *,
+    owner_required: bool,
+) -> bool:
+    if not _exact_mapping(frozen, _PRIVATE_PROVENANCE_FIELDS):
+        return False
+    if not _comment_is_unchanged(comment, owner_required=owner_required):
+        return False
+    assert isinstance(comment, Mapping)
+    assert isinstance(frozen, Mapping)
+    return all(
+        comment.get(field) == frozen.get(field)
+        for field in _PRIVATE_PROVENANCE_FIELDS
+    )
+
+
 def private_gate_is_valid(snapshot: Mapping[str, Any]) -> bool:
-    """Validate a fully cross-bound synthetic private-advisory snapshot."""
+    """Validate independently frozen private-advisory evidence."""
     contract = snapshot.get("contract")
     report = snapshot.get("report")
     attestation = snapshot.get("attestation")
+    verification = snapshot.get("verification")
+    frozen_evidence = snapshot.get("frozen_evidence")
     current_head = snapshot.get("current_head_sha")
 
     if snapshot.get("expected_reporter") != snapshot.get("current_reporter"):
@@ -305,16 +339,33 @@ def private_gate_is_valid(snapshot: Mapping[str, Any]) -> bool:
         return False
     if snapshot.get("expected_head_sha") != current_head:
         return False
-    if not _comment_is_unchanged(contract, owner_required=True):
+    if not _exact_mapping(
+        frozen_evidence,
+        {"contract", "report", "attestation", "verification"},
+    ):
         return False
-    if not _comment_is_unchanged(report):
-        return False
-    if not _comment_is_unchanged(attestation, owner_required=True):
-        return False
+    assert isinstance(frozen_evidence, Mapping)
+    for name, comment, owner_required in (
+        ("contract", contract, True),
+        ("report", report, False),
+        ("attestation", attestation, True),
+        ("verification", verification, True),
+    ):
+        if not _comment_matches_frozen_provenance(
+            comment,
+            frozen_evidence.get(name),
+            owner_required=owner_required,
+        ):
+            return False
+    assert isinstance(contract, Mapping)
+    assert isinstance(report, Mapping)
+    assert isinstance(attestation, Mapping)
+    assert isinstance(verification, Mapping)
 
     contract_document = _parse_yaml_mapping(contract)
     report_document = _parse_yaml_mapping(report)
     attestation_document = _parse_yaml_mapping(attestation)
+    verification_document = _parse_yaml_mapping(verification)
     if not _exact_mapping(contract_document, {"PRIVATE-GATE0-CONTRACT-V1"}):
         return False
     if not _exact_mapping(report_document, _PRIVATE_REPORT_FIELDS):
@@ -323,20 +374,31 @@ def private_gate_is_valid(snapshot: Mapping[str, Any]) -> bool:
         attestation_document, {"PRIVATE-GATE0-MAINTAINER-ATTESTATION"}
     ):
         return False
+    if not _exact_mapping(
+        verification_document, {"PRIVATE-GATE0-OWNER-VERIFICATION-V1"}
+    ):
+        return False
 
     assert contract_document is not None
     assert report_document is not None
     assert attestation_document is not None
+    assert verification_document is not None
     contract_data = contract_document["PRIVATE-GATE0-CONTRACT-V1"]
     attestation_data = attestation_document[
         "PRIVATE-GATE0-MAINTAINER-ATTESTATION"
+    ]
+    verification_data = verification_document[
+        "PRIVATE-GATE0-OWNER-VERIFICATION-V1"
     ]
     if not _exact_mapping(contract_data, _PRIVATE_CONTRACT_FIELDS):
         return False
     if not _exact_mapping(attestation_data, _PRIVATE_ATTESTATION_FIELDS):
         return False
+    if not _exact_mapping(verification_data, _PRIVATE_VERIFICATION_FIELDS):
+        return False
     assert isinstance(contract_data, Mapping)
     assert isinstance(attestation_data, Mapping)
+    assert isinstance(verification_data, Mapping)
 
     string_contract_fields = {
         "advisory_id",
@@ -375,10 +437,8 @@ def private_gate_is_valid(snapshot: Mapping[str, Any]) -> bool:
     if contract_authorizations != snapshot.get("current_authorizations"):
         return False
 
-    contract_body = (
-        contract.get("body") if isinstance(contract, Mapping) else None
-    )
-    report_body = report.get("body") if isinstance(report, Mapping) else None
+    contract_body = contract.get("body")
+    report_body = report.get("body")
     if not isinstance(contract_body, str) or not isinstance(report_body, str):
         return False
     contract_digest = comment_sha256(contract_body)
@@ -414,12 +474,8 @@ def private_gate_is_valid(snapshot: Mapping[str, Any]) -> bool:
         return False
 
     attestation_roles = attestation_data.get("roles")
-    reverification = attestation_data.get("reverification")
     if not _exact_mapping(attestation_roles, _PRIVATE_ROLE_FIELDS):
         return False
-    if not _exact_mapping(reverification, _PRIVATE_REVERIFICATION_FIELDS):
-        return False
-    assert isinstance(reverification, Mapping)
     if attestation_roles != expected_roles:
         return False
     if (
@@ -434,44 +490,78 @@ def private_gate_is_valid(snapshot: Mapping[str, Any]) -> bool:
         return False
     if attestation_data.get("private_contract_sha256") != contract_digest:
         return False
-    if not isinstance(report, Mapping):
+    if attestation_data.get("report_comment_id") != report.get("id"):
         return False
     if attestation_data.get("report_comment_url") != report.get("url"):
         return False
     if attestation_data.get("report_comment_sha256") != report_digest:
         return False
+    if attestation_data.get("report_author") != report.get("author"):
+        return False
+    if attestation_data.get("report_author_association") != report.get(
+        "author_association"
+    ):
+        return False
     report_created_at = report.get("created_at")
     if attestation_data.get("report_created_at") != report_created_at:
+        return False
+    if attestation_data.get("report_updated_at") != report.get("updated_at"):
         return False
     if attestation_data.get("verdict") != "PASS":
         return False
     if attestation_data.get("head_sha") != current_head:
         return False
 
-    if reverification.get("contract_sha256") != contract_digest:
+    verification_evidence = verification_data.get("evidence")
+    if not _exact_mapping(
+        verification_evidence, {"contract", "report", "attestation"}
+    ):
         return False
-    if reverification.get("report_sha256") != report_digest:
+    assert isinstance(verification_evidence, Mapping)
+    for name in ("contract", "report", "attestation"):
+        provenance = verification_evidence.get(name)
+        if not _exact_mapping(provenance, _PRIVATE_PROVENANCE_FIELDS):
+            return False
+        if provenance != frozen_evidence.get(name):
+            return False
+    if verification_data.get("reporter") != snapshot.get("current_reporter"):
         return False
-    if reverification.get("reporter") != snapshot.get("current_reporter"):
-        return False
-    if reverification.get("collaborators_sorted") != snapshot.get(
+    if verification_data.get("collaborators_sorted") != snapshot.get(
         "current_collaborators"
     ):
         return False
-    if reverification.get("authorized_code_contributors") != snapshot.get(
+    if verification_data.get("authorized_code_contributors") != snapshot.get(
         "current_authorizations"
     ):
         return False
-    if reverification.get("head_sha") != current_head:
+    if verification_data.get("roles") != expected_roles:
+        return False
+    if verification_data.get("head_sha") != current_head:
         return False
 
     try:
+        contract_created = _parse_timestamp(contract.get("created_at"))
         report_created = _parse_timestamp(report_created_at)
         attestation_created = _parse_timestamp(attestation.get("created_at"))
-        reverified_at = _parse_timestamp(reverification.get("verified_at"))
-    except (TypeError, ValueError):
+        verification_created = _parse_timestamp(verification.get("created_at"))
+    except (AttributeError, TypeError, ValueError):
         return False
-    if reverified_at < report_created or reverified_at < attestation_created:
+    if any(
+        timestamp.tzinfo is None or timestamp.utcoffset() is None
+        for timestamp in (
+            contract_created,
+            report_created,
+            attestation_created,
+            verification_created,
+        )
+    ):
+        return False
+    if not (
+        contract_created
+        < report_created
+        < attestation_created
+        < verification_created
+    ):
         return False
     return True
 
