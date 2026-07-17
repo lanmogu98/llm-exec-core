@@ -1,5 +1,6 @@
 """LLM configuration loader."""
 
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -105,6 +106,14 @@ def load_all_settings(
     global _DEFAULT_PROVIDER_SETTINGS
 
     if config_source is None:
+        warnings.warn(
+            "Loading the bundled model catalog without config_source is "
+            "deprecated. Pass config_source with a caller-owned catalog; "
+            "see the migration contract at "
+            "https://github.com/lanmogu98/llm-exec-core/issues/5.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if _DEFAULT_PROVIDER_SETTINGS is None:
             _DEFAULT_PROVIDER_SETTINGS = _build_settings(None)
         return _clone_settings(_DEFAULT_PROVIDER_SETTINGS)
@@ -135,7 +144,11 @@ def get_model_details(
                 provider_settings.models[model_name],
             )
 
-    available_models = ", ".join(get_supported_models(config_source))
+    available_models = ", ".join(
+        model_name
+        for provider_settings in settings_by_provider.values()
+        for model_name in provider_settings.models
+    )
     raise ValueError(
         f"Model '{model_name}' not found. Available models: {available_models}"
     )

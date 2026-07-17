@@ -1,15 +1,33 @@
+import inspect
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import inspect
 
 from llm_exec_core.client import LLMClient
 
 
-def test_get_supported_models_is_zero_arg_staticmethod():
+def test_get_supported_models_is_staticmethod_with_optional_config_source():
     sig = inspect.signature(LLMClient.get_supported_models)
 
-    assert len(sig.parameters) == 0
+    assert isinstance(
+        inspect.getattr_static(LLMClient, "get_supported_models"), staticmethod
+    )
+    assert list(sig.parameters) == ["config_source"]
+    assert sig.parameters["config_source"].default is None
+
+
+def test_get_supported_models_forwards_config_source_unchanged():
+    config_source = {"test-provider": {}}
+    expected_models = ["test-model"]
+
+    with patch(
+        "llm_exec_core.client.get_supported_models",
+        return_value=expected_models,
+    ) as get_models:
+        result = LLMClient.get_supported_models(config_source)
+
+    assert result is expected_models
+    get_models.assert_called_once_with(config_source)
 
 
 @pytest.mark.asyncio

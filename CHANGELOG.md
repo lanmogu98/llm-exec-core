@@ -9,6 +9,16 @@
   security process, and offline governance tabletop tests.
 - Add deterministic mock-only CI for Python 3.10 and 3.13 with locked
   dependencies, full-SHA actions, minimal permissions, and stable check names.
+- Allow `LLMClient.get_supported_models` to discover models from a caller-owned
+  path or raw catalog dictionary.
+
+### Changed
+
+- Emit an actionable `DeprecationWarning` for implicit bundled-catalog loads
+  while preserving that compatibility fallback pending the separately governed
+  final-removal child of the model-catalog migration.
+- Describe core as provider-agnostic execution, schema, and catalog-loading
+  infrastructure, with runtime catalog policy owned by callers.
 
 ## 0.2.0
 
