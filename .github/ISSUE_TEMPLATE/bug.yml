@@ -1,0 +1,54 @@
+name: Bug report
+description: Report reproducible incorrect behavior in llm-exec-core.
+title: "[Bug]: "
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Public Issues are the only public intake channel. Do not submit code
+        unless the maintainer first authorizes it in writing.
+  - type: input
+    id: version
+    attributes:
+      label: Package version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, Python version, and dependency versions.
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: minimal_reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Redact keys, tokens, prompts, and other sensitive data.
+      render: python
+  - type: checkboxes
+    id: contribution_boundary
+    attributes:
+      label: Contribution boundary
+      options:
+        - label: I have not attached or submitted an unsolicited code change.
+          required: true

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Add the Gate 0-audited repository governance contract, structured public
+  intake, prior-written-authorization contribution policy, confidential
+  security process, and offline governance tabletop tests.
+- Add deterministic mock-only CI for Python 3.10 and 3.13 with locked
+  dependencies, full-SHA actions, minimal permissions, and stable check names.
+
 ## 0.2.0
 
 ### Added
