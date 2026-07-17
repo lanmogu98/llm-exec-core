@@ -1,10 +1,83 @@
+import warnings
+from unittest.mock import patch
+
+import pytest
+import yaml
+
+import llm_exec_core.config as config_module
 from llm_exec_core.client import LLMClient
 from llm_exec_core.config import (
     get_model_details,
+    get_provider_settings,
     get_supported_models,
     load_all_settings,
 )
-import yaml
+
+DEPRECATION_MESSAGE = (
+    "Loading the bundled model catalog without config_source is deprecated. "
+    "Pass config_source with a caller-owned catalog; see the migration "
+    "contract at https://github.com/lanmogu98/llm-exec-core/issues/5."
+)
+
+EXPECTED_DEFAULT_MODELS = [
+    "deepseek-v3.2",
+    "deepseek-r1",
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "gemini-3-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-pro",
+    "gemini-2.5-flash-free",
+    "gemini-2.5-flash-lite-free",
+    "gemini-3-flash-free",
+    "gemini-3.1-flash-lite-free",
+    "qwen3.6-flash",
+    "qwen-max",
+    "qwen-turbo",
+    "qwen-plus",
+    "qwen3.5-plus",
+    "qwen3-max-preview",
+    "qwen3-max",
+    "glm-5.2",
+    "glm-4.5",
+    "glm-4.6",
+    "glm-4.7",
+    "glm-5",
+    "glm-5.1",
+    "glm-5.2-or",
+    "glm-4.5-or",
+    "glm-4.6-or",
+    "glm-4.7-or",
+    "glm-5-or",
+    "glm-5.1-or",
+    "glm-5-turbo-or",
+    "doubao-seed-2.1-pro",
+    "doubao-seed-1.6",
+    "gpt-4o-or",
+    "gpt-4.1-or",
+    "gpt-5-or",
+    "gpt-5.2-or",
+    "gpt-5.4-or",
+    "gpt-5.5-or",
+    "claude-sonnet-5-or",
+    "claude-opus-4.8-or",
+    "claude-sonnet-4-or",
+    "claude-opus-4.6-or",
+    "claude-sonnet-4.6-or",
+    "claude-opus-4.7-or",
+    "claude-haiku-4.5-or",
+]
+
+CATALOG_API_CASES = [
+    "load_all_settings",
+    "get_supported_models",
+    "get_model_details_valid",
+    "get_model_details_unknown",
+    "get_provider_settings_valid",
+    "get_provider_settings_unknown",
+    "LLMClient.get_supported_models",
+    "LLMClient",
+]
 
 CUSTOM_CONFIG = {
     "_shared": {"ignored": True},
@@ -23,6 +96,139 @@ CUSTOM_CONFIG = {
         },
     },
 }
+
+
+def _call_catalog_api(api_name, config_source=None):
+    source_args = () if config_source is None else (config_source,)
+    model_name = "deepseek-v3.2" if config_source is None else "test-model"
+    provider_name = (
+        "deepseek-volcengine" if config_source is None else "test-provider"
+    )
+
+    if api_name == "load_all_settings":
+        return load_all_settings(*source_args)
+    if api_name == "get_supported_models":
+        return get_supported_models(*source_args)
+    if api_name == "get_model_details_valid":
+        return get_model_details(model_name, *source_args)
+    if api_name == "get_model_details_unknown":
+        with pytest.raises(ValueError):
+            get_model_details("unknown-model", *source_args)
+        return None
+    if api_name == "get_provider_settings_valid":
+        return get_provider_settings(provider_name, *source_args)
+    if api_name == "get_provider_settings_unknown":
+        with pytest.raises(ValueError):
+            get_provider_settings("unknown-provider", *source_args)
+        return None
+    if api_name == "LLMClient.get_supported_models":
+        return LLMClient.get_supported_models(*source_args)
+    if config_source is None:
+        return LLMClient(model_name)
+    return LLMClient(model_name, config_source=config_source)
+
+
+@pytest.mark.parametrize("cache_state", ["cold", "warm"])
+@pytest.mark.parametrize("api_name", CATALOG_API_CASES)
+def test_default_catalog_public_calls_emit_one_actionable_warning(
+    monkeypatch, cache_state, api_name
+):
+    monkeypatch.setattr(config_module, "_DEFAULT_PROVIDER_SETTINGS", None)
+    monkeypatch.setenv("DEEPSEEK_API_KEY_VOLC", "test-key")
+
+    if cache_state == "warm":
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            load_all_settings()
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _call_catalog_api(api_name)
+
+    deprecations = [
+        str(warning.message)
+        for warning in caught
+        if issubclass(warning.category, DeprecationWarning)
+    ]
+    assert deprecations == [DEPRECATION_MESSAGE]
+
+
+@pytest.mark.parametrize("source_kind", ["dict", "path"])
+@pytest.mark.parametrize("api_name", CATALOG_API_CASES)
+def test_explicit_catalog_public_calls_emit_no_deprecation_warning(
+    monkeypatch, tmp_path, source_kind, api_name
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    config_source = CUSTOM_CONFIG
+    if source_kind == "path":
+        config_source = tmp_path / "llm_config.yml"
+        with config_source.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(CUSTOM_CONFIG, handle)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _call_catalog_api(api_name, config_source)
+
+    assert not [
+        warning
+        for warning in caught
+        if issubclass(warning.category, DeprecationWarning)
+    ]
+
+
+def test_implicit_catalog_warning_uses_fixed_stacklevel(monkeypatch):
+    monkeypatch.setattr(config_module, "_DEFAULT_PROVIDER_SETTINGS", None)
+
+    with patch("llm_exec_core.config.warnings.warn") as warn:
+        load_all_settings()
+
+    warn.assert_called_once_with(
+        DEPRECATION_MESSAGE,
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+
+def test_zero_argument_supported_models_preserve_order(monkeypatch):
+    monkeypatch.setattr(config_module, "_DEFAULT_PROVIDER_SETTINGS", None)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        models = LLMClient.get_supported_models()
+
+    assert models == EXPECTED_DEFAULT_MODELS
+    assert [
+        str(warning.message)
+        for warning in caught
+        if issubclass(warning.category, DeprecationWarning)
+    ] == [DEPRECATION_MESSAGE]
+
+
+def test_unknown_model_reuses_snapshot_and_preserves_error_order(
+    monkeypatch,
+):
+    monkeypatch.setattr(config_module, "_DEFAULT_PROVIDER_SETTINGS", None)
+
+    with (
+        patch(
+            "llm_exec_core.config.load_all_settings", wraps=load_all_settings
+        ) as loader,
+        warnings.catch_warnings(record=True) as caught,
+    ):
+        warnings.simplefilter("always")
+        with pytest.raises(ValueError) as error:
+            get_model_details("unknown-model")
+
+    assert loader.call_count == 1
+    assert str(error.value) == (
+        "Model 'unknown-model' not found. Available models: "
+        + ", ".join(EXPECTED_DEFAULT_MODELS)
+    )
+    assert [
+        str(warning.message)
+        for warning in caught
+        if issubclass(warning.category, DeprecationWarning)
+    ] == [DEPRECATION_MESSAGE]
 
 
 def test_load_all_settings_accepts_dict_and_skips_private_keys():
@@ -328,7 +534,8 @@ def test_provider_settings_accepts_configured_max_tokens_retry_policy():
     assert provider_settings.max_tokens_retry.max_tokens_limit == 8192
 
 
-def test_explicit_config_source_is_not_polluted_by_default_cache():
+def test_default_cache_does_not_pollute_explicit_config_source(monkeypatch):
+    monkeypatch.setattr(config_module, "_DEFAULT_PROVIDER_SETTINGS", None)
     get_supported_models()
 
     first = get_supported_models(CUSTOM_CONFIG)
@@ -355,8 +562,8 @@ def test_explicit_config_source_is_not_polluted_by_default_cache():
     assert second == ["other-model"]
 
 
-def test_explicit_config_source_does_not_use_default_cache():
-    default_models = set(get_supported_models())
+def test_explicit_config_source_does_not_populate_default_cache(monkeypatch):
+    monkeypatch.setattr(config_module, "_DEFAULT_PROVIDER_SETTINGS", None)
     custom_models = get_supported_models(
         {
             "other-provider": {
@@ -375,6 +582,10 @@ def test_explicit_config_source_does_not_use_default_cache():
             }
         }
     )
+
+    assert config_module._DEFAULT_PROVIDER_SETTINGS is None
+
+    default_models = set(get_supported_models())
 
     assert set(custom_models) == {"other-model"}
     assert default_models.isdisjoint(custom_models)

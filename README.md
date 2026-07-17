@@ -1,13 +1,14 @@
 # llm-exec-core
 
-`llm-exec-core` is a small Python package for async LLM execution, shared
-provider/model catalog loading, streaming assembly, and typed usage/result
-objects.
+`llm-exec-core` is a small provider-agnostic Python package for async LLM
+execution, model-catalog schema and loading infrastructure, streaming assembly,
+and typed usage/result objects.
 
 It provides:
 
 - `LLMClient` for async request execution and streaming
-- `llm_exec_core/llm_config.yml` as the shared model catalog
+- schema and loading helpers for caller-owned provider/model catalogs
+- `llm_exec_core/llm_config.yml` as a temporary legacy fallback
 - typed result and usage objects for legacy and new call sites
 
 ## Install
@@ -19,10 +20,25 @@ uv add llm-exec-core
 ## Basic usage
 
 ```python
+from pathlib import Path
+
 from llm_exec_core.client import LLMClient
 
-client = LLMClient("your-model-name")
+catalog = Path("path/to/llm_config.yml")
+client = LLMClient("your-model-name", config_source=catalog)
+models = LLMClient.get_supported_models(catalog)
 ```
+
+`config_source` accepts either a catalog path or a raw configuration dictionary
+across the client and public configuration helpers. Caller-owned catalogs are
+the recommended runtime policy boundary.
+
+For compatibility, omitting `config_source` still loads the bundled catalog and
+emits `DeprecationWarning`. This fallback has no approved removal version;
+removal is governed by the separate
+[final-removal child #10](https://github.com/lanmogu98/llm-exec-core/issues/10)
+under the [model-catalog migration contract
+#5](https://github.com/lanmogu98/llm-exec-core/issues/5).
 
 ## Request options
 

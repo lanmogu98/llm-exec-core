@@ -132,9 +132,11 @@ class LLMClient:
     """Client for interacting with the LLM API (Async)."""
 
     @staticmethod
-    def get_supported_models() -> list[str]:
-        """Return list of supported model names from llm_config.yml."""
-        return get_supported_models()
+    def get_supported_models(
+        config_source: Path | Dict[str, Any] | None = None,
+    ) -> list[str]:
+        """Return model names from an explicit or legacy bundled catalog."""
+        return get_supported_models(config_source)
 
     def __init__(
         self,
