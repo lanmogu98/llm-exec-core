@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.1
+
 ### Added
 
 - Add the Gate 0-audited repository governance contract, structured public
