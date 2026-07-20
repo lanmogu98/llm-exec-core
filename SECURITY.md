@@ -19,15 +19,22 @@ scope, coordinate validation/remediation privately, and provide status updates
 when there is material progress. No fixed response or disclosure deadline is
 promised.
 
-The security advisory is the private work item. Reporter/collaborator access
-does not authorize code. Do not prepare or submit a patch unless `lanmogu98`
-first posts an owner-authored `CONTRIBUTION-AUTHORIZATION` in the advisory that
-names you, the exact scope and delivery, and its expiry. Unauthorized submitted
+The advisory is the private semantic work item. It records the objective, scope,
+non-goals, compatibility/security impact, acceptance, validation, rollback,
+reporter, collaborators, authorized contributors, and intended implementer.
+Reporter or collaborator access does not authorize code.
+
+Do not prepare or submit a patch unless `lanmogu98` gives an explicit maintainer
+dispatch inside the advisory naming the work item, contributor or implementation
+session, exact semantic scope, and branch/PR delivery. Unauthorized submitted
 code is not inspected or executed.
 
-Confidential work follows the private Gate 0 contract in `AGENTS.md`: immutable
-owner contract, fresh independent read-only audit, separate owner attestation,
-exact-body hashes, access/head revalidation, isolated offline checks, and
-maintainer-only advisory merge. Any evidence, access, authorization, contract,
-or head mutation invalidates PASS. Public disclosure is sanitized and
-coordinated after remediation.
+Security work requires a new independent read-only reviewer on the actual private
+PR head. The reviewer must not have implemented that head and reports a concise
+`PASS` or `FAIL`, findings, and blockers. Validate the recorded head in an
+isolated local environment with mocked/fake provider access and the canonical
+commands in `AGENTS.md`. A new commit requires a new review.
+
+Only the maintainer merges through the advisory workflow and coordinates
+sanitized disclosure, release, and publication. Rollback is a focused revert PR;
+direct push, bypass, and disclosure of confidential evidence are prohibited.

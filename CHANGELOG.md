@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed
+
+- Replace governance evidence chains with semantic maintainer dispatch and
+  risk-based independent review of the exact pull-request head.
+
 ## 0.2.1
 
 ### Added

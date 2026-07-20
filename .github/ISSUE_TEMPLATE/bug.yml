@@ -6,8 +6,9 @@ body:
   - type: markdown
     attributes:
       value: >-
-        Public Issues are the only public intake channel. Do not submit code
-        unless the maintainer first authorizes it in writing.
+        Public Issues are the only public intake channel. Do not prepare or
+        submit code until the Issue is accepted and the maintainer explicitly
+        dispatches your actor/session, semantic scope, and branch/PR delivery.
   - type: input
     id: version
     attributes:
@@ -34,6 +35,18 @@ body:
     validations:
       required: true
   - type: textarea
+    id: scope
+    attributes:
+      label: Proposed semantic scope
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+    validations:
+      required: true
+  - type: textarea
     id: reproduction
     attributes:
       label: Steps to reproduce
@@ -45,10 +58,44 @@ body:
       label: Minimal reproduction
       description: Redact keys, tokens, prompts, and other sensitive data.
       render: python
+  - type: textarea
+    id: impact
+    attributes:
+      label: Compatibility and security impact
+    validations:
+      required: true
+  - type: dropdown
+    id: risk_class
+    attributes:
+      label: Risk class
+      description: High risk includes workflow, permissions, secrets, security, external code, breaking public API, and catalog changes.
+      options:
+        - Ordinary source/test/docs/config
+        - High risk
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation plan
+    validations:
+      required: true
+  - type: textarea
+    id: rollback
+    attributes:
+      label: Rollback and recovery
+    validations:
+      required: true
   - type: checkboxes
     id: contribution_boundary
     attributes:
       label: Contribution boundary
       options:
-        - label: I have not attached or submitted an unsolicited code change.
+        - label: I will wait for an explicit maintainer dispatch before preparing code.
           required: true

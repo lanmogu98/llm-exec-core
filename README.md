@@ -157,10 +157,10 @@ See [AGENTS.md](AGENTS.md) for the project workflow and quality contract.
 
 ## Issues and contributions
 
-This repository accepts public Issues only; code contributions require prior
-written maintainer authorization. Do not prepare or submit an outside fork,
-patch, or pull request until an owner-authored authorization exists in the
-accepted Issue. See [CONTRIBUTING.md](CONTRIBUTING.md).
+This repository accepts public Issues only. Code preparation and contribution
+require an accepted Issue plus an explicit maintainer dispatch naming the
+semantic scope, actor/session, and branch/PR delivery. Unsolicited external code
+is not inspected or executed. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Report vulnerabilities through GitHub's private vulnerability reporting path,
 not a public Issue. See [SECURITY.md](SECURITY.md).

@@ -2,7 +2,7 @@ blank_issues_enabled: false
 contact_links:
   - name: Contribution policy
     url: https://github.com/lanmogu98/llm-exec-core/blob/main/CONTRIBUTING.md
-    about: Public Issues only; code requires prior written authorization.
+    about: Public Issues only; code requires accepted scope and explicit maintainer dispatch.
   - name: Report a security vulnerability privately
     url: https://github.com/lanmogu98/llm-exec-core/security/advisories/new
     about: Do not disclose vulnerabilities in a public Issue.

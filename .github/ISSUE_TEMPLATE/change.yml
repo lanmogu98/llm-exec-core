@@ -6,8 +6,9 @@ body:
   - type: markdown
     attributes:
       value: >-
-        Public Issues are the only public intake channel. Code contributions
-        require prior written maintainer authorization in the accepted Issue.
+        Public Issues are the only public intake channel. Code preparation and
+        contribution require an accepted Issue and explicit maintainer dispatch
+        naming the actor/session, semantic scope, and branch/PR delivery.
   - type: textarea
     id: objective
     attributes:
@@ -50,6 +51,16 @@ body:
       label: Risks and dependencies
     validations:
       required: true
+  - type: dropdown
+    id: risk_class
+    attributes:
+      label: Risk class
+      description: High risk includes workflow, permissions, secrets, security, external code, breaking public API, and catalog changes.
+      options:
+        - Ordinary source/test/docs/config
+        - High risk
+    validations:
+      required: true
   - type: textarea
     id: validation
     attributes:
@@ -67,5 +78,5 @@ body:
     attributes:
       label: Contribution boundary
       options:
-        - label: I will wait for written authorization before preparing code.
+        - label: I will wait for an explicit maintainer dispatch before preparing code.
           required: true
