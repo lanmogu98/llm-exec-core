@@ -5,63 +5,50 @@ submit code, approve a workflow, inspect credentials, call a provider, or
 exercise a live security advisory. Executable cases live in
 `tests/governance/test_governance_contract.py`.
 
-## External fork event states
+## Dispatch cases
 
-| Contributor | Prior exact authorization | Fork workflow | Maintainer action |
-|---|---:|---|---|
-| First-time external | No | Awaiting approval | Do not inspect/execute; close the PR |
-| First-time external | Yes, current | Awaiting approval | Re-check author/scope/time and workflow diff, then owner may approve |
-| Previously-known external | No | Awaiting approval | Do not inspect/execute; close the PR |
-| Previously-known external | Yes, current | Awaiting approval | Re-check author/scope/time and workflow diff, then owner may approve |
+| Case | Issue and dispatch state | Required result |
+|---|---|---|
+| Ordinary source/test/docs/config change | Accepted Issue; dispatch matches scope, actor/session, and branch/PR delivery | Implementation may proceed; tests, exact-head CI/review, and owner UI merge remain required |
+| Objective, scope, behavior, compatibility, security, or authority changes materially | Existing dispatch predates the semantic change | Stop and obtain a new maintainer dispatch |
+| Date, link, formatting, typo, evidence, or status changes | Existing dispatch still matches semantic work | Preserve dispatch; continue without ceremony |
+| High-risk PR | Matching dispatch; workflow, permissions, secrets, security, external code, breaking API, or catalog is involved | New independent read-only `PASS` review on the actual PR head |
+| High-risk PR head changes | Previous review names an older commit | Review is stale; obtain a new independent review |
+| Owner-only action | Implementation agent is otherwise fully dispatched | Deny merge, auto-merge, release/publication, settings, secrets, permissions, protected deployment, bypass, and direct `main` update |
 
-The offline authorization fixture proves that an immutable owner-authored
-record's API `created_at` and declared `issued_at` must be equal and strictly
-earlier than the earliest hypothetical preparation/delivery event. It cannot
-backdate `issued_at` and must exactly match contributor, work item, scope, and
-delivery. Timestamp and completion-bound expiry remain inclusive.
-Repository setting readback, not this table, proves GitHub is configured with
-`approval_policy=all_external_contributors` before CI is reachable.
+No Issue/comment hash, attestation chain, timestamp chain, or pre-implementation
+universal audit is part of these cases. The Issue is the semantic source of
+truth; the commit SHA identifies the actual PR head.
 
-## Gate 0 and workflow-change cases
+## External and security boundaries
 
-- Pending Gate 0 permits contract read/edit, audit, and remediation only.
-- Pending Gate 0 rejects implementation assignment/branch, tracked writes,
-  settings changes, and external-code execution.
-- PASS permits scoped implementation only after all immutable evidence matches.
-- PASS is readiness, not authority: actor role, explicit task actions, and the
-  contribution-plane allowlist must also permit the operation.
-- A synthetic CI replacement that returns success is still not mergeable unless
-  the owner posts exactly `WORKFLOW-CHANGE-AUTHORIZED: <current head SHA>`.
-- A new head SHA, edited comment, non-owner comment, or extra comment text
-  invalidates workflow authorization; only the maintainer may merge in the UI.
+| Contributor | Accepted work item and matching dispatch | Required handling |
+|---|---:|---|
+| First-time external | No | Do not inspect or execute submitted code; close the PR |
+| First-time external | Yes | Check current scope and workflow diff; treat code as high risk |
+| Previously known external | No | Do not inspect or execute submitted code; close the PR |
+| Previously known external | Yes | Apply the same current-scope and high-risk review rules |
+| Security reporter/collaborator | Advisory access only | Access is not code authority; require an advisory dispatch |
+| Security implementer | Matching advisory dispatch | Isolated validation plus independent review on the actual private PR head |
 
-## Private advisory cases
+The independent reviewer must not have implemented the reviewed head and
+reports concise `PASS` or `FAIL`, findings, and blockers. The maintainer alone
+merges through the GitHub UI or advisory workflow and controls coordinated
+publication. Unauthorized external code is never checkout, downloaded,
+substantively inspected, built, tested, executed, or approved for workflow use.
 
-The synthetic advisory fixture computes the exact private contract digest with
-Python `hashlib` and OpenSSL. Its unchanged baseline passes. Each of these
-mutations fails closed independently:
+## Evidence and ordering cases
 
-- reporter changes;
-- sorted collaborator snapshot changes;
-- contract/report/attestation/verification is edited or deleted;
-- any stable comment ID, URL, author, association, or timestamp changes;
-- contract body changes without matching immutable evidence;
-- authorized contributor set changes; or
-- private-fork head SHA changes.
-
-The contract, report, owner attestation, and separate owner verification comment
-are parsed as complete schemas. An independently supplied frozen snapshot binds
-all four comments' immutable digests and provenance. The verification comment
-binds the first three comments' exact digests, IDs, URLs, authors, associations,
-and timestamps, plus access roles, run/task IDs, and exact head; it must be
-strictly later than the attestation. Mutation cases include a coordinated rewrite
-that recomputes every local body hash and downstream digest, proving that a
-self-consistent replacement still fails the independent frozen snapshot.
-
-The tabletop does not claim normal GitHub checks run in a temporary private
-security fork. The required path is isolated execution of the canonical command
-set against the recorded head, private evidence, maintainer-only advisory merge,
-and sanitized coordinated disclosure.
+- Official web facts record the URL, retrieval date, and verified semantic facts;
+  representation hashes are not governance evidence.
+- SHA-256 is retained for built release artifacts, commit SHA for exact PR-head
+  identity, and package-manager-native lock integrity for dependencies.
+- Only completed upstream stages block a child. Refresh downstream evidence
+  when that child's turn arrives; do not pre-audit future work.
+- Parent and child work items do not duplicate approval of the same semantic
+  decision.
+- Rollback is a focused revert PR. Direct push and bypass are never recovery
+  paths.
 
 ## Bootstrap recovery matrix
 

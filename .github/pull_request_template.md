@@ -1,35 +1,43 @@
-## Work contract
+## Work item and dispatch
 
-- Accepted Issue: Closes #
-- Outside-contributor authorization permalink: not external
-- Gate 0 PASS report: https://github.com/
-- Maintainer attestation: https://github.com/
-- `issue_revision_sha256`:
+- Accepted Issue or private advisory:
+- Explicit maintainer dispatch link/comment:
+- Implementation actor/session:
+- Topic branch and exact head SHA:
 
-## Scope
+## Semantic scope
 
+- Objective:
 - What changed:
 - Non-goals:
+- Acceptance criteria met:
 - This PR addresses one concern: yes / no
 
-## Evidence
+## Risk and evidence
 
+- Risk class: ordinary / high risk
+- High-risk kind, if any: workflow / permissions / secrets / security / external code / breaking API / catalog / not applicable
 - Commands and results:
 - Public API / compatibility impact:
+- Security impact:
 - Documentation impact:
-- Risk and rollback:
+- Risk and focused rollback:
 
-## Workflow changes
+## Independent exact-head review
 
-- Changes `.github/workflows/**`: yes / no
-- Current head SHA:
-- Matching owner comment `WORKFLOW-CHANGE-AUTHORIZED: <head SHA>`:
+- Required: yes / no
+- Reviewer did not implement this head: yes / no / not applicable
+- Reviewed head SHA:
+- Review link and `PASS`/`FAIL`:
+- Findings and blockers:
 
 ## Maintainer merge checklist
 
-- [ ] The Issue revision, PASS report, attestation, and hashes still match.
-- [ ] External code has a prior, current, exact-scope authorization record.
+- [ ] The accepted work item and explicit dispatch still match semantic scope,
+      actor/session, and branch/PR delivery.
 - [ ] Required checks are green on this exact head SHA.
-- [ ] Workflow changes have an exact-head owner authorization comment.
-- [ ] No direct `main` update, auto-merge, secret, or live-provider call is used.
+- [ ] Any high-risk change has a new independent `PASS` review on this head.
+- [ ] External code was not inspected or executed before valid dispatch.
+- [ ] No direct `main` update, auto-merge, live-provider call, or unauthorized
+      owner-only action is used.
 - [ ] Merge is performed by the maintainer in the GitHub UI.

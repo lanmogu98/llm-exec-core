@@ -4,52 +4,43 @@ This public repository accepts public Issue reports and change requests only.
 It does not accept unsolicited code contributions.
 
 Before preparing a fork, patch, or pull request, open a structured public Issue
-and wait for a prior owner-authored written authorization in that Issue. The
-authorization must name you, the exact scope, allowed delivery, issue permalink,
-issue time, and expiry/completion boundary. It does not change the proprietary
-license or grant permission beyond the authorized contribution.
+and wait until the maintainer accepts it and gives an explicit maintainer
+dispatch. The plain-language dispatch must name the work item, contributor or
+implementation session, exact semantic scope, and permitted branch/PR delivery.
+It does not change the proprietary license or grant permission beyond that
+dispatch.
 
-```yaml
-CONTRIBUTION-AUTHORIZATION:
-  contributor: github-login
-  work_item: permalink
-  allowed_scope: exact scope
-  allowed_delivery: fork/branch/PR description
-  issued_at: timestamp
-  expires_at: timestamp-or-completion
-```
-
-The owner comment must be unedited. Its declared `issued_at` must exactly match
-GitHub's immutable comment `created_at`, which must predate the earliest code
-preparation or delivery. The authorization must exactly match the proposed
-scope and delivery. A timestamp expiry is inclusive; `expires_at: completion`
-requires recorded completion state and rejects any later preparation/delivery.
-
-After authorization, the Issue must be completed as an audit-ready work
-contract, pass an independent adversarial Gate 0 audit, and receive a separate
-maintainer attestation before implementation starts. Authorization for one
-Issue, person, scope, or delivery does not transfer to another.
+An Issue defines the objective, scope, non-goals, acceptance criteria,
+compatibility and security impact, validation, rollback, and authority
+boundaries. A material change to objective, semantic scope, behavior,
+compatibility, security, or authority requires a new dispatch. Dates, links,
+formatting, typo corrections, evidence refreshes, and status bookkeeping do not.
 
 Unauthorized external pull requests are closed without checkout, download,
 build, test, execution, workflow approval, or substantive review. First-time
-and previously-known external contributors both require owner approval before
-fork workflows run. The maintainer approves a run only after revalidating the
-authorization and workflow-file diff for the current delivery.
+and previously known external contributors follow the same rule. The maintainer
+approves an external fork workflow only after checking the current dispatch and
+workflow-file diff.
 
-For an authorized pull request:
+For a dispatched pull request:
 
-- use one PR for one concern;
-- link the accepted Issue, PASS report, maintainer attestation, revision hash,
-  and authorization permalink;
-- keep changes inside the authorized scope and preserve compatibility;
+- use one Issue, session, worktree, `codex/` branch, and PR for one concern;
+- link the accepted Issue and dispatch;
+- keep changes inside the dispatched semantic scope and preserve compatibility;
 - use mocked/fake provider calls and never include keys, tokens, `.env`, or live
   provider requests;
-- run the commands listed in `AGENTS.md`; and
-- never update `main` directly or enable auto-merge.
+- run the commands listed in `AGENTS.md` and record the exact PR head;
+- obtain a new independent exact-head review for workflow, permission, secret,
+  security, external-code, breaking-public-API, or catalog work; and
+- never update `main` directly, enable auto-merge, merge, publish, or change
+  settings, secrets, or permissions.
+
+Required CI must pass on the exact head. Only `lanmogu98` merges through the
+GitHub UI. Rollback uses a focused revert PR, never direct push or bypass.
 
 Security vulnerabilities must not be filed publicly. Use
 [private vulnerability reporting](https://github.com/lanmogu98/llm-exec-core/security/advisories/new)
-and follow the private process in [SECURITY.md](SECURITY.md). Advisory access by
-itself does not authorize code.
+and follow [SECURITY.md](SECURITY.md). Advisory access by itself does not
+authorize code; an explicit maintainer dispatch inside the advisory is required.
 
 Public visibility grants no rights beyond [LICENSE](LICENSE).
