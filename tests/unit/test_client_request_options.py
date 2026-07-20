@@ -953,8 +953,6 @@ async def test_cached_structured_response_is_parsed_and_validated_again(
     [
         "gemini-3-flash",
         "gemini-3.1-flash-lite",
-        "gemini-3-flash-free",
-        "gemini-3.1-flash-lite-free",
     ],
 )
 @pytest.mark.parametrize(
@@ -1007,7 +1005,7 @@ async def test_gemini_rejects_overlapping_thinking_controls_before_http(
 async def test_gemini_include_thoughts_alone_is_not_a_conflicting_control(
     monkeypatch,
 ):
-    monkeypatch.setenv("GEMINI_FT_API_KEY", "test-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     request_options = {
         "reasoning_effort": "high",
         "extra_body": {
@@ -1020,7 +1018,7 @@ async def test_gemini_include_thoughts_alone_is_not_a_conflicting_control(
         mock_httpx_client.post.return_value = _success_response()
         mock_cls.return_value = mock_httpx_client
 
-        client = LLMClient("gemini-3-flash-free")
+        client = LLMClient("gemini-3-flash")
         _disable_rate_limit(client)
         await client.generate("Hello", request_options=request_options)
 
