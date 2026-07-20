@@ -2,10 +2,15 @@
 
 ## Unreleased
 
+## 0.3.0
+
 ### Changed
 
 - Replace governance evidence chains with semantic maintainer dispatch and
   risk-based independent review of the exact pull-request head.
+- Prune the transitional bundled catalog to the reviewed 21-model set, add
+  DeepSeek V4 Ark/native and Gemini 3.5 Flash routes, remove `gemini-free`
+  aliases without fallback, and advance the package boundary to 0.3.0.
 
 ## 0.2.1
 

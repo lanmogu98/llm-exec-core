@@ -9,6 +9,12 @@ ROOT = Path(__file__).parents[2]
 CHECK_SCRIPT = ROOT / "scripts" / "check_openrouter_capabilities.py"
 CONFIG_PATH = ROOT / "src" / "llm_exec_core" / "llm_config.yml"
 FIXTURE_PATH = ROOT / "tests" / "fixtures" / "openrouter_models.json"
+EXPECTED_TARGET_IDS = [
+    "anthropic/claude-opus-4.8",
+    "anthropic/claude-sonnet-5",
+    "openai/gpt-5.5",
+    "z-ai/glm-5.2",
+]
 
 
 def _load_compare_function():
@@ -32,6 +38,18 @@ def test_openrouter_snapshot_fixture_matches_tracked_target_fields():
     config, models_payload = _load_inputs()
 
     assert compare(config, models_payload) == []
+
+
+def test_openrouter_2026_07_20_snapshot_contains_only_retained_targets():
+    _, models_payload = _load_inputs()
+
+    assert [model["id"] for model in models_payload["data"]] == (
+        EXPECTED_TARGET_IDS
+    )
+    assert all(
+        set(model) == {"id", "supported_parameters"}
+        for model in models_payload["data"]
+    )
 
 
 def test_openrouter_snapshot_comparison_reports_parameter_drift():

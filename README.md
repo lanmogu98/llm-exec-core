@@ -124,7 +124,7 @@ response is cached, and cached structured responses are validated again on each
 hit. Planning metadata reports `validation_status="client_validated"` and a
 separate `hook_applied` flag.
 
-Gemini paid/free aliases for the reviewed models share capabilities. On Gemini
+On Gemini
 routes, `reasoning_effort` cannot be combined with `thinking_level` or
 `thinking_budget` under either normalized `google.thinking_config` payload
 shape; `include_thoughts` alone is allowed.

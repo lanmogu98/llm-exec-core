@@ -1,3 +1,4 @@
+from pathlib import Path
 import warnings
 from unittest.mock import patch
 
@@ -19,48 +20,58 @@ DEPRECATION_MESSAGE = (
     "contract at https://github.com/lanmogu98/llm-exec-core/issues/5."
 )
 
+ROOT = Path(__file__).parents[2]
+BUNDLED_CONFIG_PATH = ROOT / "src" / "llm_exec_core" / "llm_config.yml"
+README_PATH = ROOT / "README.md"
+
 EXPECTED_DEFAULT_MODELS = [
-    "deepseek-v3.2",
-    "deepseek-r1",
+    "deepseek-v4-flash-volc",
+    "deepseek-v4-pro-volc",
     "deepseek-v4-flash",
     "deepseek-v4-pro",
     "gemini-3-flash",
     "gemini-3.1-flash-lite",
     "gemini-3.1-pro",
+    "gemini-3.5-flash",
+    "qwen3.6-flash",
+    "glm-5.2",
+    "glm-5",
+    "glm-5.1",
+    "glm-5.2-or",
+    "glm-5-or",
+    "glm-5.1-or",
+    "glm-5-turbo-or",
+    "doubao-seed-2.1-pro",
+    "doubao-seed-1.6",
+    "gpt-5.5-or",
+    "claude-sonnet-5-or",
+    "claude-opus-4.8-or",
+]
+
+REMOVED_DEFAULT_MODELS = [
+    "deepseek-v3.2",
+    "deepseek-r1",
     "gemini-2.5-flash-free",
     "gemini-2.5-flash-lite-free",
     "gemini-3-flash-free",
     "gemini-3.1-flash-lite-free",
-    "qwen3.6-flash",
     "qwen-max",
     "qwen-turbo",
     "qwen-plus",
     "qwen3.5-plus",
     "qwen3-max-preview",
     "qwen3-max",
-    "glm-5.2",
     "glm-4.5",
     "glm-4.6",
     "glm-4.7",
-    "glm-5",
-    "glm-5.1",
-    "glm-5.2-or",
     "glm-4.5-or",
     "glm-4.6-or",
     "glm-4.7-or",
-    "glm-5-or",
-    "glm-5.1-or",
-    "glm-5-turbo-or",
-    "doubao-seed-2.1-pro",
-    "doubao-seed-1.6",
     "gpt-4o-or",
     "gpt-4.1-or",
     "gpt-5-or",
     "gpt-5.2-or",
     "gpt-5.4-or",
-    "gpt-5.5-or",
-    "claude-sonnet-5-or",
-    "claude-opus-4.8-or",
     "claude-sonnet-4-or",
     "claude-opus-4.6-or",
     "claude-sonnet-4.6-or",
@@ -100,10 +111,8 @@ CUSTOM_CONFIG = {
 
 def _call_catalog_api(api_name, config_source=None):
     source_args = () if config_source is None else (config_source,)
-    model_name = "deepseek-v3.2" if config_source is None else "test-model"
-    provider_name = (
-        "deepseek-volcengine" if config_source is None else "test-provider"
-    )
+    model_name = "deepseek-v4-flash" if config_source is None else "test-model"
+    provider_name = "deepseek" if config_source is None else "test-provider"
 
     if api_name == "load_all_settings":
         return load_all_settings(*source_args)
@@ -134,7 +143,7 @@ def test_default_catalog_public_calls_emit_one_actionable_warning(
     monkeypatch, cache_state, api_name
 ):
     monkeypatch.setattr(config_module, "_DEFAULT_PROVIDER_SETTINGS", None)
-    monkeypatch.setenv("DEEPSEEK_API_KEY_VOLC", "test-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
 
     if cache_state == "warm":
         with warnings.catch_warnings():
@@ -231,6 +240,128 @@ def test_unknown_model_reuses_snapshot_and_preserves_error_order(
     ] == [DEPRECATION_MESSAGE]
 
 
+@pytest.mark.parametrize("removed_model", REMOVED_DEFAULT_MODELS)
+def test_removed_default_models_preserve_value_error_shape(removed_model):
+    with pytest.raises(ValueError) as error:
+        get_model_details(removed_model, BUNDLED_CONFIG_PATH)
+
+    assert str(error.value) == (
+        f"Model '{removed_model}' not found. Available models: "
+        + ", ".join(EXPECTED_DEFAULT_MODELS)
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "alias",
+        "provider_name",
+        "model_id",
+        "api_key_env_var",
+        "api_base_url",
+        "input_price",
+        "output_price",
+        "max_tokens",
+        "context_window",
+        "source",
+    ),
+    [
+        (
+            "deepseek-v4-flash-volc",
+            "deepseek-volcengine",
+            "deepseek-v4-flash-260425",
+            "DEEPSEEK_API_KEY_VOLC",
+            "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+            1.0,
+            2.0,
+            384000,
+            1024000,
+            "https://www.volcengine.com/docs/82379/1330310?lang=zh",
+        ),
+        (
+            "deepseek-v4-pro-volc",
+            "deepseek-volcengine",
+            "deepseek-v4-pro-260425",
+            "DEEPSEEK_API_KEY_VOLC",
+            "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+            12.0,
+            24.0,
+            384000,
+            1024000,
+            "https://www.volcengine.com/docs/82379/1330310?lang=zh",
+        ),
+        (
+            "deepseek-v4-flash",
+            "deepseek",
+            "deepseek-v4-flash",
+            "DEEPSEEK_API_KEY",
+            "https://api.deepseek.com/chat/completions",
+            1.0,
+            2.0,
+            384000,
+            1000000,
+            "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
+        ),
+        (
+            "deepseek-v4-pro",
+            "deepseek",
+            "deepseek-v4-pro",
+            "DEEPSEEK_API_KEY",
+            "https://api.deepseek.com/chat/completions",
+            3.0,
+            6.0,
+            384000,
+            1000000,
+            "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
+        ),
+    ],
+)
+def test_deepseek_routes_have_exact_ids_prices_limits_and_sources(
+    alias,
+    provider_name,
+    model_id,
+    api_key_env_var,
+    api_base_url,
+    input_price,
+    output_price,
+    max_tokens,
+    context_window,
+    source,
+):
+    actual_provider, provider, model = get_model_details(
+        alias, BUNDLED_CONFIG_PATH
+    )
+
+    assert actual_provider == provider_name
+    assert provider.api_key_env_var == api_key_env_var
+    assert provider.api_base_url == api_base_url
+    assert provider.pricing_currency == "¥"
+    assert provider.max_tokens == max_tokens
+    assert provider.context_window == context_window
+    assert provider.request_overrides is None
+    assert model.id == model_id
+    assert model.pricing.input == input_price
+    assert model.pricing.output == output_price
+    assert model.capabilities is not None
+    assert model.capabilities.source == source
+    assert model.capabilities.source_date == "2026-07-20"
+
+
+def test_deepseek_native_and_ark_aliases_do_not_shadow_or_fallback():
+    settings = load_all_settings(BUNDLED_CONFIG_PATH)
+
+    assert list(settings["deepseek-volcengine"].models) == [
+        "deepseek-v4-flash-volc",
+        "deepseek-v4-pro-volc",
+    ]
+    assert list(settings["deepseek"].models) == [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+    ]
+    assert set(settings["deepseek-volcengine"].models).isdisjoint(
+        settings["deepseek"].models
+    )
+
+
 def test_load_all_settings_accepts_dict_and_skips_private_keys():
     settings = load_all_settings(CUSTOM_CONFIG)
 
@@ -293,8 +424,8 @@ def test_model_details_accepts_capability_metadata():
 
 def test_default_config_includes_review_target_capabilities():
     expected_models = {
-        "deepseek-v3.2": {
-            "id": "deepseek-v3-2-251201",
+        "deepseek-v4-flash-volc": {
+            "id": "deepseek-v4-flash-260425",
             "strict": False,
             "json": True,
             "tools": True,
@@ -302,8 +433,8 @@ def test_default_config_includes_review_target_capabilities():
             "tool_choice": True,
             "parallel": False,
         },
-        "deepseek-r1": {
-            "id": "deepseek-r1-250528",
+        "deepseek-v4-pro-volc": {
+            "id": "deepseek-v4-pro-260425",
             "strict": False,
             "json": True,
             "tools": True,
@@ -356,15 +487,6 @@ def test_default_config_includes_review_target_capabilities():
             "tool_choice": False,
             "parallel": False,
         },
-        "qwen-max": {
-            "id": "qwen-max",
-            "strict": False,
-            "json": False,
-            "tools": True,
-            "tool_streaming": False,
-            "tool_choice": True,
-            "parallel": False,
-        },
         "gemini-3-flash": {
             "id": "gemini-3-flash-preview",
             "strict": True,
@@ -375,7 +497,16 @@ def test_default_config_includes_review_target_capabilities():
             "parallel": False,
         },
         "gemini-3.1-flash-lite": {
-            "id": "gemini-3.1-flash-lite-preview",
+            "id": "gemini-3.1-flash-lite",
+            "strict": True,
+            "json": True,
+            "tools": True,
+            "tool_streaming": True,
+            "tool_choice": True,
+            "parallel": False,
+        },
+        "gemini-3.5-flash": {
+            "id": "gemini-3.5-flash",
             "strict": True,
             "json": True,
             "tools": True,
@@ -495,20 +626,131 @@ def test_default_openrouter_capabilities_match_supported_parameters():
         )
 
 
-def test_paid_and_free_gemini_aliases_share_model_capabilities():
-    settings = load_all_settings()
+def test_paid_gemini_catalog_has_exact_ids_and_gemini_3_5_facts():
+    settings = load_all_settings(BUNDLED_CONFIG_PATH)
+    gemini = settings["gemini"]
 
-    for paid_name, free_name in (
-        ("gemini-3-flash", "gemini-3-flash-free"),
-        ("gemini-3.1-flash-lite", "gemini-3.1-flash-lite-free"),
-    ):
-        paid = settings["gemini"].models[paid_name]
-        free = settings["gemini-free"].models[free_name]
+    assert "gemini-free" not in settings
+    assert list(gemini.models) == [
+        "gemini-3-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-pro",
+        "gemini-3.5-flash",
+    ]
+    assert {
+        model_name: model.id for model_name, model in gemini.models.items()
+    } == {
+        "gemini-3-flash": "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite": "gemini-3.1-flash-lite",
+        "gemini-3.1-pro": "gemini-3.1-pro-preview",
+        "gemini-3.5-flash": "gemini-3.5-flash",
+    }
+    assert gemini.context_window == 1048576
+    assert gemini.max_tokens == 65536
+    assert gemini.request_overrides is None
 
-        assert paid.id == free.id
-        assert paid.capabilities is not None
-        assert free.capabilities == paid.capabilities
-        assert free.pricing != paid.pricing
+    gemini_3_5 = gemini.models["gemini-3.5-flash"]
+    assert gemini_3_5.pricing.input == 1.5
+    assert gemini_3_5.pricing.output == 9.0
+    assert gemini_3_5.capabilities is not None
+    assert gemini_3_5.capabilities.source == (
+        "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash"
+    )
+    assert gemini_3_5.capabilities.source_date == "2026-07-20"
+    assert all(
+        not model_name.endswith("-free")
+        for provider in settings.values()
+        for model_name in provider.models
+    )
+
+
+def test_pruned_provider_models_match_the_transitional_policy():
+    settings = load_all_settings(BUNDLED_CONFIG_PATH)
+
+    assert {
+        provider_name: list(settings[provider_name].models)
+        for provider_name in (
+            "qwen",
+            "zhipu",
+            "zhipu-openrouter",
+            "openai-openrouter",
+            "anthropic-openrouter",
+        )
+    } == {
+        "qwen": ["qwen3.6-flash"],
+        "zhipu": ["glm-5.2", "glm-5", "glm-5.1"],
+        "zhipu-openrouter": [
+            "glm-5.2-or",
+            "glm-5-or",
+            "glm-5.1-or",
+            "glm-5-turbo-or",
+        ],
+        "openai-openrouter": ["gpt-5.5-or"],
+        "anthropic-openrouter": [
+            "claude-sonnet-5-or",
+            "claude-opus-4.8-or",
+        ],
+    }
+
+
+def test_doubao_provider_settings_remain_unchanged():
+    with BUNDLED_CONFIG_PATH.open(encoding="utf-8") as handle:
+        raw_config = yaml.safe_load(handle)
+
+    assert raw_config["doubao"] == {
+        "api_key_env_var": "DOUBAO_API_KEY",
+        "api_base_url": (
+            "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+        ),
+        "temperature": 0.6,
+        "max_tokens": 32000,
+        "context_window": 256000,
+        "pricing_currency": "¥",
+        "models": {
+            "doubao-seed-2.1-pro": {
+                "id": "doubao-seed-2-1-pro-260628",
+                "pricing": {"input": 0.8, "output": 2.0},
+                "capabilities": {
+                    "version": "volcengine-doubao-seed-2.1-pro-2026-07-02",
+                    "source": (
+                        "https://www.volcengine.com/docs/82379/1330310"
+                    ),
+                    "source_date": "2026-07-02",
+                    "strict_response_schema": True,
+                    "json_object_response": True,
+                    "tools": True,
+                    "tool_streaming": True,
+                    "tool_choice": True,
+                    "reasoning_controls": [
+                        "thinking",
+                        "reasoning_effort",
+                    ],
+                },
+            },
+            "doubao-seed-1.6": {
+                "id": "doubao-seed-1-6-250615",
+                "pricing": {"input": 0.8, "output": 2.0},
+            },
+        },
+    }
+
+
+def test_readme_removes_only_stale_gemini_free_alias_guidance():
+    readme = README_PATH.read_text(encoding="utf-8")
+
+    assert (
+        "Gemini paid/free aliases for the reviewed models share capabilities."
+        not in readme
+    )
+    assert (
+        "On Gemini\nroutes, `reasoning_effort` cannot be combined with "
+        "`thinking_level` or\n`thinking_budget` under either normalized "
+        "`google.thinking_config` payload\nshape; `include_thoughts` alone is "
+        "allowed.\n\nOpenRouter target capabilities remain static at runtime."
+        in readme
+    )
+    assert readme.startswith("# llm-exec-core\n")
+    assert readme.endswith("Proprietary. See [LICENSE](LICENSE).\n")
 
 
 def test_provider_settings_accepts_configured_max_tokens_retry_policy():
