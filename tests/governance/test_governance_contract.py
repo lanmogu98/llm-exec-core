@@ -35,6 +35,22 @@ def test_ordinary_change_uses_dispatch_without_hash_or_attestation() -> None:
     )
 
 
+@pytest.mark.parametrize("action", ["delete_repository", "unknown_action"])
+def test_implementation_actions_fail_closed_to_explicit_allowlist(
+    action: str,
+) -> None:
+    assert implementation_action_allowed(
+        issue_accepted=True,
+        dispatch_matches=True,
+        action="tracked_file_write",
+    )
+    assert not implementation_action_allowed(
+        issue_accepted=True,
+        dispatch_matches=True,
+        action=action,
+    )
+
+
 @pytest.mark.parametrize(
     "change_kind",
     [

@@ -85,6 +85,12 @@ formatting, typo corrections, evidence refreshes, labels, and status updates do
 not invalidate an otherwise matching dispatch. Machines may gather and verify
 mechanical evidence; semantic dispatch remains a maintainer decision.
 
+Automation requests maintainer intervention only for semantic scope or dispatch,
+exact-head merge, release or package publication, and settings, secrets, or
+permissions. Mechanical evidence, status, and bookkeeping do not trigger a
+maintainer request; external workflow approval is a permissions/workflow
+authority decision.
+
 ## Implementation and review
 
 Ordinary source, test, documentation, and configuration work requires an

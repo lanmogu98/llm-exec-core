@@ -32,6 +32,17 @@ _OWNER_ONLY_ACTIONS = {
     "main_bypass",
     "direct_main_update",
 }
+_IMPLEMENTATION_CONTRIBUTION_ACTIONS = {
+    "read_evidence",
+    "issue_comment",
+    "topic_branch",
+    "commit",
+    "push_topic_branch",
+    "tracked_file_write",
+    "workflow_file_write",
+    "pr_update",
+    "mock_ci_control",
+}
 _NON_SUCCESS_CONDITIONS = {
     "missing",
     "not_started",
@@ -77,6 +88,7 @@ def implementation_action_allowed(
     return (
         issue_accepted
         and dispatch_matches
+        and action in _IMPLEMENTATION_CONTRIBUTION_ACTIONS
         and action not in _OWNER_ONLY_ACTIONS
     )
 
