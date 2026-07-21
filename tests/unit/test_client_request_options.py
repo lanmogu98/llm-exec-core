@@ -1,12 +1,17 @@
 from contextlib import asynccontextmanager
 from copy import deepcopy
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from llm_exec_core import StructuredOutputValidationError
 from llm_exec_core.client import LLMClient
+
+BUNDLED_CONFIG_PATH = (
+    Path(__file__).parents[2] / "src" / "llm_exec_core" / "llm_config.yml"
+)
 
 
 def _config(
@@ -15,6 +20,8 @@ def _config(
     model_capabilities=None,
     provider_name="test-provider",
     api_base_url="https://example.invalid/chat/completions",
+    api_key_env_var="TEST_API_KEY",
+    model_name="test-model",
 ):
     model_config = {
         "id": "provider-model-id",
@@ -24,14 +31,14 @@ def _config(
         model_config["capabilities"] = model_capabilities
 
     provider_config = {
-        "api_key_env_var": "TEST_API_KEY",
+        "api_key_env_var": api_key_env_var,
         "api_base_url": api_base_url,
         "temperature": 0.1,
         "max_tokens": max_tokens,
         "context_window": 4096,
         "pricing_currency": "$",
         "models": {
-            "test-model": model_config,
+            model_name: model_config,
         },
     }
     if request_overrides is not None:
@@ -988,7 +995,14 @@ async def test_gemini_rejects_overlapping_thinking_controls_before_http(
         mock_httpx_client.post.return_value = _success_response()
         mock_cls.return_value = mock_httpx_client
 
-        client = LLMClient(model_name)
+        client = LLMClient(
+            model_name,
+            config_source=_config(
+                provider_name="gemini",
+                api_key_env_var="GEMINI_API_KEY",
+                model_name=model_name,
+            ),
+        )
         with pytest.raises(
             ValueError,
             match="reasoning_effort cannot be combined",
@@ -1018,7 +1032,14 @@ async def test_gemini_include_thoughts_alone_is_not_a_conflicting_control(
         mock_httpx_client.post.return_value = _success_response()
         mock_cls.return_value = mock_httpx_client
 
-        client = LLMClient("gemini-3-flash")
+        client = LLMClient(
+            "gemini-3-flash",
+            config_source=_config(
+                provider_name="gemini",
+                api_key_env_var="GEMINI_API_KEY",
+                model_name="gemini-3-flash",
+            ),
+        )
         _disable_rate_limit(client)
         await client.generate("Hello", request_options=request_options)
 
@@ -1314,7 +1335,7 @@ async def test_openrouter_target_models_plan_temperature_from_snapshot(
         mock_httpx_client.post.return_value = _success_response()
         mock_cls.return_value = mock_httpx_client
 
-        client = LLMClient(model_name)
+        client = LLMClient(model_name, config_source=BUNDLED_CONFIG_PATH)
         assert client.capabilities is not None
         assert (
             "temperature"

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.4.0
+
+### Changed
+
+- Require callers to pass a complete model catalog Path or dictionary for
+  discovery and client construction, while retaining the packaged catalog as
+  an explicitly copyable reference template.
+
 ## 0.3.0
 
 ### Changed
