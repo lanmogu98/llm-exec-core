@@ -8,7 +8,8 @@ It provides:
 
 - `LLMClient` for async request execution and streaming
 - schema and loading helpers for caller-owned provider/model catalogs
-- `llm_exec_core/llm_config.yml` as a temporary legacy fallback
+- `llm_exec_core/llm_config.yml` as a maintained complete reference template,
+  never runtime policy
 - typed result and usage objects for legacy and new call sites
 
 ## Install
@@ -20,25 +21,29 @@ uv add llm-exec-core
 ## Basic usage
 
 ```python
+from importlib.resources import files
 from pathlib import Path
 
 from llm_exec_core.client import LLMClient
 
-catalog = Path("path/to/llm_config.yml")
+reference = files("llm_exec_core").joinpath("llm_config.yml")
+catalog = Path("config/llm_config.yml")
+catalog.write_bytes(reference.read_bytes())
+
 client = LLMClient("your-model-name", config_source=catalog)
 models = LLMClient.get_supported_models(catalog)
 ```
 
-`config_source` accepts either a catalog path or a raw configuration dictionary
-across the client and public configuration helpers. Caller-owned catalogs are
-the recommended runtime policy boundary.
+As of 0.4.0, `config_source` is required across the client and public
+configuration helpers and accepts either a complete catalog `Path` or raw
+dictionary. Omitting it or passing `None` raises `ValueError`. The packaged
+catalog is only a maintained, complete reference template that callers may
+copy explicitly; it is never selected as runtime policy.
 
-For compatibility, omitting `config_source` still loads the bundled catalog and
-emits `DeprecationWarning`. This fallback has no approved removal version;
-removal is governed by the separate
-[final-removal child #10](https://github.com/lanmogu98/llm-exec-core/issues/10)
-under the [model-catalog migration contract
-#5](https://github.com/lanmogu98/llm-exec-core/issues/5).
+Adopt or refresh the reference by copying it manually or automating a full
+replacement, then optionally edit the complete application-owned copy. Every
+supplied catalog must be complete: core provides no partial overlay or
+inheritance semantics with the packaged template.
 
 ## Request options
 

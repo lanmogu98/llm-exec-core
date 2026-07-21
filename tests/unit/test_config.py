@@ -1,5 +1,5 @@
+from importlib.resources import files
 from pathlib import Path
-import warnings
 from unittest.mock import patch
 
 import pytest
@@ -8,16 +8,19 @@ import yaml
 import llm_exec_core.config as config_module
 from llm_exec_core.client import LLMClient
 from llm_exec_core.config import (
+    ModelDetails,
+    Pricing,
+    ProviderSettings,
     get_model_details,
     get_provider_settings,
     get_supported_models,
     load_all_settings,
 )
 
-DEPRECATION_MESSAGE = (
-    "Loading the bundled model catalog without config_source is deprecated. "
-    "Pass config_source with a caller-owned catalog; see the migration "
-    "contract at https://github.com/lanmogu98/llm-exec-core/issues/5."
+REQUIRED_SOURCE_MESSAGE = (
+    "config_source is required; pass a complete caller-owned catalog as a "
+    "pathlib.Path or dict. See "
+    "https://github.com/lanmogu98/llm-exec-core/issues/5."
 )
 
 ROOT = Path(__file__).parents[2]
@@ -109,10 +112,13 @@ CUSTOM_CONFIG = {
 }
 
 
-def _call_catalog_api(api_name, config_source=None):
-    source_args = () if config_source is None else (config_source,)
-    model_name = "deepseek-v4-flash" if config_source is None else "test-model"
-    provider_name = "deepseek" if config_source is None else "test-provider"
+OMITTED = object()
+
+
+def _call_catalog_api(api_name, config_source=OMITTED):
+    source_args = () if config_source is OMITTED else (config_source,)
+    model_name = "test-model"
+    provider_name = "test-provider"
 
     if api_name == "load_all_settings":
         return load_all_settings(*source_args)
@@ -121,50 +127,47 @@ def _call_catalog_api(api_name, config_source=None):
     if api_name == "get_model_details_valid":
         return get_model_details(model_name, *source_args)
     if api_name == "get_model_details_unknown":
+        if config_source is OMITTED or config_source is None:
+            return get_model_details("unknown-model", *source_args)
         with pytest.raises(ValueError):
-            get_model_details("unknown-model", *source_args)
-        return None
+            return get_model_details("unknown-model", *source_args)
     if api_name == "get_provider_settings_valid":
         return get_provider_settings(provider_name, *source_args)
     if api_name == "get_provider_settings_unknown":
+        if config_source is OMITTED or config_source is None:
+            return get_provider_settings("unknown-provider", *source_args)
         with pytest.raises(ValueError):
-            get_provider_settings("unknown-provider", *source_args)
-        return None
+            return get_provider_settings("unknown-provider", *source_args)
     if api_name == "LLMClient.get_supported_models":
         return LLMClient.get_supported_models(*source_args)
-    if config_source is None:
+    if config_source is OMITTED:
         return LLMClient(model_name)
     return LLMClient(model_name, config_source=config_source)
 
 
-@pytest.mark.parametrize("cache_state", ["cold", "warm"])
+@pytest.mark.parametrize("source_mode", ["omitted", "none"])
 @pytest.mark.parametrize("api_name", CATALOG_API_CASES)
-def test_default_catalog_public_calls_emit_one_actionable_warning(
-    monkeypatch, cache_state, api_name
+def test_catalog_public_calls_require_explicit_source_before_build(
+    source_mode, api_name
 ):
-    monkeypatch.setattr(config_module, "_DEFAULT_PROVIDER_SETTINGS", None)
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    config_source = OMITTED if source_mode == "omitted" else None
 
-    if cache_state == "warm":
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            load_all_settings()
+    with patch.object(config_module, "_build_settings") as build_settings:
+        with pytest.raises(ValueError) as error:
+            _call_catalog_api(api_name, config_source)
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        _call_catalog_api(api_name)
+    assert str(error.value) == REQUIRED_SOURCE_MESSAGE
+    build_settings.assert_not_called()
 
-    deprecations = [
-        str(warning.message)
-        for warning in caught
-        if issubclass(warning.category, DeprecationWarning)
-    ]
-    assert deprecations == [DEPRECATION_MESSAGE]
+
+def test_legacy_default_catalog_symbols_are_removed():
+    assert not hasattr(config_module, "_DEFAULT_PROVIDER_SETTINGS")
+    assert not hasattr(config_module, "_get_default_config_path")
 
 
 @pytest.mark.parametrize("source_kind", ["dict", "path"])
 @pytest.mark.parametrize("api_name", CATALOG_API_CASES)
-def test_explicit_catalog_public_calls_emit_no_deprecation_warning(
+def test_explicit_catalog_public_calls_preserve_behavior(
     monkeypatch, tmp_path, source_kind, api_name
 ):
     monkeypatch.setenv("TEST_API_KEY", "test-key")
@@ -174,70 +177,27 @@ def test_explicit_catalog_public_calls_emit_no_deprecation_warning(
         with config_source.open("w", encoding="utf-8") as handle:
             yaml.safe_dump(CUSTOM_CONFIG, handle)
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        _call_catalog_api(api_name, config_source)
-
-    assert not [
-        warning
-        for warning in caught
-        if issubclass(warning.category, DeprecationWarning)
-    ]
+    _call_catalog_api(api_name, config_source)
 
 
-def test_implicit_catalog_warning_uses_fixed_stacklevel(monkeypatch):
-    monkeypatch.setattr(config_module, "_DEFAULT_PROVIDER_SETTINGS", None)
-
-    with patch("llm_exec_core.config.warnings.warn") as warn:
-        load_all_settings()
-
-    warn.assert_called_once_with(
-        DEPRECATION_MESSAGE,
-        DeprecationWarning,
-        stacklevel=2,
-    )
-
-
-def test_zero_argument_supported_models_preserve_order(monkeypatch):
-    monkeypatch.setattr(config_module, "_DEFAULT_PROVIDER_SETTINGS", None)
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        models = LLMClient.get_supported_models()
+def test_explicit_reference_supported_models_preserve_order():
+    models = LLMClient.get_supported_models(BUNDLED_CONFIG_PATH)
 
     assert models == EXPECTED_DEFAULT_MODELS
-    assert [
-        str(warning.message)
-        for warning in caught
-        if issubclass(warning.category, DeprecationWarning)
-    ] == [DEPRECATION_MESSAGE]
 
 
-def test_unknown_model_reuses_snapshot_and_preserves_error_order(
-    monkeypatch,
-):
-    monkeypatch.setattr(config_module, "_DEFAULT_PROVIDER_SETTINGS", None)
-
-    with (
-        patch(
-            "llm_exec_core.config.load_all_settings", wraps=load_all_settings
-        ) as loader,
-        warnings.catch_warnings(record=True) as caught,
-    ):
-        warnings.simplefilter("always")
+def test_unknown_model_uses_explicit_snapshot_and_preserves_error_order():
+    with patch(
+        "llm_exec_core.config.load_all_settings", wraps=load_all_settings
+    ) as loader:
         with pytest.raises(ValueError) as error:
-            get_model_details("unknown-model")
+            get_model_details("unknown-model", BUNDLED_CONFIG_PATH)
 
     assert loader.call_count == 1
     assert str(error.value) == (
         "Model 'unknown-model' not found. Available models: "
         + ", ".join(EXPECTED_DEFAULT_MODELS)
     )
-    assert [
-        str(warning.message)
-        for warning in caught
-        if issubclass(warning.category, DeprecationWarning)
-    ] == [DEPRECATION_MESSAGE]
 
 
 @pytest.mark.parametrize("removed_model", REMOVED_DEFAULT_MODELS)
@@ -552,7 +512,7 @@ def test_default_config_includes_review_target_capabilities():
         },
     }
 
-    settings = load_all_settings()
+    settings = load_all_settings(BUNDLED_CONFIG_PATH)
     models = {
         model_name: model_details
         for provider_settings in settings.values()
@@ -597,7 +557,7 @@ def test_default_openrouter_capabilities_match_supported_parameters():
         },
     }
 
-    settings = load_all_settings()
+    settings = load_all_settings(BUNDLED_CONFIG_PATH)
     models = {
         model_name: model_details
         for provider_settings in settings.values()
@@ -776,61 +736,38 @@ def test_provider_settings_accepts_configured_max_tokens_retry_policy():
     assert provider_settings.max_tokens_retry.max_tokens_limit == 8192
 
 
-def test_default_cache_does_not_pollute_explicit_config_source(monkeypatch):
-    monkeypatch.setattr(config_module, "_DEFAULT_PROVIDER_SETTINGS", None)
-    get_supported_models()
-
-    first = get_supported_models(CUSTOM_CONFIG)
-    second = get_supported_models(
-        {
-            "other-provider": {
-                "api_key_env_var": "OTHER_API_KEY",
-                "api_base_url": "https://example.invalid/chat/completions",
-                "temperature": 0.1,
-                "max_tokens": 128,
-                "context_window": 4096,
-                "pricing_currency": "$",
-                "models": {
-                    "other-model": {
-                        "id": "other-model-id",
-                        "pricing": {"input": 1.0, "output": 2.0},
-                    }
-                },
-            }
-        }
+@pytest.mark.parametrize("source_order", [("dict", "path"), ("path", "dict")])
+def test_explicit_sources_return_fresh_typed_settings_in_both_orders(
+    tmp_path, source_order
+):
+    config_path = tmp_path / "llm_config.yml"
+    config_path.write_text(
+        yaml.safe_dump(CUSTOM_CONFIG, sort_keys=False), encoding="utf-8"
     )
+    sources = {"dict": CUSTOM_CONFIG, "path": config_path}
 
-    assert first == ["test-model"]
-    assert second == ["other-model"]
+    first = load_all_settings(sources[source_order[0]])
+    first["test-provider"].api_base_url = "https://mutated.invalid/v1"
+    first["test-provider"].models["test-model"].id = "mutated-model-id"
+    first["test-provider"].models["test-model"].pricing.input = 999.0
 
-
-def test_explicit_config_source_does_not_populate_default_cache(monkeypatch):
-    monkeypatch.setattr(config_module, "_DEFAULT_PROVIDER_SETTINGS", None)
-    custom_models = get_supported_models(
-        {
-            "other-provider": {
-                "api_key_env_var": "OTHER_API_KEY",
-                "api_base_url": "https://example.invalid/chat/completions",
-                "temperature": 0.1,
-                "max_tokens": 128,
-                "context_window": 4096,
-                "pricing_currency": "$",
-                "models": {
-                    "other-model": {
-                        "id": "other-model-id",
-                        "pricing": {"input": 1.0, "output": 2.0},
-                    }
-                },
-            }
-        }
-    )
-
-    assert config_module._DEFAULT_PROVIDER_SETTINGS is None
-
-    default_models = set(get_supported_models())
-
-    assert set(custom_models) == {"other-model"}
-    assert default_models.isdisjoint(custom_models)
+    for settings in (
+        load_all_settings(sources[source_order[1]]),
+        load_all_settings(sources[source_order[0]]),
+    ):
+        provider = settings["test-provider"]
+        model = provider.models["test-model"]
+        assert list(settings) == ["test-provider"]
+        assert list(provider.models) == ["test-model"]
+        assert isinstance(provider, ProviderSettings)
+        assert isinstance(model, ModelDetails)
+        assert isinstance(model.pricing, Pricing)
+        assert (
+            provider.api_base_url
+            == CUSTOM_CONFIG["test-provider"]["api_base_url"]
+        )
+        assert model.id == "provider-model-id"
+        assert model.pricing.input == 1.0
 
 
 def test_load_all_settings_accepts_path(tmp_path):
@@ -861,33 +798,18 @@ def test_load_all_settings_accepts_path(tmp_path):
     assert list(settings["test-provider"].models.keys()) == ["test-model"]
 
 
-def test_default_settings_cache_returns_isolated_objects(monkeypatch):
-    first = load_all_settings()
-    provider_name = next(iter(first))
-    provider_settings = first[provider_name]
-    model_name = next(iter(provider_settings.models))
-    model_details = provider_settings.models[model_name]
+def test_packaged_reference_can_be_copied_and_loaded_explicitly(tmp_path):
+    resource = files("llm_exec_core").joinpath("llm_config.yml")
+    destination = tmp_path / "llm_config.yml"
 
-    original_api_base_url = provider_settings.api_base_url
-    original_model_id = model_details.id
-    original_input_price = model_details.pricing.input
+    assert resource.is_file()
+    reference = resource.read_bytes()
+    assert reference
+    destination.write_bytes(reference)
+    settings = load_all_settings(destination)
 
-    monkeypatch.setenv(provider_settings.api_key_env_var, "test-key")
-
-    provider_settings.api_base_url = "https://mutated.invalid/v1"
-    model_details.id = "mutated-model-id"
-    model_details.pricing.input = 999.0
-
-    second = load_all_settings()
-    second_provider = second[provider_name]
-    second_model = second_provider.models[model_name]
-
-    assert second_provider.api_base_url == original_api_base_url
-    assert second_model.id == original_model_id
-    assert second_model.pricing.input == original_input_price
-
-    client = LLMClient(model_name)
-
-    assert client.api_url == original_api_base_url
-    assert client.model == original_model_id
-    assert client.pricing.input == original_input_price
+    assert list(settings) == list(load_all_settings(BUNDLED_CONFIG_PATH))
+    for config_source in (OMITTED, None):
+        with pytest.raises(ValueError) as error:
+            _call_catalog_api("load_all_settings", config_source)
+        assert str(error.value) == REQUIRED_SOURCE_MESSAGE

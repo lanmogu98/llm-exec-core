@@ -1,6 +1,5 @@
 """LLM configuration loader."""
 
-import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -57,31 +56,23 @@ class ProviderSettings(BaseModel):
     rate_limit: Optional[RateLimitSettings] = None
 
 
-_DEFAULT_PROVIDER_SETTINGS: Optional[Dict[str, ProviderSettings]] = None
-
-
-def _get_default_config_path() -> Path:
-    return Path(__file__).with_name("llm_config.yml")
-
-
 def _load_raw_config(
-    config_source: Path | Dict[str, Any] | None,
+    config_source: Path | Dict[str, Any],
 ) -> Dict[str, Any]:
     if isinstance(config_source, dict):
         return config_source
 
-    config_path = config_source or _get_default_config_path()
-    if not config_path.exists():
+    if not config_source.exists():
         raise FileNotFoundError(
-            f"Configuration file not found at {config_path}"
+            f"Configuration file not found at {config_source}"
         )
 
-    with config_path.open("r", encoding="utf-8") as handle:
+    with config_source.open("r", encoding="utf-8") as handle:
         return yaml.safe_load(handle) or {}
 
 
 def _build_settings(
-    config_source: Path | Dict[str, Any] | None,
+    config_source: Path | Dict[str, Any],
 ) -> Dict[str, ProviderSettings]:
     config_data = _load_raw_config(config_source)
     return {
@@ -91,32 +82,15 @@ def _build_settings(
     }
 
 
-def _clone_settings(
-    settings: Dict[str, ProviderSettings],
-) -> Dict[str, ProviderSettings]:
-    return {
-        provider_name: provider_settings.model_copy(deep=True)
-        for provider_name, provider_settings in settings.items()
-    }
-
-
 def load_all_settings(
     config_source: Path | Dict[str, Any] | None = None,
 ) -> Dict[str, ProviderSettings]:
-    global _DEFAULT_PROVIDER_SETTINGS
-
     if config_source is None:
-        warnings.warn(
-            "Loading the bundled model catalog without config_source is "
-            "deprecated. Pass config_source with a caller-owned catalog; "
-            "see the migration contract at "
-            "https://github.com/lanmogu98/llm-exec-core/issues/5.",
-            DeprecationWarning,
-            stacklevel=2,
+        raise ValueError(
+            "config_source is required; pass a complete caller-owned "
+            "catalog as a pathlib.Path or dict. See "
+            "https://github.com/lanmogu98/llm-exec-core/issues/5."
         )
-        if _DEFAULT_PROVIDER_SETTINGS is None:
-            _DEFAULT_PROVIDER_SETTINGS = _build_settings(None)
-        return _clone_settings(_DEFAULT_PROVIDER_SETTINGS)
 
     return _build_settings(config_source)
 

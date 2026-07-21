@@ -135,7 +135,10 @@ class LLMClient:
     def get_supported_models(
         config_source: Path | Dict[str, Any] | None = None,
     ) -> list[str]:
-        """Return model names from an explicit or legacy bundled catalog."""
+        """Return models from a required explicit Path or dictionary catalog.
+
+        Omitting ``config_source`` or passing ``None`` raises ``ValueError``.
+        """
         return get_supported_models(config_source)
 
     def __init__(
@@ -152,7 +155,8 @@ class LLMClient:
             model_name: The name of the model to use.
             thinking_level: Optional thinking/reasoning level override.
                 For Gemini 3+, maps to reasoning_effort.
-            config_source: Optional config path or raw config dict.
+            config_source: Required complete config Path or raw dictionary.
+                Omitting it or passing None raises ValueError.
         """
         self._thinking_level = thinking_level
 
