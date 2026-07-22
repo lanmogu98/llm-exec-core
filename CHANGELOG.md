@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.1
+
 ### Added
 
 - Allow caller-owned provider schemas to declare ordered API-key environment

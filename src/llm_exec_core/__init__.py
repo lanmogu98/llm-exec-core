@@ -4,7 +4,7 @@ from .client import LLMClient, StructuredOutputValidationError
 from .types import ExecutionMetadata, LLMResult, TokenUsage
 from .usage import format_usage_report
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 __all__ = [
     "__version__",
