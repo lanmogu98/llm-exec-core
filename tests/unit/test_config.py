@@ -180,6 +180,47 @@ def test_provider_settings_connection_declarations_are_additive():
     assert provider.api_base_url == "https://example.invalid/chat/completions"
 
 
+def test_request_policy_schema_fields_have_legacy_safe_defaults():
+    provider = ProviderSettings(**CUSTOM_CONFIG["test-provider"])
+    model = provider.models["test-model"]
+    model_schema = ModelDetails.model_json_schema()["properties"]
+    provider_schema = ProviderSettings.model_json_schema()["properties"]
+
+    for field_name in (
+        "temperature",
+        "max_tokens",
+        "context_window",
+        "request_overrides",
+        "output_token_field",
+    ):
+        assert field_name in ModelDetails.model_fields
+        assert field_name in model_schema
+        assert getattr(model, field_name) is None
+
+    assert "output_token_field" in ProviderSettings.model_fields
+    assert "output_token_field" in provider_schema
+    assert provider.output_token_field == "max_tokens"
+    assert provider.model_dump()["output_token_field"] == "max_tokens"
+
+
+@pytest.mark.parametrize("target", ["provider", "model"])
+def test_request_policy_schema_rejects_unknown_output_token_field(target):
+    if target == "provider":
+        with pytest.raises(ValueError):
+            ProviderSettings(
+                **CUSTOM_CONFIG["test-provider"],
+                output_token_field="completion_tokens",
+            )
+        return
+
+    with pytest.raises(ValueError):
+        ModelDetails(
+            id="provider-model-id",
+            pricing={"input": 1.0, "output": 2.0},
+            output_token_field="completion_tokens",
+        )
+
+
 def test_provider_settings_preserves_alias_order_and_duplicates():
     aliases = [
         "SECONDARY_KEY",
@@ -486,6 +527,44 @@ def test_get_model_details_returns_provider_name_settings_and_model():
     assert provider_name == "test-provider"
     assert provider_settings.api_key_env_var == "TEST_API_KEY"
     assert model_details.id == "provider-model-id"
+
+
+def test_get_model_details_returns_raw_provider_and_model_request_policy():
+    config = {
+        "test-provider": {
+            **CUSTOM_CONFIG["test-provider"],
+            "temperature": 0.2,
+            "max_tokens": 256,
+            "context_window": 8192,
+            "request_overrides": {"shared": "provider"},
+            "output_token_field": "max_tokens",
+            "models": {
+                "test-model": {
+                    "id": "provider-model-id",
+                    "pricing": {"input": 1.0, "output": 2.0},
+                    "temperature": 0.7,
+                    "max_tokens": 512,
+                    "context_window": 16384,
+                    "request_overrides": {"shared": "model"},
+                    "output_token_field": "max_completion_tokens",
+                }
+            },
+        }
+    }
+
+    provider_name, provider, model = get_model_details("test-model", config)
+
+    assert provider_name == "test-provider"
+    assert provider.temperature == 0.2
+    assert provider.max_tokens == 256
+    assert provider.context_window == 8192
+    assert provider.request_overrides == {"shared": "provider"}
+    assert provider.output_token_field == "max_tokens"
+    assert model.temperature == 0.7
+    assert model.max_tokens == 512
+    assert model.context_window == 16384
+    assert model.request_overrides == {"shared": "model"}
+    assert model.output_token_field == "max_completion_tokens"
 
 
 def test_model_details_accepts_capability_metadata():
@@ -914,6 +993,45 @@ def test_explicit_sources_return_fresh_typed_settings_in_both_orders(
         )
         assert model.id == "provider-model-id"
         assert model.pricing.input == 1.0
+
+
+def test_request_policy_settings_are_deeply_isolated_across_explicit_loads():
+    source = {
+        "test-provider": {
+            **CUSTOM_CONFIG["test-provider"],
+            "request_overrides": {"routing": {"only": ["provider-route"]}},
+            "models": {
+                "test-model": {
+                    "id": "provider-model-id",
+                    "pricing": {"input": 1.0, "output": 2.0},
+                    "request_overrides": {
+                        "routing": {"only": ["model-route"]}
+                    },
+                }
+            },
+        }
+    }
+
+    _, first_provider, first_model = get_model_details("test-model", source)
+    assert first_provider.request_overrides is not None
+    assert first_model.request_overrides is not None
+    first_provider.request_overrides["routing"]["only"].append("mutated")
+    first_model.request_overrides["routing"]["only"].append("mutated")
+
+    _, second_provider, second_model = get_model_details("test-model", source)
+
+    assert second_provider.request_overrides == {
+        "routing": {"only": ["provider-route"]}
+    }
+    assert second_model.request_overrides == {
+        "routing": {"only": ["model-route"]}
+    }
+    assert source["test-provider"]["request_overrides"] == {
+        "routing": {"only": ["provider-route"]}
+    }
+    assert source["test-provider"]["models"]["test-model"][
+        "request_overrides"
+    ] == {"routing": {"only": ["model-route"]}}
 
 
 def test_load_all_settings_accepts_path(tmp_path):

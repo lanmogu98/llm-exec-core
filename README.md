@@ -99,6 +99,28 @@ payload fields. For target models with capability metadata, core validates known
 high-risk fields such as `response_format`, `tools`, tool streaming, and
 reasoning controls before sending the request.
 
+Catalog lookup remains raw: `get_model_details()` returns the declared
+`ProviderSettings` and `ModelDetails` without synthesizing or mutating an
+effective settings object. A model may optionally override `temperature`,
+`max_tokens`, `context_window`, `request_overrides`, and `output_token_field`.
+`LLMClient` uses each non-`None` model scalar before its provider default and
+deep-clones caller-owned catalog data across loads and clients.
+
+Request defaults are normalized and merged provider first, then model, with
+per-call `request_options` highest. One-level `extra_body` promotion, protected
+core fields, and deep provider → model → per-call `stream_options` merging are
+preserved. Legacy catalogs generate `max_tokens`; a provider or model can select
+`max_completion_tokens` instead. Any explicit token-limit field in request
+defaults or per-call options suppresses the generated default, while a final
+payload containing both token-limit fields fails before HTTP. Configured retry
+lowering updates whichever single integer token-limit field is present.
+
+The `thinking_level` convenience argument maps to `reasoning_effort` when model
+capabilities are absent or explicitly list that control. Capability metadata
+that is present but does not list `reasoning_effort` rejects `thinking_level`
+before request construction; core does not translate it to provider-specific
+thinking fields.
+
 Check the target route's docs or supported-parameter metadata before relying on
 strict schemas, tools, reasoning controls, sampling controls, or routing
 objects. For example, if an OpenRouter model reports `structured_outputs` /

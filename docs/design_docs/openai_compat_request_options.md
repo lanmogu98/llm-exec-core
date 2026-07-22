@@ -162,49 +162,82 @@ now fail closed. A focused revert must remove both declarations, both resolver
 paths, their tests, and this documentation together to restore the prior
 single-key/static-URL behavior.
 
+## Raw Catalog and Effective Client Policy
+
+`ProviderSettings` retains its existing `temperature`, `max_tokens`,
+`context_window`, and `request_overrides` declarations and adds
+`output_token_field`, which defaults to `max_tokens`. `ModelDetails` adds
+optional `temperature`, `max_tokens`, `context_window`, `request_overrides`, and
+`output_token_field` declarations. The two valid output-token field names are
+`max_tokens` and `max_completion_tokens`.
+
+`get_model_details()` continues to return the raw
+`(provider_name, ProviderSettings, ModelDetails)` tuple. It does not fill model
+fields from provider defaults or write merged request defaults into either
+object. Dictionary catalogs are deep-copied at the load boundary, and Path
+catalogs are parsed afresh, so mutations to one returned settings tree or one
+client's effective defaults do not affect the caller's source or a later load.
+
+For client construction, `temperature`, `max_tokens`, `context_window`, and
+`output_token_field` use the model value when it is non-`None`; otherwise they
+use the provider value. This keeps legacy catalogs provider-wide while allowing
+heterogeneous models under one provider without provider-name branches.
+
 ## Payload Construction
 
 The effective request payload is built in this order:
 
-1. Core defaults: `model`, `messages`, `temperature`, `stream`, and usually
-   `max_tokens`.
+1. Core defaults: `model`, `messages`, effective `temperature`, `stream`, and
+   the effective generated output-token field/value when no explicit token
+   field controls the payload.
 2. Normalized provider `request_overrides`.
-3. Normalized per-call `request_options`.
+3. Normalized model `request_overrides`.
+4. Normalized per-call `request_options`.
 
-Each provider and per-call layer normalizes SDK-style `extra_body` one level
-before merging. Values under `extra_body` are promoted into that layer's
+Each provider, model, and per-call layer normalizes SDK-style `extra_body` one
+level before merging. Values under `extra_body` are promoted into that layer's
 top-level request body, and direct top-level keys in the same layer win. The
 normalization does not recurse, so `extra_body.extra_body` becomes the final
 top-level raw `extra_body` field.
 
 `model`, `messages`, and `stream` are core-owned protected fields. They are
-rejected after normalization in provider `request_overrides` and per-call
+rejected after normalization in provider/model `request_overrides` and per-call
 `request_options`. `stream_options` is the supported way to customize streaming
 request behavior.
 
-If normalized provider or per-call options contain `max_completion_tokens`, the
-core-generated default `max_tokens` is omitted. An explicit `max_tokens` in
-provider or per-call options remains in the payload and follows normal
-precedence.
+Legacy catalogs select a generated `max_tokens`. A provider or model may select
+generated `max_completion_tokens` through `output_token_field` without placing
+the numeric value in raw request overrides. If any normalized provider, model,
+or per-call layer contains either token-limit field, that explicit field
+suppresses the generated default and follows normal same-key precedence. A
+final payload containing both `max_tokens` and `max_completion_tokens` is
+contradictory and fails before HTTP with an actionable `ValueError`.
+
+Configured max-token retry matching still uses the declared status, body
+substring, configured limit, existing lower bound, retry count, and delay. It
+inspects the single token field in the final payload; when that value is an
+integer above the configured limit, retry lowering logs the field name and
+numeric limits and updates that same field. An absent or non-integer limit does
+not enter the lowering path.
 
 On OpenRouter routes with capability metadata, core-generated `temperature`,
 `max_tokens`, and `max_completion_tokens` are planned against
 `supported_parameters`. Unsupported generated defaults are omitted; a generated
 `max_tokens` is converted to `max_completion_tokens` when only that token-limit
-parameter is listed. Explicit provider/per-call values for unsupported fields
-fail fast instead of being sent silently.
+parameter is listed. Explicit provider/model/per-call values for unsupported
+fields fail fast instead of being sent silently.
 
-`stream_options` is deep-merged as provider first, then per-call. When
-`stream=True`, `include_usage: true` is added when final `stream_options` is
+`stream_options` is deep-merged as provider first, then model, then per call.
+When `stream=True`, `include_usage: true` is added when final `stream_options` is
 absent. Mapping-valued `stream_options` keeps caller values and receives
 `include_usage: true` only when that key is absent. Other explicit values are
-considered present and are not modified. An explicit per-call
-`stream_options: None` clears any provider `stream_options` and suppresses the
-core `include_usage` default. Omit `stream_options` to receive the default
-streaming usage request.
+considered present and are not modified. An explicit model or per-call
+`stream_options: None` clears lower-precedence `stream_options`; a per-call
+`None` also suppresses the core `include_usage` default. Omit `stream_options`
+to receive the default streaming usage request.
 
 For non-streaming calls, `stream_options` is included only when explicitly
-provided by provider or per-call options.
+provided by provider, model, or per-call options.
 
 ## Capability-Aware Planning
 
@@ -229,6 +262,12 @@ capability metadata. Raw unknown/provider-specific fields still pass through.
   `google.thinking_config` or `extra_body.google.thinking_config`.
   `include_thoughts` by itself is not conflicting. This applies to paid and free
   aliases.
+- With no capability metadata, the `thinking_level` constructor convenience
+  keeps legacy behavior and emits `reasoning_effort`. With metadata present, it
+  emits that field only when `reasoning_controls` lists `reasoning_effort`;
+  otherwise client construction fails before request planning. Direct raw
+  request controls continue through the existing payload capability validation.
+  Core never translates `thinking_level` to provider-specific thinking fields.
 
 `structured_output` planning chooses one of these strategies:
 

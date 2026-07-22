@@ -286,26 +286,52 @@ class LLMClient:
             config_source: Required complete config Path or raw dictionary.
                 Omitting it or passing None raises ValueError.
         """
-        self._thinking_level = thinking_level
-
         provider_name, provider_settings, model_details = get_model_details(
             model_name, config_source
         )
+        if (
+            thinking_level
+            and model_details.capabilities is not None
+            and "reasoning_effort"
+            not in model_details.capabilities.reasoning_controls
+        ):
+            raise ValueError(
+                f"{model_name} thinking_level requires reasoning_effort "
+                "in model capabilities."
+            )
+        self._thinking_level = thinking_level
 
         self.api_key = _resolve_api_key(
             provider_settings.api_key_env_var,
             provider_settings.api_key_env_aliases,
         )
 
-        self.context_window = provider_settings.context_window
-        self.max_tokens = provider_settings.max_tokens
+        self.context_window = (
+            model_details.context_window
+            if model_details.context_window is not None
+            else provider_settings.context_window
+        )
+        self.max_tokens = (
+            model_details.max_tokens
+            if model_details.max_tokens is not None
+            else provider_settings.max_tokens
+        )
         self.model_name = model_name
         self.model = model_details.id
         self.capabilities = model_details.capabilities
         self.provider_name = provider_name
         self.pricing = model_details.pricing
         self.pricing_currency = provider_settings.pricing_currency
-        self.temperature = provider_settings.temperature
+        self.temperature = (
+            model_details.temperature
+            if model_details.temperature is not None
+            else provider_settings.temperature
+        )
+        self.output_token_field = (
+            model_details.output_token_field
+            if model_details.output_token_field is not None
+            else provider_settings.output_token_field
+        )
         self.max_tokens_retry = provider_settings.max_tokens_retry
 
         self.api_url = _resolve_api_url(
@@ -317,9 +343,25 @@ class LLMClient:
             "Authorization": f"Bearer {self.api_key}",
         }
 
-        self.request_overrides = dict(
-            provider_settings.request_overrides or {}
+        provider_request_overrides = self._normalize_request_options(
+            provider_settings.request_overrides
         )
+        model_request_overrides = self._normalize_request_options(
+            model_details.request_overrides
+        )
+        provider_stream_options = provider_request_overrides.pop(
+            "stream_options", _MISSING
+        )
+        model_stream_options = model_request_overrides.pop(
+            "stream_options", _MISSING
+        )
+        self.request_overrides = provider_request_overrides
+        self.request_overrides.update(model_request_overrides)
+        stream_options = self._merge_stream_options(
+            provider_stream_options, model_stream_options
+        )
+        if stream_options is not _MISSING:
+            self.request_overrides["stream_options"] = stream_options
         if self._thinking_level:
             self.request_overrides["reasoning_effort"] = self._thinking_level
 
@@ -505,13 +547,9 @@ class LLMClient:
             provider_stream_options, request_stream_options
         )
 
-        has_explicit_max_tokens = (
-            "max_tokens" in provider_options
-            or "max_tokens" in per_call_options
-        )
-        has_max_completion_tokens = (
-            "max_completion_tokens" in provider_options
-            or "max_completion_tokens" in per_call_options
+        has_explicit_token_limit = any(
+            field in provider_options or field in per_call_options
+            for field in ("max_tokens", "max_completion_tokens")
         )
         has_explicit_temperature = (
             "temperature" in provider_options
@@ -525,13 +563,17 @@ class LLMClient:
             "stream": stream,
         }
         core_default_fields = {"temperature"}
-        if not has_max_completion_tokens or has_explicit_max_tokens:
-            data["max_tokens"] = self.max_tokens
-            if not has_explicit_max_tokens:
-                core_default_fields.add("max_tokens")
+        if not has_explicit_token_limit:
+            data[self.output_token_field] = self.max_tokens
+            core_default_fields.add(self.output_token_field)
 
         data.update(provider_options)
         data.update(per_call_options)
+        if "max_tokens" in data and "max_completion_tokens" in data:
+            raise ValueError(
+                "Request payload cannot contain both max_tokens and "
+                "max_completion_tokens; provide exactly one token-limit field."
+            )
         if has_explicit_temperature:
             core_default_fields.discard("temperature")
 
@@ -1051,25 +1093,41 @@ class LLMClient:
 
                 status_code = e.response.status_code
                 retry_policy = self.max_tokens_retry
-                should_lower_max_tokens = (
+                token_limit_field = next(
+                    (
+                        field
+                        for field in (
+                            "max_tokens",
+                            "max_completion_tokens",
+                        )
+                        if type(data.get(field)) is int
+                    ),
+                    None,
+                )
+                should_lower_token_limit = (
                     retry_policy is not None
                     and status_code == retry_policy.status_code
                     and retry_policy.body_contains.lower() in body.lower()
-                    and isinstance(data.get("max_tokens"), int)
-                    and data["max_tokens"] > retry_policy.max_tokens_limit
+                    and token_limit_field is not None
+                    and data[token_limit_field] > retry_policy.max_tokens_limit
                 )
-                if should_lower_max_tokens and retry_policy is not None:
-                    old_max = data["max_tokens"]
-                    data["max_tokens"] = min(
+                if (
+                    should_lower_token_limit
+                    and retry_policy is not None
+                    and token_limit_field is not None
+                ):
+                    old_limit = data[token_limit_field]
+                    data[token_limit_field] = min(
                         retry_policy.max_tokens_limit,
-                        max(1, old_max // 2),
+                        max(1, old_limit // 2),
                     )
                     logger.warning(
-                        "HTTP error %s; lowering max_tokens %s -> %s "
+                        "HTTP error %s; lowering %s %s -> %s "
                         "and retrying...",
                         status_code,
-                        old_max,
-                        data["max_tokens"],
+                        token_limit_field,
+                        old_limit,
+                        data[token_limit_field],
                     )
                 elif status_code == 429:
                     logger.warning(
