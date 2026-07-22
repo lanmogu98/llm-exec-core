@@ -45,6 +45,53 @@ replacement, then optionally edit the complete application-owned copy. Every
 supplied catalog must be complete: core provides no partial overlay or
 inheritance semantics with the packaged template.
 
+## Provider connection overrides
+
+Caller-owned catalogs can declare ordered API-key aliases and one endpoint
+override variable without adding provider-specific logic to `LLMClient`:
+
+```yaml
+synthetic-provider:
+  api_key_env_var: SYNTHETIC_PRIMARY_API_KEY
+  api_key_env_aliases:
+    - SYNTHETIC_FALLBACK_API_KEY
+  api_base_url: https://static.example.invalid/v1/chat/completions
+  api_base_url_env_var: SYNTHETIC_API_BASE_URL
+  pricing_currency: "$"
+  models:
+    synthetic-model:
+      id: synthetic-model-id
+      pricing: {input: 0.0, output: 0.0}
+```
+
+The primary key is checked first, followed by aliases in declaration order.
+Unset, empty, and Unicode-whitespace-only values are skipped. The first value
+with non-whitespace content is used unchanged, including ordinary surrounding
+spaces, after rejecting C0/DEL control characters. Resolution stops at that
+winner; errors name declarations but never credential values.
+
+When the endpoint variable is absent, unset, or Unicode-whitespace-only, the
+static `api_base_url` is used byte-for-byte. A populated override may be either
+an HTTPS SDK base ending in `/v1` or a full HTTPS URL ending in
+`/chat/completions`; surrounding ASCII whitespace and trailing slashes are
+removed, and `/chat/completions` is appended to an SDK base. Overrides with
+userinfo, a query or fragment delimiter, invalid ports, unsupported paths,
+backslashes, or remaining whitespace/control characters fail before HTTP
+client or request construction.
+
+There is deliberately no hostname allowlist. Explicit catalogs and environment
+variables are controlled by the caller or deployer, so regional, workspace,
+private-gateway, IP-literal, and self-hosted compatible endpoints remain
+possible. The deterministic HTTPS/path/parser checks reduce accidental secret
+leakage and ambiguous parsing; they are not an SSRF boundary against a
+malicious deployer.
+
+The declarations are optional. `ProviderSettings.model_fields`, JSON schema,
+and default `model_dump()` output add `api_key_env_aliases=[]` and
+`api_base_url_env_var=None`; existing field meanings and ordinary static-route
+behavior remain unchanged apart from fail-closed whitespace/control-bearing
+credentials.
+
 ## Request options
 
 Use `request_options` for raw per-call OpenAI-compatible Chat Completions

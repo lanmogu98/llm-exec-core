@@ -88,6 +88,80 @@ schema validation and acts as a post-validation transform. A hook used without
 `structured_output` retains its legacy transform behavior but does not imply
 validation.
 
+## Provider Connection Resolution
+
+`ProviderSettings` keeps the required `api_key_env_var` and `api_base_url`
+fields and adds two optional, provider-neutral declarations:
+
+```yaml
+synthetic-provider:
+  api_key_env_var: SYNTHETIC_PRIMARY_API_KEY
+  api_key_env_aliases:
+    - SYNTHETIC_FALLBACK_API_KEY
+  api_base_url: https://static.example.invalid/v1/chat/completions
+  api_base_url_env_var: SYNTHETIC_API_BASE_URL
+```
+
+Each new environment-variable name must be a non-empty string with no Unicode
+whitespace, `=`, or NUL. The endpoint variable must differ from the primary key
+name and every alias. Alias order and duplicates are preserved, and an alias
+may repeat the primary name. These checks intentionally do not tighten the
+legacy primary declaration.
+
+Credential resolution checks `[api_key_env_var, *api_key_env_aliases]` in
+order. An unset, empty, or Unicode-whitespace-only value does not win. The first
+value containing non-whitespace content wins and terminates lookup. If its
+original value contains a C0 control or DEL, resolution fails without checking
+a later alias; otherwise the original value is used unchanged in the
+Authorization header. Missing-key and invalid-key errors contain declared
+variable names only. With no aliases, a missing or blank primary preserves the
+legacy `ValueError` message exactly.
+
+Endpoint resolution uses only `api_base_url_env_var`:
+
+1. An absent declaration or an unset/Unicode-whitespace-only value returns the
+   static URL byte-for-byte without validation or normalization.
+2. A populated value is stripped of exactly surrounding ASCII space, tab, LF,
+   CR, VT, and FF, then any remaining ASCII control/space, DEL, Unicode
+   whitespace, or backslash is rejected.
+3. Literal query and fragment delimiters are rejected. Standard-library URL
+   parsing must yield an absolute case-insensitive HTTPS URL with authority and
+   hostname, no userinfo, and either no explicit port or a valid port in
+   `1..65535`; an empty port delimiter is invalid.
+4. Trailing slashes are removed. A path ending exactly in
+   `/chat/completions` is used as-is; a path ending exactly in `/v1` receives
+   `/chat/completions`; all other paths are rejected.
+5. Apart from the defined edge trim, trailing-slash removal, and suffix append,
+   the scheme, authority, and path bytes are preserved.
+
+| Declared override value | Resolved request URL |
+| --- | --- |
+| `https://api.example.invalid/v1` | `https://api.example.invalid/v1/chat/completions` |
+| `https://api.example.invalid/v1/chat/completions` | unchanged |
+| `https://workspace.example.invalid/compatible-mode/v1///` | `https://workspace.example.invalid/compatible-mode/v1/chat/completions` |
+| unset or blank | the exact static `api_base_url` |
+
+Invalid overrides fail before HTTP client/request construction. Exceptions may
+identify the endpoint variable and a reason category but never reproduce its
+value, hostname, port, path, query, or fragment. Resolution does not mutate
+`ProviderSettings`, caller dictionaries, or lists, so repeated Path/dictionary
+loads and independent model instances remain isolated.
+
+There is intentionally no hostname allowlist or provider-name branch. Catalogs
+and environment variables are deployer-controlled, and regional, workspace,
+private-gateway, IP-literal, and self-hosted OpenAI-compatible endpoints must
+remain possible. HTTPS/path/control/userinfo/query/fragment checks prevent
+common accidental leakage and cross-parser ambiguity, but do not form an SSRF
+boundary against a malicious deployer.
+
+The optional fields are additive public Pydantic schema/serialization surface:
+legacy default `model_dump()` output gains `api_key_env_aliases=[]` and
+`api_base_url_env_var=None`. Existing valid credentials and static endpoints
+retain their meanings; whitespace-only and C0/DEL-bearing selected credentials
+now fail closed. A focused revert must remove both declarations, both resolver
+paths, their tests, and this documentation together to restore the prior
+single-key/static-URL behavior.
+
 ## Payload Construction
 
 The effective request payload is built in this order:

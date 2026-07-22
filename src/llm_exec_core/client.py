@@ -13,6 +13,7 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from urllib.parse import SplitResult, urlsplit
 
 import httpx
 import jsonschema
@@ -44,10 +45,137 @@ _KNOWN_CAPABILITY_CONTROL_FIELDS = {
     "verbosity",
 }
 _MISSING = object()
+_ASCII_EDGE_WHITESPACE = " \t\n\r\v\f"
 
 
 def _reject_non_finite_json_constant(value: str) -> None:
     raise ValueError(f"{value} is not valid JSON.")
+
+
+def _resolve_api_key(primary_name: str, aliases: list[str]) -> str:
+    declared_names = [primary_name, *aliases]
+    for environment_name in declared_names:
+        value = os.environ.get(environment_name)
+        if value is None or not any(
+            not character.isspace() for character in value
+        ):
+            continue
+        if any(
+            ord(character) <= 0x1F or ord(character) == 0x7F
+            for character in value
+        ):
+            raise ValueError(
+                "API key environment variable "
+                f"'{environment_name}' contains a control character."
+            )
+        return value
+
+    if not aliases:
+        raise ValueError(
+            f"API key environment variable '{primary_name}' is not set."
+        )
+
+    rendered_names = ", ".join(
+        f"'{environment_name}'" for environment_name in declared_names
+    )
+    raise ValueError(
+        f"API key environment variables {rendered_names} "
+        "are not set or are blank."
+    )
+
+
+def _invalid_endpoint_override(
+    environment_name: str, reason: str
+) -> ValueError:
+    return ValueError(
+        "Endpoint override environment variable "
+        f"'{environment_name}' is invalid ({reason})."
+    )
+
+
+def _parse_endpoint_override(
+    candidate: str, environment_name: str
+) -> SplitResult:
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        raise _invalid_endpoint_override(environment_name, "URL syntax")
+    return parsed
+
+
+def _resolve_api_url(static_url: str, environment_name: str | None) -> str:
+    if environment_name is None:
+        return static_url
+
+    value = os.environ.get(environment_name)
+    if value is None or not any(
+        not character.isspace() for character in value
+    ):
+        return static_url
+
+    candidate = value.strip(_ASCII_EDGE_WHITESPACE)
+    if any(
+        ord(character) <= 0x20
+        or ord(character) == 0x7F
+        or character.isspace()
+        or character == "\\"
+        for character in candidate
+    ):
+        raise _invalid_endpoint_override(
+            environment_name, "forbidden character"
+        )
+    if "?" in candidate or "#" in candidate:
+        raise _invalid_endpoint_override(
+            environment_name, "query or fragment delimiter"
+        )
+
+    parsed = _parse_endpoint_override(candidate, environment_name)
+    if parsed.scheme.lower() != "https":
+        raise _invalid_endpoint_override(environment_name, "HTTPS required")
+    if not parsed.netloc:
+        raise _invalid_endpoint_override(
+            environment_name, "authority and hostname required"
+        )
+    if "@" in parsed.netloc:
+        raise _invalid_endpoint_override(
+            environment_name, "userinfo is not allowed"
+        )
+    if parsed.netloc.endswith(":"):
+        raise _invalid_endpoint_override(environment_name, "invalid port")
+
+    try:
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        hostname = None
+        port = None
+        valid_authority = False
+    else:
+        valid_authority = True
+    if not valid_authority:
+        raise _invalid_endpoint_override(
+            environment_name, "invalid authority or port"
+        )
+    if not hostname:
+        raise _invalid_endpoint_override(
+            environment_name, "authority and hostname required"
+        )
+    if port is not None and not 1 <= port <= 65535:
+        raise _invalid_endpoint_override(environment_name, "invalid port")
+
+    normalized = candidate.rstrip("/")
+    normalized_path = _parse_endpoint_override(
+        normalized, environment_name
+    ).path
+    if normalized_path.endswith("/chat/completions"):
+        return normalized
+    if normalized_path.endswith("/v1"):
+        return f"{normalized}/chat/completions"
+    raise _invalid_endpoint_override(
+        environment_name, "unsupported endpoint path"
+    )
 
 
 class StructuredOutputValidationError(ValueError):
@@ -164,12 +292,10 @@ class LLMClient:
             model_name, config_source
         )
 
-        self.api_key = os.environ.get(provider_settings.api_key_env_var)
-        if not self.api_key:
-            raise ValueError(
-                "API key environment variable "
-                f"'{provider_settings.api_key_env_var}' is not set."
-            )
+        self.api_key = _resolve_api_key(
+            provider_settings.api_key_env_var,
+            provider_settings.api_key_env_aliases,
+        )
 
         self.context_window = provider_settings.context_window
         self.max_tokens = provider_settings.max_tokens
@@ -182,7 +308,10 @@ class LLMClient:
         self.temperature = provider_settings.temperature
         self.max_tokens_retry = provider_settings.max_tokens_retry
 
-        self.api_url = provider_settings.api_base_url
+        self.api_url = _resolve_api_url(
+            provider_settings.api_base_url,
+            provider_settings.api_base_url_env_var,
+        )
         self.headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",

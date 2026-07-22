@@ -165,6 +165,152 @@ def test_legacy_default_catalog_symbols_are_removed():
     assert not hasattr(config_module, "_get_default_config_path")
 
 
+def test_provider_settings_connection_declarations_are_additive():
+    provider = ProviderSettings(**CUSTOM_CONFIG["test-provider"])
+    dumped = provider.model_dump()
+    schema_properties = ProviderSettings.model_json_schema()["properties"]
+
+    assert "api_key_env_aliases" in ProviderSettings.model_fields
+    assert "api_base_url_env_var" in ProviderSettings.model_fields
+    assert "api_key_env_aliases" in schema_properties
+    assert "api_base_url_env_var" in schema_properties
+    assert dumped["api_key_env_aliases"] == []
+    assert dumped["api_base_url_env_var"] is None
+    assert provider.api_key_env_var == "TEST_API_KEY"
+    assert provider.api_base_url == "https://example.invalid/chat/completions"
+
+
+def test_provider_settings_preserves_alias_order_and_duplicates():
+    aliases = [
+        "SECONDARY_KEY",
+        "TEST_API_KEY",
+        "SECONDARY_KEY",
+        "CONTROL\x07KEY",
+    ]
+    provider = ProviderSettings(
+        **CUSTOM_CONFIG["test-provider"],
+        api_key_env_aliases=aliases,
+        api_base_url_env_var="SYNTHETIC_API_BASE_URL",
+    )
+
+    assert provider.api_key_env_aliases == aliases
+    assert provider.api_base_url_env_var == "SYNTHETIC_API_BASE_URL"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "declaration"),
+    [
+        ("api_key_env_aliases", "SINGLE_STRING"),
+        ("api_key_env_aliases", ["VALID_ALIAS", 1]),
+        ("api_base_url_env_var", 1),
+    ],
+)
+def test_provider_settings_requires_strings_for_new_environment_names(
+    field_name, declaration
+):
+    with pytest.raises(ValueError):
+        ProviderSettings(
+            **CUSTOM_CONFIG["test-provider"],
+            **{field_name: declaration},
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_name",
+    [
+        "",
+        " ",
+        "KEY\tNAME",
+        "KEY\u2003NAME",
+        "KEY=VALUE",
+        "KEY\x00VALUE",
+    ],
+)
+@pytest.mark.parametrize(
+    "field_name", ["api_key_env_aliases", "api_base_url_env_var"]
+)
+def test_provider_settings_rejects_invalid_new_environment_names(
+    field_name, invalid_name
+):
+    declaration = (
+        [invalid_name] if field_name == "api_key_env_aliases" else invalid_name
+    )
+
+    with pytest.raises(ValueError):
+        ProviderSettings(
+            **CUSTOM_CONFIG["test-provider"],
+            **{field_name: declaration},
+        )
+
+
+@pytest.mark.parametrize("legacy_name", ["", "LEGACY KEY", "A=B", "A\x00B"])
+def test_provider_settings_does_not_retroactively_validate_primary_key_name(
+    legacy_name,
+):
+    provider = ProviderSettings(
+        **{
+            **CUSTOM_CONFIG["test-provider"],
+            "api_key_env_var": legacy_name,
+        }
+    )
+
+    assert provider.api_key_env_var == legacy_name
+
+
+@pytest.mark.parametrize("endpoint_name", ["TEST_API_KEY", "SECONDARY_KEY"])
+def test_provider_settings_rejects_endpoint_and_credential_name_overlap(
+    endpoint_name,
+):
+    with pytest.raises(ValueError):
+        ProviderSettings(
+            **CUSTOM_CONFIG["test-provider"],
+            api_key_env_aliases=["SECONDARY_KEY", "TEST_API_KEY"],
+            api_base_url_env_var=endpoint_name,
+        )
+
+
+def test_provider_settings_default_alias_lists_are_isolated():
+    first = ProviderSettings(**CUSTOM_CONFIG["test-provider"])
+    second = ProviderSettings(**CUSTOM_CONFIG["test-provider"])
+
+    first.api_key_env_aliases.append("MUTATED_ALIAS")
+
+    assert second.api_key_env_aliases == []
+
+
+@pytest.mark.parametrize("source_kind", ["dict", "path"])
+def test_connection_declarations_are_isolated_across_explicit_loads(
+    tmp_path, source_kind
+):
+    source_data = {
+        "test-provider": {
+            **CUSTOM_CONFIG["test-provider"],
+            "api_key_env_aliases": ["SECONDARY_KEY"],
+            "api_base_url_env_var": "SYNTHETIC_API_BASE_URL",
+        }
+    }
+    config_source = source_data
+    if source_kind == "path":
+        config_source = tmp_path / "llm_config.yml"
+        config_source.write_text(
+            yaml.safe_dump(source_data, sort_keys=False), encoding="utf-8"
+        )
+
+    first = load_all_settings(config_source)
+    first["test-provider"].api_key_env_aliases.append("MUTATED_ALIAS")
+    first["test-provider"].api_base_url_env_var = "MUTATED_BASE_URL"
+    second = load_all_settings(config_source)
+
+    assert second["test-provider"].api_key_env_aliases == ["SECONDARY_KEY"]
+    assert (
+        second["test-provider"].api_base_url_env_var
+        == "SYNTHETIC_API_BASE_URL"
+    )
+    assert source_data["test-provider"]["api_key_env_aliases"] == [
+        "SECONDARY_KEY"
+    ]
+
+
 @pytest.mark.parametrize("source_kind", ["dict", "path"])
 @pytest.mark.parametrize("api_name", CATALOG_API_CASES)
 def test_explicit_catalog_public_calls_preserve_behavior(

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Added
+
+- Allow caller-owned provider schemas to declare ordered API-key environment
+  aliases and an HTTPS endpoint-override environment variable, with
+  provider-neutral precedence, normalization, and sanitized validation.
+
+### Changed
+
+- Add the optional `api_key_env_aliases=[]` and
+  `api_base_url_env_var=None` fields to `ProviderSettings` schema and default
+  serialization, and fail closed before header construction for
+  whitespace-only or C0/DEL-bearing selected credentials.
+
 ## 0.4.0
 
 ### Changed
