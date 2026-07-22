@@ -1,7 +1,8 @@
 """LLM configuration loader."""
 
+from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -30,6 +31,13 @@ class ModelDetails(BaseModel):
     id: str
     pricing: Pricing
     capabilities: Optional[ModelCapabilities] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    context_window: Optional[int] = None
+    request_overrides: Optional[Dict[str, Any]] = None
+    output_token_field: Optional[
+        Literal["max_tokens", "max_completion_tokens"]
+    ] = None
 
 
 class RateLimitSettings(BaseModel):
@@ -51,6 +59,9 @@ class ProviderSettings(BaseModel):
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     context_window: Optional[int] = None
+    output_token_field: Literal["max_tokens", "max_completion_tokens"] = (
+        "max_tokens"
+    )
     pricing_currency: str
     models: Dict[str, ModelDetails]
     request_overrides: Optional[Dict[str, Any]] = None
@@ -103,7 +114,7 @@ def _load_raw_config(
     config_source: Path | Dict[str, Any],
 ) -> Dict[str, Any]:
     if isinstance(config_source, dict):
-        return config_source
+        return deepcopy(config_source)
 
     if not config_source.exists():
         raise FileNotFoundError(

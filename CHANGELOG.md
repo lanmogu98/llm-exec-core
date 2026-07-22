@@ -7,6 +7,8 @@
 - Allow caller-owned provider schemas to declare ordered API-key environment
   aliases and an HTTPS endpoint-override environment variable, with
   provider-neutral precedence, normalization, and sanitized validation.
+- Allow models to declare optional context/output limits, temperature, request
+  defaults, and generated output-token field over legacy-safe provider defaults.
 
 ### Changed
 
@@ -14,6 +16,10 @@
   `api_base_url_env_var=None` fields to `ProviderSettings` schema and default
   serialization, and fail closed before header construction for
   whitespace-only or C0/DEL-bearing selected credentials.
+- Resolve effective request policy provider → model → per call without mutating
+  raw catalog objects, reject dual token-limit fields, lower the actual integer
+  token field on configured retries, and validate `thinking_level` against
+  declared model reasoning controls.
 
 ## 0.4.0
 

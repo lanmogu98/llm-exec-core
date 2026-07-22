@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from llm_exec_core import StructuredOutputValidationError
@@ -22,6 +23,8 @@ def _config(
     api_base_url="https://example.invalid/chat/completions",
     api_key_env_var="TEST_API_KEY",
     model_name="test-model",
+    provider_settings=None,
+    model_settings=None,
 ):
     model_config = {
         "id": "provider-model-id",
@@ -29,6 +32,8 @@ def _config(
     }
     if model_capabilities is not None:
         model_config["capabilities"] = model_capabilities
+    if model_settings is not None:
+        model_config.update(deepcopy(model_settings))
 
     provider_config = {
         "api_key_env_var": api_key_env_var,
@@ -43,6 +48,8 @@ def _config(
     }
     if request_overrides is not None:
         provider_config["request_overrides"] = request_overrides
+    if provider_settings is not None:
+        provider_config.update(deepcopy(provider_settings))
     return {provider_name: provider_config}
 
 
@@ -122,6 +129,298 @@ def _qwen_no_tools_capabilities():
     capabilities["tools"] = False
     capabilities["tool_choice"] = False
     return capabilities
+
+
+def test_client_resolves_model_request_policy_scalars_over_provider_defaults(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    provider_values = {
+        "temperature": 0.2,
+        "max_tokens": 256,
+        "context_window": 8192,
+        "output_token_field": "max_completion_tokens",
+    }
+
+    fallback_client = LLMClient(
+        "test-model",
+        config_source=_config(
+            provider_settings=provider_values,
+            model_settings={
+                "temperature": None,
+                "max_tokens": None,
+                "context_window": None,
+                "output_token_field": None,
+            },
+        ),
+    )
+    override_client = LLMClient(
+        "test-model",
+        config_source=_config(
+            provider_settings=provider_values,
+            model_settings={
+                "temperature": 0.7,
+                "max_tokens": 512,
+                "context_window": 16384,
+                "output_token_field": "max_tokens",
+            },
+        ),
+    )
+
+    assert (
+        fallback_client.temperature,
+        fallback_client.max_tokens,
+        fallback_client.context_window,
+        fallback_client.output_token_field,
+    ) == (0.2, 256, 8192, "max_completion_tokens")
+    assert (
+        override_client.temperature,
+        override_client.max_tokens,
+        override_client.context_window,
+        override_client.output_token_field,
+    ) == (0.7, 512, 16384, "max_tokens")
+
+
+def test_effective_request_defaults_are_isolated_from_catalog_and_clients(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    provider_overrides = {
+        "provider_only": {"values": ["provider"]},
+        "shared": {"values": ["provider"]},
+    }
+    model_overrides = {
+        "model_only": {"values": ["model"]},
+        "shared": {"values": ["model"]},
+    }
+    config = _config(
+        request_overrides=provider_overrides,
+        model_settings={"request_overrides": model_overrides},
+    )
+
+    first = LLMClient("test-model", config_source=config)
+    first.request_overrides["provider_only"]["values"].append("mutated")
+    first.request_overrides["model_only"]["values"].append("mutated")
+    second = LLMClient("test-model", config_source=config)
+
+    assert second.request_overrides == {
+        "provider_only": {"values": ["provider"]},
+        "shared": {"values": ["model"]},
+        "model_only": {"values": ["model"]},
+    }
+    assert provider_overrides == {
+        "provider_only": {"values": ["provider"]},
+        "shared": {"values": ["provider"]},
+    }
+    assert model_overrides == {
+        "model_only": {"values": ["model"]},
+        "shared": {"values": ["model"]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_request_defaults_merge_normalized_provider_model_and_per_call(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    provider_overrides = {
+        "top_p": 0.9,
+        "provider_only": True,
+        "cross_layer": "provider-direct",
+        "extra_body": {
+            "promoted": "provider-extra",
+            "cross_layer": "provider-extra",
+        },
+    }
+    model_overrides = {
+        "top_p": 0.6,
+        "model_only": True,
+        "extra_body": {
+            "promoted": "model-extra",
+            "cross_layer": "model-extra",
+        },
+    }
+    request_options = {
+        "top_p": 0.2,
+        "call_only": True,
+        "extra_body": {"promoted": "call-extra"},
+    }
+    originals = deepcopy(
+        (provider_overrides, model_overrides, request_options)
+    )
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                request_overrides=provider_overrides,
+                model_settings={"request_overrides": model_overrides},
+            ),
+        )
+        await client.generate("Hello", request_options=request_options)
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert payload["provider_only"] is True
+    assert payload["model_only"] is True
+    assert payload["call_only"] is True
+    assert payload["cross_layer"] == "model-extra"
+    assert payload["promoted"] == "call-extra"
+    assert payload["top_p"] == 0.2
+    assert (provider_overrides, model_overrides, request_options) == originals
+
+
+@pytest.mark.asyncio
+async def test_stream_options_deep_merge_provider_model_and_per_call(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    provider_stream_options = {
+        "provider_only": True,
+        "nested": {"provider": 1, "shared": "provider"},
+    }
+    model_stream_options = {
+        "model_only": True,
+        "nested": {"model": 2, "shared": "model"},
+    }
+    request_stream_options = {
+        "call_only": True,
+        "nested": {"call": 3, "shared": "call"},
+    }
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                request_overrides={"stream_options": provider_stream_options},
+                model_settings={
+                    "request_overrides": {
+                        "stream_options": model_stream_options
+                    }
+                },
+            ),
+        )
+        await client.generate(
+            "Hello",
+            request_options={"stream_options": request_stream_options},
+        )
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert payload["stream_options"] == {
+        "provider_only": True,
+        "model_only": True,
+        "call_only": True,
+        "nested": {
+            "provider": 1,
+            "model": 2,
+            "call": 3,
+            "shared": "call",
+        },
+    }
+    assert provider_stream_options == {
+        "provider_only": True,
+        "nested": {"provider": 1, "shared": "provider"},
+    }
+    assert model_stream_options == {
+        "model_only": True,
+        "nested": {"model": 2, "shared": "model"},
+    }
+    assert request_stream_options == {
+        "call_only": True,
+        "nested": {"call": 3, "shared": "call"},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_settings", "expected_field"),
+    [
+        ({}, "max_tokens"),
+        (
+            {
+                "max_tokens": 321,
+                "output_token_field": "max_completion_tokens",
+            },
+            "max_completion_tokens",
+        ),
+    ],
+    ids=["legacy-max-tokens", "model-selected-completion-tokens"],
+)
+async def test_generated_token_limit_uses_effective_output_field(
+    monkeypatch,
+    model_settings,
+    expected_field,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(model_settings=model_settings),
+        )
+        await client.generate("Hello")
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+    other_field = (
+        "max_completion_tokens"
+        if expected_field == "max_tokens"
+        else "max_tokens"
+    )
+
+    assert payload[expected_field] == model_settings.get("max_tokens", 128)
+    assert other_field not in payload
+    assert client.output_token_field == expected_field
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("token_field", "generated_field"),
+    [
+        ("max_tokens", "max_completion_tokens"),
+        ("max_completion_tokens", "max_tokens"),
+    ],
+)
+async def test_explicit_token_limit_precedence_suppresses_generated_default(
+    monkeypatch,
+    token_field,
+    generated_field,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                request_overrides={token_field: 111},
+                provider_settings={"output_token_field": generated_field},
+                model_settings={
+                    "request_overrides": {token_field: 222},
+                },
+            ),
+        )
+        await client.generate("Hello", request_options={token_field: 333})
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert payload[token_field] == 333
+    assert generated_field not in payload
 
 
 @pytest.mark.asyncio
@@ -265,7 +564,7 @@ async def test_max_completion_tokens_suppresses_core_default_max_tokens(
 
 
 @pytest.mark.asyncio
-async def test_explicit_max_tokens_survives_with_max_completion_tokens(
+async def test_dual_token_limit_fields_fail_before_http_after_normalization(
     monkeypatch,
 ):
     monkeypatch.setenv("TEST_API_KEY", "test-key")
@@ -281,12 +580,167 @@ async def test_explicit_max_tokens_survives_with_max_completion_tokens(
                 request_overrides={"max_completion_tokens": 1024}
             ),
         )
-        await client.generate("Hello", request_options={"max_tokens": 64})
+        with pytest.raises(
+            ValueError,
+            match="both max_tokens and max_completion_tokens",
+        ):
+            await client.generate(
+                "Hello",
+                request_options={"extra_body": {"max_tokens": 64}},
+            )
 
-    payload = mock_httpx_client.post.await_args.kwargs["json"]
+    mock_cls.assert_not_called()
+    mock_httpx_client.post.assert_not_awaited()
 
-    assert payload["max_completion_tokens"] == 1024
-    assert payload["max_tokens"] == 64
+
+@pytest.mark.asyncio
+async def test_model_request_defaults_keep_protected_field_validation(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                model_settings={
+                    "request_overrides": {
+                        "extra_body": {"model": "other-model"}
+                    }
+                }
+            ),
+        )
+        with pytest.raises(ValueError, match="protected"):
+            await client.generate("Hello")
+
+    mock_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "token_field", ["max_tokens", "max_completion_tokens"]
+)
+async def test_retry_lowers_the_present_integer_token_limit_field(
+    monkeypatch,
+    caplog,
+    token_field,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    caplog.set_level("WARNING", logger="llm_exec_core.client")
+    request = httpx.Request("POST", "https://example.invalid/chat/completions")
+    error_response = httpx.Response(
+        404,
+        text='{"error":"No allowed providers"}',
+        request=request,
+    )
+    payloads = []
+
+    async def post_side_effect(*args, **kwargs):
+        payloads.append(deepcopy(kwargs["json"]))
+        if len(payloads) == 1:
+            return error_response
+        return _success_response()
+
+    with (
+        patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls,
+        patch("llm_exec_core.client.asyncio.sleep", new_callable=AsyncMock),
+    ):
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.side_effect = post_side_effect
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                max_tokens=1000,
+                provider_settings={
+                    "output_token_field": token_field,
+                    "max_tokens_retry": {
+                        "status_code": 404,
+                        "body_contains": "no allowed providers",
+                        "max_tokens_limit": 800,
+                    },
+                },
+            ),
+        )
+        _disable_rate_limit(client)
+        result = await client.generate("Hello")
+
+    other_field = (
+        "max_completion_tokens"
+        if token_field == "max_tokens"
+        else "max_tokens"
+    )
+    assert result.text == "ok"
+    assert [payload[token_field] for payload in payloads] == [1000, 500]
+    assert all(other_field not in payload for payload in payloads)
+    assert f"lowering {token_field} 1000 -> 500" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("limit_value", "error_body"),
+    [
+        (1000, '{"error":"different failure"}'),
+        ("1000", '{"error":"No allowed providers"}'),
+    ],
+    ids=["body-does-not-match", "limit-is-not-integer"],
+)
+async def test_retry_does_not_lower_nonmatching_or_non_integer_limit(
+    monkeypatch,
+    limit_value,
+    error_body,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    request = httpx.Request("POST", "https://example.invalid/chat/completions")
+    error_response = httpx.Response(
+        404,
+        text=error_body,
+        request=request,
+    )
+    payloads = []
+
+    async def post_side_effect(*args, **kwargs):
+        payloads.append(deepcopy(kwargs["json"]))
+        if len(payloads) == 1:
+            return error_response
+        return _success_response()
+
+    with (
+        patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls,
+        patch("llm_exec_core.client.asyncio.sleep", new_callable=AsyncMock),
+    ):
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.side_effect = post_side_effect
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_config(
+                provider_settings={
+                    "max_tokens_retry": {
+                        "status_code": 404,
+                        "body_contains": "no allowed providers",
+                        "max_tokens_limit": 800,
+                    }
+                }
+            ),
+        )
+        _disable_rate_limit(client)
+        result = await client.generate(
+            "Hello",
+            request_options={"max_completion_tokens": limit_value},
+        )
+
+    assert result.text == "ok"
+    assert [payload["max_completion_tokens"] for payload in payloads] == [
+        limit_value,
+        limit_value,
+    ]
+    assert all("max_tokens" not in payload for payload in payloads)
 
 
 @pytest.mark.asyncio
@@ -361,6 +815,54 @@ async def test_generate_passes_reasoning_and_tool_controls(monkeypatch):
     assert payload["reasoning_effort"] == "high"
     assert payload["tools"] == [tool]
     assert payload["tool_choice"] == "auto"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "capabilities",
+    [None, _json_only_capabilities()],
+    ids=["capabilities-absent", "reasoning-effort-supported"],
+)
+async def test_thinking_level_maps_to_reasoning_effort_when_allowed(
+    monkeypatch,
+    capabilities,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            thinking_level="high",
+            config_source=_config(model_capabilities=capabilities),
+        )
+        await client.generate("Hello")
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+
+    assert payload["reasoning_effort"] == "high"
+
+
+def test_thinking_level_rejected_before_request_construction_when_unsupported(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        with pytest.raises(
+            ValueError,
+            match="thinking_level.*reasoning_effort",
+        ):
+            LLMClient(
+                "test-model",
+                thinking_level="high",
+                config_source=_config(model_capabilities=_qwen_capabilities()),
+            )
+
+    mock_cls.assert_not_called()
 
 
 @pytest.mark.asyncio
