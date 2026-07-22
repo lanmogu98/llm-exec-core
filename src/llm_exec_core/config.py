@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class Pricing(BaseModel):
@@ -45,7 +45,9 @@ class MaxTokensRetrySettings(BaseModel):
 
 class ProviderSettings(BaseModel):
     api_key_env_var: str
+    api_key_env_aliases: List[str] = Field(default_factory=list)
     api_base_url: str
+    api_base_url_env_var: Optional[str] = None
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     context_window: Optional[int] = None
@@ -54,6 +56,47 @@ class ProviderSettings(BaseModel):
     request_overrides: Optional[Dict[str, Any]] = None
     max_tokens_retry: Optional[MaxTokensRetrySettings] = None
     rate_limit: Optional[RateLimitSettings] = None
+
+    @field_validator("api_key_env_aliases")
+    @classmethod
+    def _validate_api_key_env_aliases(cls, aliases: List[str]) -> List[str]:
+        for alias in aliases:
+            cls._validate_new_environment_name(alias)
+        return aliases
+
+    @field_validator("api_base_url_env_var")
+    @classmethod
+    def _validate_api_base_url_env_var(
+        cls, environment_name: Optional[str]
+    ) -> Optional[str]:
+        if environment_name is not None:
+            cls._validate_new_environment_name(environment_name)
+        return environment_name
+
+    @model_validator(mode="after")
+    def _validate_connection_environment_names(self) -> "ProviderSettings":
+        if self.api_base_url_env_var is not None and (
+            self.api_base_url_env_var == self.api_key_env_var
+            or self.api_base_url_env_var in self.api_key_env_aliases
+        ):
+            raise ValueError(
+                "api_base_url_env_var must differ from every API-key "
+                "environment-variable name."
+            )
+        return self
+
+    @staticmethod
+    def _validate_new_environment_name(environment_name: str) -> None:
+        if (
+            not environment_name
+            or "=" in environment_name
+            or "\x00" in environment_name
+            or any(character.isspace() for character in environment_name)
+        ):
+            raise ValueError(
+                "New environment-variable declarations must be non-empty "
+                "and contain no whitespace, '=', or NUL."
+            )
 
 
 def _load_raw_config(
