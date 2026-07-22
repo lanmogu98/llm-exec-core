@@ -119,6 +119,20 @@ comments, reports, or attestations. SHA-256 remains appropriate for built
 release artifacts; the commit SHA identifies the exact PR head; package-manager
 lock integrity remains native to the package manager.
 
+This package is a Chat Completions execution library, not an agent framework.
+Subscription Coding, Token, Agent, or similar plans are products rather than
+third-party provider routes and must not be cataloged as routes. A third-party
+catalog route requires current official evidence of an ordinary API endpoint,
+its exact model identifier, a request/response contract compatible with this
+package, and ordinary-API pricing that the catalog can represent accurately.
+
+Subscription-plan documentation alone is incomplete research, not evidence that
+ordinary API support is absent. Before recording a route as unconfirmed,
+research must continue through official ordinary model lists, online-inference
+documentation, pricing tables, release notes, and, if necessary, evidence
+supplied by the owner across the owner-controlled console-evidence boundary;
+agents must not inspect an authenticated console.
+
 Only completed upstream stages block a child work item. Refresh downstream
 evidence and assumptions when that child's turn arrives instead of fully
 auditing future work in advance. A parent and child must not duplicate approval
