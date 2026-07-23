@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 import json
 from copy import deepcopy
@@ -6,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 import llm_exec_core.client as client_module
 import llm_exec_core.config as config_module
@@ -744,6 +746,38 @@ def test_pricing_context_constructor_argument_is_keyword_only():
     assert parameter.default is None
 
 
+def test_rich_client_pricing_context_rejects_public_reassignment(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    client = LLMClient(
+        "test-model",
+        config_source=_rich_client_config([_rich_client_rule()]),
+        pricing_context=_rich_client_context(),
+    )
+    replacement = config_module.PricingContext.model_validate(
+        _rich_client_context(region="eu-west")
+    )
+
+    with pytest.raises(AttributeError):
+        client.pricing_context = replacement
+
+
+def test_rich_client_pricing_context_rejects_public_field_mutation(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    client = LLMClient(
+        "test-model",
+        config_source=_rich_client_config([_rich_client_rule()]),
+        pricing_context=_rich_client_context(),
+    )
+    exposed_context = client.pricing_context
+
+    assert exposed_context is not None
+    with pytest.raises(ValidationError):
+        exposed_context.region = "eu-west"
+    assert client.pricing_context.region == "us-east"
+
+
 @pytest.mark.asyncio
 async def test_rich_client_deep_copies_pricing_context(monkeypatch):
     monkeypatch.setenv("TEST_API_KEY", "test-key")
@@ -763,6 +797,74 @@ async def test_rich_client_deep_copies_pricing_context(monkeypatch):
 
     assert result.usage.currency == "USD"
     assert client.pricing_context.region == "us-east"
+
+
+@pytest.mark.asyncio
+async def test_rich_client_uses_request_start_pricing_context_snapshot(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    us_rule = _rich_client_rule(rule_id="us-rule")
+    eu_rule = _rich_client_rule(rule_id="eu-rule", currency="EUR")
+    eu_rule["region"] = "eu-west"
+    post_started = asyncio.Event()
+    release_response = asyncio.Event()
+
+    async def delayed_post(*args, **kwargs):
+        post_started.set()
+        await release_response.wait()
+        return _http_response(_openai_usage())
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.side_effect = delayed_post
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_rich_client_config([us_rule, eu_rule]),
+            pricing_context=_rich_client_context(),
+        )
+        request = asyncio.create_task(client.generate("Hello"))
+        await asyncio.wait_for(post_started.wait(), timeout=1)
+        stored_context = client.__dict__.get("_pricing_context")
+        if stored_context is None:
+            stored_context = client.__dict__["pricing_context"]
+        object.__setattr__(stored_context, "region", "eu-west")
+        release_response.set()
+        result = await request
+
+    assert result.usage.currency == "USD"
+
+
+@pytest.mark.asyncio
+async def test_rich_client_rejects_batch_context_at_request_start(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    realtime_rule = _rich_client_rule(rule_id="realtime-rule")
+    batch_rule = _rich_client_rule(rule_id="batch-rule", request_mode="batch")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _http_response(_openai_usage())
+        mock_cls.return_value = mock_httpx_client
+
+        client = LLMClient(
+            "test-model",
+            config_source=_rich_client_config([realtime_rule, batch_rule]),
+            pricing_context=_rich_client_context(),
+        )
+        stored_context = client.__dict__.get("_pricing_context")
+        if stored_context is None:
+            stored_context = client.__dict__["pricing_context"]
+        object.__setattr__(stored_context, "request_mode", "batch")
+
+        with pytest.raises(
+            config_module.PricingCalculationError,
+            match="realtime pricing contexts only",
+        ):
+            await client.generate("Hello")
+
+    assert mock_httpx_client.post.await_count == 0
 
 
 @pytest.mark.asyncio

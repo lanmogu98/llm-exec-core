@@ -1167,10 +1167,27 @@ def test_packaged_reference_can_be_copied_and_loaded_explicitly(tmp_path):
 
 
 def test_legacy_pricing_validation_and_serialization_remain_permissive():
-    pricing = Pricing(input=-1.0, output=float("inf"))
+    pricing = Pricing(
+        input=-1.0,
+        output=float("inf"),
+        ignored_legacy_extra="still-permitted",
+    )
 
     assert pricing.model_dump() == {"input": -1.0, "output": float("inf")}
     assert math.isinf(pricing.output)
+
+
+@pytest.mark.parametrize("rules", [[_rich_pricing_rule()], []])
+def test_explicit_rich_schema_never_falls_back_to_legacy_pricing(rules):
+    pricing = {
+        "schema": "pricing-rules-v1",
+        "rules": rules,
+        "input": 1.0,
+        "output": 2.0,
+    }
+
+    with pytest.raises(ValidationError):
+        ModelDetails(id="provider-model-id", pricing=pricing)
 
 
 def test_rich_pricing_canonical_json_serialization_and_raw_lookup():
@@ -1806,7 +1823,7 @@ def test_batch_rules_remain_available_to_pure_resolver_and_calculator():
     assert cost.total_cost == pytest.approx(0.24)
 
 
-def test_built_wheel_exposes_rich_pricing_config_api(tmp_path):
+def test_built_wheel_exposes_canonical_rich_pricing_config_api(tmp_path):
     output_directory = tmp_path / "dist"
     build = subprocess.run(
         ["uv", "build", "--wheel", "--out-dir", str(output_directory)],
@@ -1839,6 +1856,10 @@ def test_built_wheel_exposes_rich_pricing_config_api(tmp_path):
         "import llm_exec_core.config as config; "
         "from llm_exec_core.client import LLMClient; "
         f"assert all(hasattr(config, name) for name in {symbols!r}); "
+        "schedule = config.PricingSchedule.model_construct("
+        "schema_='pricing-rules-v1', rules=[]); "
+        "assert schedule.model_dump(mode='json') == "
+        "{'schema': 'pricing-rules-v1', 'rules': []}; "
         "assert 'pricing_context' in inspect.signature(LLMClient).parameters"
     )
     imported = subprocess.run(

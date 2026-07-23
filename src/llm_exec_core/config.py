@@ -13,8 +13,10 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     ValidationInfo,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -246,7 +248,7 @@ class PricingRule(BaseModel):
 
 
 class PricingSchedule(BaseModel):
-    model_config = ConfigDict(extra="forbid", serialize_by_alias=True)
+    model_config = ConfigDict(extra="forbid")
 
     schema_: Literal["pricing-rules-v1"] = Field(alias="schema")
     rules: List[PricingRule] = Field(min_length=1)
@@ -254,6 +256,15 @@ class PricingSchedule(BaseModel):
     @property
     def schema(self) -> Literal["pricing-rules-v1"]:  # type: ignore[override]
         return self.schema_
+
+    @model_serializer(mode="wrap")
+    def _serialize_schedule(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> Dict[str, Any]:
+        serialized: Dict[str, Any] = handler(self)
+        schema = serialized.pop("schema", self.schema_)
+        serialized.pop("schema_", None)
+        return {"schema": schema, **serialized}
 
     @model_validator(mode="after")
     def _validate_unique_rule_ids(self) -> "PricingSchedule":
@@ -266,7 +277,7 @@ class PricingSchedule(BaseModel):
 
 
 class PricingContext(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     region: str
     service_scope: str
@@ -337,6 +348,13 @@ class ModelDetails(BaseModel):
     output_token_field: Optional[
         Literal["max_tokens", "max_completion_tokens"]
     ] = None
+
+    @field_validator("pricing", mode="before")
+    @classmethod
+    def _select_declared_pricing(cls, value: Any) -> Any:
+        if isinstance(value, Mapping) and "schema" in value:
+            return PricingSchedule.model_validate(value)
+        return value
 
 
 class RateLimitSettings(BaseModel):

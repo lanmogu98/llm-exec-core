@@ -440,26 +440,30 @@ class LLMClient:
             if isinstance(self.pricing, PricingSchedule)
             else provider_settings.pricing_currency
         )
-        self.pricing_context: PricingContext | None = None
+        self._pricing_context: PricingContext | None = None
         if isinstance(self.pricing, PricingSchedule):
             if pricing_context is None:
                 raise PricingContextRequiredError(
                     f"Pricing context is required for model '{model_name}'."
                 )
+            resolved_pricing_context: PricingContext
             if isinstance(pricing_context, PricingContext):
-                self.pricing_context = pricing_context.model_copy(deep=True)
+                resolved_pricing_context = pricing_context.model_copy(
+                    deep=True
+                )
             elif isinstance(pricing_context, Mapping):
-                self.pricing_context = PricingContext.model_validate(
+                resolved_pricing_context = PricingContext.model_validate(
                     deepcopy(dict(pricing_context))
                 )
             else:
                 raise PricingContextRequiredError(
                     f"Pricing context is required for model '{model_name}'."
                 )
-            if self.pricing_context.request_mode == "batch":
+            if resolved_pricing_context.request_mode == "batch":
                 raise PricingCalculationError(
                     "LLMClient supports realtime pricing contexts only."
                 )
+            self._pricing_context = resolved_pricing_context
         self.temperature = (
             model_details.temperature
             if model_details.temperature is not None
@@ -534,6 +538,12 @@ class LLMClient:
         )
 
         self._async_client: Optional[httpx.AsyncClient] = None
+
+    @property
+    def pricing_context(self) -> PricingContext | None:
+        if self._pricing_context is None:
+            return None
+        return self._pricing_context.model_copy(deep=True)
 
     async def __aenter__(self):
         """Context manager entry."""
@@ -1104,6 +1114,18 @@ class LLMClient:
         structured_output: Mapping[str, Any] | None = None,
     ) -> LLMResult:
         """Generate a structured LLM result."""
+        request_pricing_context = (
+            None
+            if self._pricing_context is None
+            else self._pricing_context.model_copy(deep=True)
+        )
+        if (
+            request_pricing_context is not None
+            and request_pricing_context.request_mode == "batch"
+        ):
+            raise PricingCalculationError(
+                "LLMClient supports realtime pricing contexts only."
+            )
         pricing_effective_at = datetime.now(timezone.utc)
         started_at = datetime.now()
         start_time = time.time()
@@ -1170,6 +1192,7 @@ class LLMClient:
                         start_time,
                         request_name,
                         pricing_effective_at,
+                        request_pricing_context,
                         stream_callback,
                     )
                 else:
@@ -1179,6 +1202,7 @@ class LLMClient:
                         start_time,
                         request_name,
                         pricing_effective_at,
+                        request_pricing_context,
                     )
                     response_text, legacy_usage = legacy_result
 
@@ -1335,6 +1359,7 @@ class LLMClient:
         start_time: float,
         request_name: str,
         pricing_effective_at: datetime,
+        pricing_context: PricingContext | None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Handle non-streaming API response."""
         response = await client.post(
@@ -1349,12 +1374,12 @@ class LLMClient:
 
         pricing_cost = None
         if isinstance(self.pricing, PricingSchedule):
-            assert self.pricing_context is not None
+            assert pricing_context is not None
             usage_parts = _parse_openai_chat_usage(
-                result.get("usage"), self.pricing_context.cache_mode
+                result.get("usage"), pricing_context.cache_mode
             )
             pricing_cost = self._calculate_rich_pricing(
-                usage_parts, pricing_effective_at
+                usage_parts, pricing_effective_at, pricing_context
             )
             input_tokens = usage_parts.prompt_tokens
             output_tokens = usage_parts.completion_tokens
@@ -1378,6 +1403,7 @@ class LLMClient:
         start_time: float,
         request_name: str,
         pricing_effective_at: datetime,
+        pricing_context: PricingContext | None,
         stream_callback: Optional[Callable[[str], None]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Handle streaming API response with real-time output or callback."""
@@ -1422,12 +1448,12 @@ class LLMClient:
 
         pricing_cost = None
         if isinstance(self.pricing, PricingSchedule):
-            assert self.pricing_context is not None
+            assert pricing_context is not None
             usage_parts = _parse_openai_chat_usage(
-                raw_usage, self.pricing_context.cache_mode
+                raw_usage, pricing_context.cache_mode
             )
             pricing_cost = self._calculate_rich_pricing(
-                usage_parts, pricing_effective_at
+                usage_parts, pricing_effective_at, pricing_context
             )
             input_tokens = usage_parts.prompt_tokens
             output_tokens = usage_parts.completion_tokens
@@ -1457,15 +1483,15 @@ class LLMClient:
         self,
         usage_parts: _PricingUsageParts,
         effective_at: datetime,
+        pricing_context: PricingContext,
     ) -> PricingCost:
         assert isinstance(self.pricing, PricingSchedule)
-        assert self.pricing_context is not None
         resolved = _resolve_declared_pricing(
             self.model_name,
             self.model,
             self.pricing,
             self._provider_pricing_currency,
-            pricing_context=self.pricing_context,
+            pricing_context=pricing_context,
             input_tokens=usage_parts.prompt_tokens,
             effective_at=effective_at,
         )
