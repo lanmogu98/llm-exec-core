@@ -1,4 +1,5 @@
 from pathlib import Path
+from collections import Counter
 import re
 import runpy
 
@@ -305,36 +306,43 @@ def test_release_workflow_has_safe_manual_interface_and_pins() -> None:
         "cancel-in-progress": "false",
     }
 
-    expected_actions = {
-        "actions/checkout": (
-            "3d3c42e5aac5ba805825da76410c181273ba90b1",
-            "v7.0.1",
-        ),
-        "astral-sh/setup-uv": (
-            "c771a70e6277c0a99b617c7a806ffedaca235ff9",
-            "v9.0.0",
-        ),
-        "actions/upload-artifact": (
-            "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-            "v7.0.1",
-        ),
-        "actions/download-artifact": (
-            "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
-            "v8.0.1",
-        ),
-        "actions/create-github-app-token": (
-            "bcd2ba49218906704ab6c1aa796996da409d3eb1",
-            "v3.2.0",
-        ),
-    }
-    action_lines = re.findall(
-        r"uses:\s*([^@\s]+)@([0-9a-f]{40})\s+#\s+(\S+)", text
+    checkout = "actions/checkout@" "3d3c42e5aac5ba805825da76410c181273ba90b1"
+    setup_uv = "astral-sh/setup-uv@" "c771a70e6277c0a99b617c7a806ffedaca235ff9"
+    upload_artifact = (
+        "actions/upload-artifact@" "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
     )
-    assert action_lines
-    assert {action for action, _, _ in action_lines} == set(expected_actions)
-    assert all(
-        (sha, version) == expected_actions[action]
-        for action, sha, version in action_lines
+    download_artifact = (
+        "actions/download-artifact@" "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+    )
+    app_token = (
+        "actions/create-github-app-token@"
+        "bcd2ba49218906704ab6c1aa796996da409d3eb1"
+    )
+    expected_actions = Counter(
+        {
+            checkout: 3,
+            setup_uv: 4,
+            upload_artifact: 1,
+            download_artifact: 2,
+            app_token: 1,
+        }
+    )
+    workflow_actions = Counter(
+        step["uses"]
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
+        if "uses" in step
+    )
+    assert workflow_actions == expected_actions
+    raw_action_lines = re.findall(r"(?m)^\s*uses:\s*([^\n]+)$", text)
+    assert Counter(raw_action_lines) == Counter(
+        {
+            f"{checkout} # v7.0.1": 3,
+            f"{setup_uv} # v9.0.0": 4,
+            f"{upload_artifact} # v7.0.1": 1,
+            f"{download_artifact} # v8.0.1": 2,
+            f"{app_token} # v3.2.0": 1,
+        }
     )
 
     for job in workflow["jobs"].values():
@@ -345,10 +353,10 @@ def test_release_workflow_has_safe_manual_interface_and_pins() -> None:
                 assert step["with"]["version"] == "0.11.30"
 
     assert "pull_request_target" not in text
-    secret_references = re.findall(
-        r"\$\{\{\s*secrets\.([A-Za-z0-9_]+)\s*\}\}", text
-    )
-    assert secret_references == ["CORE_RELEASE_PREFLIGHT_APP_PRIVATE_KEY"]
+    secret_expressions = re.findall(r"\$\{\{[^}]*\bsecrets\b[^}]*\}\}", text)
+    assert secret_expressions == [
+        "${{ secrets.CORE_RELEASE_PREFLIGHT_APP_PRIVATE_KEY }}"
+    ]
     for forbidden in (
         "PAT",
         "API_KEY",
@@ -635,26 +643,45 @@ def test_release_workflow_gates_immutable_draft_first_publication() -> None:
         if step.get("id") == "verify_immutable_releases"
     )
     token_expression = "${{ steps.immutable_releases_token.outputs.token }}"
+    token_expression_pattern = re.compile(
+        r"\$\{\{\s*steps\s*\.\s*immutable_releases_token\s*\.\s*"
+        r"outputs\s*\.\s*token\s*\}\}"
+    )
+    assert len(token_expression_pattern.findall(text)) == 1
     token_locations = [
-        (step.get("id"), name)
-        for step in publish_steps
+        (job_name, step.get("id"), name)
+        for job_name, job in jobs.items()
+        for step in job.get("steps", [])
         for name, value in step.get("env", {}).items()
-        if value == token_expression
+        if isinstance(value, str) and token_expression_pattern.fullmatch(value)
     ]
     assert token_locations == [
-        ("verify_immutable_releases", "IMMUTABLE_RELEASES_TOKEN")
+        (
+            "publish",
+            "verify_immutable_releases",
+            "IMMUTABLE_RELEASES_TOKEN",
+        )
     ]
-    immutable_setting_run = immutable_setting_step["run"]
     assert (
-        immutable_setting_run.count("repos/$REPOSITORY/immutable-releases")
-        == 1
+        immutable_setting_step["env"]["IMMUTABLE_RELEASES_TOKEN"]
+        == token_expression
     )
-    assert immutable_setting_run.count("gh api") == 1
-    assert "--method GET" in immutable_setting_run
-    assert "enabled" in immutable_setting_run
-    assert "set -euo pipefail" in immutable_setting_run
-    for mutation in ("POST", "PATCH", "PUT", "DELETE"):
-        assert mutation not in immutable_setting_run
+    immutable_setting_run = immutable_setting_step["run"]
+    assert immutable_setting_run == """set -euo pipefail
+immutable_state="$(
+  GH_TOKEN="$IMMUTABLE_RELEASES_TOKEN" gh api --method GET \\
+    "repos/$REPOSITORY/immutable-releases"
+)"
+IMMUTABLE_RELEASES_STATE="$immutable_state" python - <<'PY'
+import json
+import os
+
+
+state = json.loads(os.environ["IMMUTABLE_RELEASES_STATE"])
+if state.get("enabled") is not True:
+    raise SystemExit("immutable-Releases setting is not enabled")
+PY
+"""
 
     assert publish_steps.index(preflight) < publish_steps.index(token_step)
     assert publish_steps.index(token_step) < publish_steps.index(
