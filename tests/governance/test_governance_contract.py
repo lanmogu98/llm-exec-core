@@ -437,6 +437,14 @@ def test_release_workflow_builds_once_and_reuses_exact_candidate() -> None:
 
     build = jobs["build"]
     assert set(build["needs"]) == {"validate", "quality"}
+    assert set(build["outputs"]) == {
+        "wheel_filename",
+        "wheel_sha256",
+        "sdist_filename",
+        "sdist_sha256",
+        "notes_sha256",
+        "provenance_sha256",
+    }
     install = jobs["install"]
     assert set(install["needs"]) == {"validate", "build"}
     assert install["strategy"]["fail-fast"] == "false"
@@ -482,15 +490,45 @@ def test_release_workflow_builds_once_and_reuses_exact_candidate() -> None:
         "candidate/PROVENANCE.json",
     }
 
-    for job_name in ("install", "publish"):
+    integrity_steps = {
+        "install": next(
+            step
+            for step in install["steps"]
+            if step["name"] == "Verify and install selected distribution"
+        ),
+        "publish": next(
+            step
+            for step in jobs["publish"]["steps"]
+            if step.get("id") == "publish_preflight"
+        ),
+    }
+    for job_name, integrity_step in integrity_steps.items():
         steps = jobs[job_name]["steps"]
         assert any(
             step.get("uses", "").startswith("actions/download-artifact@")
             for step in steps
         )
-        run = "\n".join(step.get("run", "") for step in steps)
-        assert "sha256sum --check SHA256SUMS" in run
-        assert "exact five-file candidate set" in run
+        assert (
+            integrity_step["env"]["VERSION"]
+            == "${{ needs.validate.outputs.version }}"
+        )
+        run = integrity_step["run"]
+        assert 'f"llm_exec_core-{filename_version}-py3-none-any.whl"' in run
+        assert 'f"llm_exec_core-{filename_version}.tar.gz"' in run
+        for filename in (
+            "SHA256SUMS",
+            "RELEASE_NOTES.md",
+            "PROVENANCE.json",
+        ):
+            assert f'"{filename}"' in run
+        assert "actual_files != expected_files" in run
+        assert "len(manifest_lines) != 4" in run
+        assert 're.fullmatch(r"[0-9a-f]{64}  [^\\r\\n]+", line)' in run
+        assert "Path(filename).name != filename" in run
+        assert "filename in manifest" in run
+        assert "set(manifest) != expected_manifest_files" in run
+        assert '["sha256sum", "--check", "SHA256SUMS"]' in run
+        assert "check=True" in run
 
     install_run = "\n".join(step.get("run", "") for step in install["steps"])
     install_step = next(
@@ -546,36 +584,61 @@ def test_release_workflow_gates_immutable_draft_first_publication() -> None:
         "immutable-releases",
         "remote main",
         "git/ref/tags",
-        "releases/tags",
-        "target Release asset",
-        "sha256sum --check SHA256SUMS",
-        "exact five-file candidate set",
+        "releases?per_page=100&page=",
+        'release.get("tag_name") == target_tag',
+        "target Release asset collision",
     ):
         assert required in preflight_run
+    assert "releases/tags" not in preflight_run
+    assert preflight_run.index(
+        "releases?per_page=100&page="
+    ) < preflight_run.index("git/ref/tags")
 
-    create_draft = next(
+    create_draft_step = next(
         step for step in publish_steps if step.get("id") == "create_draft"
-    )["run"]
+    )
+    create_draft = create_draft_step["run"]
     assert "git/refs" in create_draft
-    assert "--draft" in create_draft
-    assert "--notes-file" in create_draft
+    assert 'gh api --method POST "repos/$REPOSITORY/releases"' in create_draft
+    assert "-F draft=true" in create_draft
+    assert "release_id=" in create_draft
+    assert "release_id=$release_id" in create_draft
+    assert "GITHUB_OUTPUT" in create_draft
+    assert "gh release create" not in create_draft
     assert "--clobber" not in create_draft
 
-    verify_draft = next(
+    verify_draft_step = next(
         step for step in publish_steps if step.get("id") == "verify_draft"
-    )["run"]
+    )
+    assert (
+        verify_draft_step["env"]["RELEASE_ID"]
+        == "${{ steps.create_draft.outputs.release_id }}"
+    )
+    verify_draft = verify_draft_step["run"]
     for required in (
         "draft",
         "RELEASE_NOTES.md",
         "asset names",
         "digest",
+        "releases/{release_id}",
     ):
         assert required in verify_draft
+    assert "releases/tags" not in verify_draft
 
-    publish_release = next(
+    publish_release_step = next(
         step for step in publish_steps if step.get("id") == "publish_release"
-    )["run"]
-    assert "--draft=false" in publish_release
+    )
+    assert (
+        publish_release_step["env"]["RELEASE_ID"]
+        == "${{ steps.create_draft.outputs.release_id }}"
+    )
+    publish_release = publish_release_step["run"]
+    expected_publish_api = (
+        'gh api --method PATCH "repos/$REPOSITORY/releases/$RELEASE_ID"'
+    )
+    assert expected_publish_api in publish_release
+    assert "-F draft=false" in publish_release
+    assert "gh release edit" not in publish_release
     verify_public = next(
         step for step in publish_steps if step.get("id") == "verify_public"
     )["run"]
@@ -585,6 +648,7 @@ def test_release_workflow_gates_immutable_draft_first_publication() -> None:
         "asset names",
         "digest",
         "time.sleep",
+        "releases/tags/{encoded_tag}",
     ):
         assert required in verify_public
 
@@ -597,9 +661,46 @@ def test_release_workflow_gates_immutable_draft_first_publication() -> None:
         "install",
         "publish",
     }
-    summary_run = "\n".join(step.get("run", "") for step in summary["steps"])
+    summary_step = summary["steps"][0]
+    assert summary_step["env"]["RAW_VERSION"] == "${{ inputs.version }}"
+    assert summary_step["env"]["DISPATCHED_SHA"] == "${{ github.sha }}"
+    assert summary_step["env"]["DISPATCHED_REF"] == "${{ github.ref }}"
+    assert (
+        summary_step["env"]["VALIDATED_VERSION"]
+        == "${{ needs.validate.outputs.version }}"
+    )
+    assert (
+        summary_step["env"]["WHEEL_FILENAME"]
+        == "${{ needs.build.outputs.wheel_filename }}"
+    )
+    assert (
+        summary_step["env"]["WHEEL_SHA256"]
+        == "${{ needs.build.outputs.wheel_sha256 }}"
+    )
+    summary_run = summary_step["run"]
     assert "publish blocked" in summary_run
     assert "validation" in summary_run
+    assert "Requested version/tag" in summary_run
+    assert "Dispatched commit/ref" in summary_run
+    assert "Validated identity: unavailable" in summary_run
+    assert 'if [[ "$BUILD_STATE" == "success" ]]' in summary_run
+    assert "Candidate: not produced" in summary_run
+    assert 'if [[ "$INSTALL_STATE" == "success" ]]' in summary_run
+    assert "Consumer checksum verification: complete" in summary_run
+    assert "Consumer checksum verification: incomplete" in summary_run
+
+    build_branch = summary_run.split(
+        'if [[ "$BUILD_STATE" == "success" ]]', 1
+    )[1]
+    assert build_branch.index("$WHEEL_FILENAME") < build_branch.index(
+        "Candidate: not produced"
+    )
+    install_branch = summary_run.split(
+        'if [[ "$INSTALL_STATE" == "success" ]]', 1
+    )[1]
+    assert install_branch.index(
+        "Consumer checksum verification: complete"
+    ) < install_branch.index("Consumer checksum verification: incomplete")
 
 
 def test_release_runbook_documents_owner_gates_and_recovery() -> None:
@@ -628,6 +729,9 @@ def test_release_runbook_documents_owner_gates_and_recovery() -> None:
         "never rewrite",
         "new version",
         "`setuptools>=64`",
+        "Administration: read",
+        "cannot currently authorize",
+        "published-only",
     ):
         assert required in text
 

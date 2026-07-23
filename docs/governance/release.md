@@ -16,11 +16,15 @@ version must match `pyproject.toml`, the AST-read package `__version__`, the
 editable root in `uv.lock`, the no-`v` tag, and both built distributions and
 their metadata.
 
-Tag, Release, and target-Release asset collisions are read without mutation.
-In `dry_run=true`, collisions are reported as `publish blocked` while all safe
-validation continues. The existing `0.4.1` tag/Release state is the expected
-safe collision fixture. In publish mode, any collision stops before mutation;
-API failures also fail closed.
+Tag, published Release, and target-Release asset collisions are read without
+mutation. The read-only validation job uses GitHub's published-only by-tag
+endpoint, which is sufficient for the existing `0.4.1` dry-run collision
+fixture but does not claim to discover drafts. In `dry_run=true`, collisions
+are reported as `publish blocked` while all safe validation continues. Before
+any future publish mutation, the write-authorized job separately paginates all
+Releases and rejects an exact matching `tag_name`, including a draft. In
+publish mode, any collision stops before mutation; API failures also fail
+closed.
 
 ## Candidate flow and assets
 
@@ -37,9 +41,12 @@ The exact workflow artifact and future Release asset set is:
 4. `RELEASE_NOTES.md`; and
 5. `PROVENANCE.json`.
 
-Every consumer verifies `SHA256SUMS`. Release notes come deterministically from
-the matching changelog section and previous reachable tag range. Provenance
-records the exact source, workflow/run, actor, and distribution checksums.
+Every consumer first requires exact basename-set equality, then parses
+`SHA256SUMS` as exactly four unique, lower-case SHA-256 records for the four
+non-manifest basenames, rejecting traversal, duplicates, and extras before
+running the checksum tool. Release notes come deterministically from the
+matching changelog section and previous reachable tag range. Provenance records
+the exact source, workflow/run, actor, and distribution checksums.
 
 ## Separate owner gates
 
@@ -52,9 +59,22 @@ separately. Issue #39 creates no stable Release.
 Only the publication job has `contents: write`. Immediately before mutation it
 rechecks both actors, remote `main`, the immutable Releases setting,
 collisions, checksums, and the exact five files. It then creates the no-`v` tag
-and an incomplete draft, uploads without clobbering, verifies the draft body,
-asset names, and digests, publishes only when complete, and reads back the
-public tag target, assets, digests, and immutability.
+and an incomplete draft through REST, captures its numeric release ID, uploads
+without clobbering, verifies the draft by ID, publishes that same ID only when
+complete, and reserves the by-tag endpoint for public readback of the tag
+target, assets, digests, and immutability.
+
+## Known publication blocker
+
+The immutable-Releases repository endpoint requires `Administration: read`.
+The accepted no-secret contract supplies only `GITHUB_TOKEN`, whose Actions
+permission model cannot currently authorize that repository administration
+read. The required preflight therefore remains fail closed and a publish run
+cannot currently pass it, even when an owner has enabled immutable Releases.
+This task does not add a PAT, App token, secret, Action, or broader permission,
+and it does not remove or weaken the preflight. The credential contract must be
+resolved through a separately accepted owner decision before any publication
+attempt; dry-run validation remains the permitted operational path.
 
 ## Failure and recovery
 

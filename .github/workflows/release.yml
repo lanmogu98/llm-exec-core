@@ -265,6 +265,13 @@ jobs:
   build:
     needs: [validate, quality]
     runs-on: ubuntu-latest
+    outputs:
+      wheel_filename: ${{ steps.assemble_candidate.outputs.wheel_filename }}
+      wheel_sha256: ${{ steps.assemble_candidate.outputs.wheel_sha256 }}
+      sdist_filename: ${{ steps.assemble_candidate.outputs.sdist_filename }}
+      sdist_sha256: ${{ steps.assemble_candidate.outputs.sdist_sha256 }}
+      notes_sha256: ${{ steps.assemble_candidate.outputs.notes_sha256 }}
+      provenance_sha256: ${{ steps.assemble_candidate.outputs.provenance_sha256 }}
     steps:
       - name: Check out exact validated commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -284,6 +291,7 @@ jobs:
         run: |
           uv build
       - name: Validate distributions and assemble candidate
+        id: assemble_candidate
         env:
           VERSION: ${{ needs.validate.outputs.version }}
           TARGET_TAG: ${{ needs.validate.outputs.tag }}
@@ -497,6 +505,25 @@ jobs:
           }
           if actual_files != expected_files:
               raise SystemExit("candidate is not the exact five-file candidate set")
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open(
+              "a", encoding="utf-8"
+          ) as output:
+              print(f"wheel_filename={candidate_wheel.name}", file=output)
+              print(
+                  f"wheel_sha256={sha256(candidate_wheel)}",
+                  file=output,
+              )
+              print(f"sdist_filename={candidate_sdist.name}", file=output)
+              print(
+                  f"sdist_sha256={sha256(candidate_sdist)}",
+                  file=output,
+              )
+              print(f"notes_sha256={sha256(notes_path)}", file=output)
+              print(
+                  f"provenance_sha256={sha256(provenance_path)}",
+                  file=output,
+              )
           PY
       - name: Upload exact release candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -538,17 +565,58 @@ jobs:
           PYTHON_VERSION: ${{ matrix.python-version }}
           DISTRIBUTION: ${{ matrix.distribution }}
           EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+
+          candidate = Path(os.environ["CANDIDATE_DIR"])
+          filename_version = re.sub(r"[^\w\d.]+", "_", os.environ["VERSION"])
+          expected_files = {
+              f"llm_exec_core-{filename_version}-py3-none-any.whl",
+              f"llm_exec_core-{filename_version}.tar.gz",
+              "SHA256SUMS",
+              "RELEASE_NOTES.md",
+              "PROVENANCE.json",
+          }
+          entries = list(candidate.iterdir())
+          actual_files = {path.name for path in entries}
+          if (
+              actual_files != expected_files
+              or any(not path.is_file() or path.is_symlink() for path in entries)
+          ):
+              raise SystemExit("candidate is not the exact five-file set")
+
+          manifest_lines = (candidate / "SHA256SUMS").read_text().splitlines()
+          if len(manifest_lines) != 4:
+              raise SystemExit("SHA256SUMS must have exactly four records")
+          manifest = {}
+          for line in manifest_lines:
+              if re.fullmatch(r"[0-9a-f]{64}  [^\r\n]+", line) is None:
+                  raise SystemExit("invalid SHA256SUMS record")
+              digest, filename = line.split("  ", 1)
+              if (
+                  Path(filename).name != filename
+                  or filename in {".", ".."}
+                  or filename in manifest
+              ):
+                  raise SystemExit("unsafe or duplicate SHA256SUMS filename")
+              manifest[filename] = digest
+          expected_manifest_files = expected_files - {"SHA256SUMS"}
+          if set(manifest) != expected_manifest_files:
+              raise SystemExit("SHA256SUMS file set does not match candidate")
+          subprocess.run(
+              ["sha256sum", "--check", "SHA256SUMS"],
+              cwd=candidate,
+              check=True,
+          )
+          PY
           cd "$CANDIDATE_DIR"
-          sha256sum --check SHA256SUMS
-          wheel_count="$(find . -maxdepth 1 -type f -name '*.whl' | wc -l)"
-          sdist_count="$(find . -maxdepth 1 -type f -name '*.tar.gz' | wc -l)"
-          file_count="$(find . -maxdepth 1 -type f | wc -l)"
-          if [[ "$wheel_count" -ne 1 || "$sdist_count" -ne 1 || "$file_count" -ne 5 ]]; then
-            echo "candidate is not the exact five-file candidate set" >&2
-            exit 1
-          fi
           wheel="$(find . -maxdepth 1 -type f -name '*.whl')"
           sdist="$(find . -maxdepth 1 -type f -name '*.tar.gz')"
           if [[ "$DISTRIBUTION" == "wheel" ]]; then
@@ -588,6 +656,7 @@ jobs:
         env:
           ORIGINAL_ACTOR: ${{ github.actor }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          VERSION: ${{ needs.validate.outputs.version }}
           EXPECTED_SHA: ${{ needs.validate.outputs.expected_sha }}
           TARGET_TAG: ${{ needs.validate.outputs.tag }}
           REPOSITORY: ${{ github.repository }}
@@ -599,18 +668,12 @@ jobs:
             echo "original and triggering actors must both be lanmogu98" >&2
             exit 1
           fi
-          cd "$CANDIDATE_DIR"
-          sha256sum --check SHA256SUMS
-          wheel_count="$(find . -maxdepth 1 -type f -name '*.whl' | wc -l)"
-          sdist_count="$(find . -maxdepth 1 -type f -name '*.tar.gz' | wc -l)"
-          file_count="$(find . -maxdepth 1 -type f | wc -l)"
-          if [[ "$wheel_count" -ne 1 || "$sdist_count" -ne 1 || "$file_count" -ne 5 ]]; then
-            echo "candidate is not the exact five-file candidate set" >&2
-            exit 1
-          fi
           python - <<'PY'
           import json
           import os
+          from pathlib import Path
+          import re
+          import subprocess
           from urllib.error import HTTPError, URLError
           from urllib.parse import quote
           from urllib.request import Request, urlopen
@@ -642,6 +705,47 @@ jobs:
                   fail(f"GitHub API failed closed: {exc.reason}")
 
 
+          candidate = Path(os.environ["CANDIDATE_DIR"])
+          filename_version = re.sub(r"[^\w\d.]+", "_", os.environ["VERSION"])
+          expected_files = {
+              f"llm_exec_core-{filename_version}-py3-none-any.whl",
+              f"llm_exec_core-{filename_version}.tar.gz",
+              "SHA256SUMS",
+              "RELEASE_NOTES.md",
+              "PROVENANCE.json",
+          }
+          entries = list(candidate.iterdir())
+          actual_files = {path.name for path in entries}
+          if (
+              actual_files != expected_files
+              or any(not path.is_file() or path.is_symlink() for path in entries)
+          ):
+              fail("candidate is not the exact five-file set")
+
+          manifest_lines = (candidate / "SHA256SUMS").read_text().splitlines()
+          if len(manifest_lines) != 4:
+              fail("SHA256SUMS must have exactly four records")
+          manifest = {}
+          for line in manifest_lines:
+              if re.fullmatch(r"[0-9a-f]{64}  [^\r\n]+", line) is None:
+                  fail("invalid SHA256SUMS record")
+              digest, filename = line.split("  ", 1)
+              if (
+                  Path(filename).name != filename
+                  or filename in {".", ".."}
+                  or filename in manifest
+              ):
+                  fail("unsafe or duplicate SHA256SUMS filename")
+              manifest[filename] = digest
+          expected_manifest_files = expected_files - {"SHA256SUMS"}
+          if set(manifest) != expected_manifest_files:
+              fail("SHA256SUMS file set does not match candidate")
+          subprocess.run(
+              ["sha256sum", "--check", "SHA256SUMS"],
+              cwd=candidate,
+              check=True,
+          )
+
           repository = os.environ["REPOSITORY"]
           expected_sha = os.environ["EXPECTED_SHA"]
           target_tag = os.environ["TARGET_TAG"]
@@ -662,20 +766,29 @@ jobs:
           if not immutable_enabled:
               fail("immutable-releases setting is not enabled")
 
+          page = 1
+          while True:
+              releases = github_api(
+                  f"repos/{repository}/releases?per_page=100&page={page}"
+              )
+              if not isinstance(releases, list):
+                  fail("release listing did not return a list")
+              for release in releases:
+                  if release.get("tag_name") == target_tag:
+                      if release.get("assets"):
+                          fail("target Release asset collision detected")
+                      state = "draft" if release.get("draft") else "published"
+                      fail(f"exact target Release collision detected ({state})")
+              if len(releases) < 100:
+                  break
+              page += 1
+
           tag_state = github_api(
               f"repos/{repository}/git/ref/tags/{encoded_tag}",
               allow_404=True,
           )
           if tag_state is not None:
               fail("exact target tag collision detected")
-          release_state = github_api(
-              f"repos/{repository}/releases/tags/{encoded_tag}",
-              allow_404=True,
-          )
-          if release_state is not None:
-              if release_state.get("assets"):
-                  fail("target Release asset collision detected")
-              fail("exact target Release collision detected")
           PY
       - name: Create exact tag, draft Release, and assets
         id: create_draft
@@ -690,12 +803,21 @@ jobs:
           gh api --method POST "repos/$REPOSITORY/git/refs" \
             -f ref="refs/tags/$TARGET_TAG" \
             -f sha="$EXPECTED_SHA"
-          gh release create "$TARGET_TAG" \
-            --repo "$REPOSITORY" \
-            --draft \
-            --title "$TARGET_TAG" \
-            --notes-file "$CANDIDATE_DIR/RELEASE_NOTES.md" \
-            --verify-tag
+          release_id="$(
+            gh api --method POST "repos/$REPOSITORY/releases" \
+              -f tag_name="$TARGET_TAG" \
+              -f target_commitish="$EXPECTED_SHA" \
+              -f name="$TARGET_TAG" \
+              -F body=@"$CANDIDATE_DIR/RELEASE_NOTES.md" \
+              -F draft=true \
+              -F prerelease=false \
+              --jq '.id'
+          )"
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "draft creation did not return a numeric release ID" >&2
+            exit 1
+          fi
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
           gh release upload "$TARGET_TAG" \
             "$CANDIDATE_DIR"/*.whl \
             "$CANDIDATE_DIR"/*.tar.gz \
@@ -708,6 +830,7 @@ jobs:
         env:
           REPOSITORY: ${{ github.repository }}
           TARGET_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_ID: ${{ steps.create_draft.outputs.release_id }}
           CANDIDATE_DIR: ${{ runner.temp }}/release-candidate
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -716,7 +839,6 @@ jobs:
           import json
           import os
           from pathlib import Path
-          from urllib.parse import quote
           from urllib.request import Request, urlopen
 
 
@@ -726,12 +848,12 @@ jobs:
 
           repository = os.environ["REPOSITORY"]
           target_tag = os.environ["TARGET_TAG"]
+          release_id = os.environ["RELEASE_ID"]
+          if not release_id.isdigit():
+              raise SystemExit("draft release ID is not numeric")
           candidate = Path(os.environ["CANDIDATE_DIR"])
           request = Request(
-              (
-                  f"https://api.github.com/repos/{repository}/releases/tags/"
-                  f"{quote(target_tag, safe='')}"
-              ),
+              f"https://api.github.com/repos/{repository}/releases/{release_id}",
               headers={
                   "Accept": "application/vnd.github+json",
                   "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
@@ -743,6 +865,10 @@ jobs:
               release = json.load(response)
           if release.get("draft") is not True:
               raise SystemExit("Release is not an unpublished draft")
+          if release.get("id") != int(release_id):
+              raise SystemExit("draft release ID does not match")
+          if release.get("tag_name") != target_tag:
+              raise SystemExit("draft tag does not match target")
           notes = (candidate / "RELEASE_NOTES.md").read_text()
           if release.get("body") != notes:
               raise SystemExit("draft body does not match RELEASE_NOTES.md")
@@ -768,12 +894,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          TARGET_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_ID: ${{ steps.create_draft.outputs.release_id }}
         run: |
-          gh release edit "$TARGET_TAG" \
-            --repo "$REPOSITORY" \
-            --draft=false \
-            --latest=false
+          set -euo pipefail
+          if [[ ! "$RELEASE_ID" =~ ^[0-9]+$ ]]; then
+            echo "draft release ID is not numeric" >&2
+            exit 1
+          fi
+          gh api --method PATCH "repos/$REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false \
+            -f make_latest=false \
+            --silent
       - name: Verify immutable public Release
         id: verify_public
         env:
@@ -861,10 +992,12 @@ jobs:
       - name: Write release validation summary
         env:
           DRY_RUN: ${{ inputs.dry_run }}
-          VERSION: ${{ needs.validate.outputs.version }}
-          TARGET_TAG: ${{ needs.validate.outputs.tag }}
-          EXPECTED_SHA: ${{ needs.validate.outputs.expected_sha }}
-          SOURCE_REF: ${{ github.ref }}
+          RAW_VERSION: ${{ inputs.version }}
+          DISPATCHED_SHA: ${{ github.sha }}
+          DISPATCHED_REF: ${{ github.ref }}
+          VALIDATED_VERSION: ${{ needs.validate.outputs.version }}
+          VALIDATED_TAG: ${{ needs.validate.outputs.tag }}
+          VALIDATED_SHA: ${{ needs.validate.outputs.expected_sha }}
           VALIDATION_STATE: ${{ needs.validate.result }}
           QUALITY_STATE: ${{ needs.quality.result }}
           BUILD_STATE: ${{ needs.build.result }}
@@ -873,6 +1006,12 @@ jobs:
           PUBLISH_BLOCKED: ${{ needs.validate.outputs.publish_blocked }}
           COLLISION_REPORT: ${{ needs.validate.outputs.collision_report }}
           ARTIFACT_NAME: ${{ needs.validate.outputs.artifact_name }}
+          WHEEL_FILENAME: ${{ needs.build.outputs.wheel_filename }}
+          WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
+          SDIST_FILENAME: ${{ needs.build.outputs.sdist_filename }}
+          SDIST_SHA256: ${{ needs.build.outputs.sdist_sha256 }}
+          NOTES_SHA256: ${{ needs.build.outputs.notes_sha256 }}
+          PROVENANCE_SHA256: ${{ needs.build.outputs.provenance_sha256 }}
           RELEASE_URL: ${{ needs.publish.outputs.release_url }}
           SERVER_URL: ${{ github.server_url }}
           REPOSITORY: ${{ github.repository }}
@@ -889,16 +1028,35 @@ jobs:
             fi
           fi
           workflow_url="$SERVER_URL/$REPOSITORY/actions/runs/$RUN_ID"
+          collision_result="${COLLISION_REPORT:-unavailable}"
           {
             echo "## Release workflow summary"
-            echo "- Version/tag: \`$VERSION\` / \`$TARGET_TAG\`"
-            echo "- Commit/ref: \`$EXPECTED_SHA\` / \`$SOURCE_REF\`"
+            echo "- Requested version/tag: \`$RAW_VERSION\` / \`$RAW_VERSION\`"
+            echo "- Dispatched commit/ref: \`$DISPATCHED_SHA\` / \`$DISPATCHED_REF\`"
+            if [[ -n "$VALIDATED_VERSION" && -n "$VALIDATED_SHA" ]]; then
+              echo "- Validated identity: \`$VALIDATED_VERSION\` / \`$VALIDATED_TAG\` at \`$VALIDATED_SHA\`"
+            else
+              echo "- Validated identity: unavailable"
+            fi
             echo "- Mode: \`$mode\`"
             echo "- validation: \`$VALIDATION_STATE\`"
             echo "- Quality/build/install: \`$QUALITY_STATE\` / \`$BUILD_STATE\` / \`$INSTALL_STATE\`"
             echo "- Publication: \`$publish_result\`"
-            echo "- Collisions: \`$COLLISION_REPORT\`"
-            echo "- Candidate artifact: \`$ARTIFACT_NAME\` (SHA256SUMS verified by consumers)"
+            echo "- Collisions: \`$collision_result\`"
+            if [[ "$BUILD_STATE" == "success" ]]; then
+              echo "- Candidate artifact: \`$ARTIFACT_NAME\`"
+              echo "- Wheel: \`$WHEEL_FILENAME\` — \`$WHEEL_SHA256\`"
+              echo "- Sdist: \`$SDIST_FILENAME\` — \`$SDIST_SHA256\`"
+              echo "- RELEASE_NOTES.md: \`$NOTES_SHA256\`"
+              echo "- PROVENANCE.json: \`$PROVENANCE_SHA256\`"
+            else
+              echo "- Candidate: not produced"
+            fi
+            if [[ "$INSTALL_STATE" == "success" ]]; then
+              echo "- Consumer checksum verification: complete"
+            else
+              echo "- Consumer checksum verification: incomplete"
+            fi
             echo "- Workflow: $workflow_url"
             if [[ -n "$RELEASE_URL" ]]; then
               echo "- Release: $RELEASE_URL"
