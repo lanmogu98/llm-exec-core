@@ -622,11 +622,16 @@ def test_release_workflow_gates_immutable_draft_first_publication() -> None:
     ) < preflight_run.index("git/ref/tags")
     assert "immutable-releases" not in preflight_run
 
-    token_step = next(
-        step
-        for step in publish_steps
-        if step.get("id") == "immutable_releases_token"
-    )
+    token_step_id = "immutable_releases_token"
+    token_step_definitions = [
+        (job_name, step)
+        for job_name, job in jobs.items()
+        for step in job.get("steps", [])
+        if step.get("id") == token_step_id
+    ]
+    assert len(token_step_definitions) == 1
+    assert token_step_definitions[0][0] == "publish"
+    token_step = token_step_definitions[0][1]
     assert token_step["uses"] == (
         "actions/create-github-app-token@"
         "bcd2ba49218906704ab6c1aa796996da409d3eb1"
@@ -647,6 +652,7 @@ def test_release_workflow_gates_immutable_draft_first_publication() -> None:
         r"\$\{\{\s*steps\s*\.\s*immutable_releases_token\s*\.\s*"
         r"outputs\s*\.\s*token\s*\}\}"
     )
+    assert text.count(token_step_id) == 2
     assert len(token_expression_pattern.findall(text)) == 1
     token_locations = [
         (job_name, step.get("id"), name)
@@ -667,6 +673,7 @@ def test_release_workflow_gates_immutable_draft_first_publication() -> None:
         == token_expression
     )
     immutable_setting_run = immutable_setting_step["run"]
+    assert text.count("IMMUTABLE_RELEASES_TOKEN") == 2
     assert immutable_setting_run == """set -euo pipefail
 immutable_state="$(
   GH_TOKEN="$IMMUTABLE_RELEASES_TOKEN" gh api --method GET \\
