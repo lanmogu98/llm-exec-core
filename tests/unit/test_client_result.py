@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import math
 from copy import deepcopy
 from dataclasses import asdict
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,6 +13,7 @@ from pydantic import ValidationError
 import llm_exec_core.client as client_module
 import llm_exec_core.config as config_module
 from llm_exec_core.client import LLMClient
+from llm_exec_core.usage import format_usage_report
 
 USAGE_FIELD_MISSING = object()
 
@@ -1234,6 +1236,192 @@ async def test_rich_mixed_currency_preserves_result_and_marks_aggregate_cost(
     }
     assert len(aggregate["requests"]) == 2
     assert all("currency" not in request for request in aggregate["requests"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "cache_mode",
+        "usage_accounting",
+        "rates",
+        "usage",
+        "later_usage",
+        "expected_costs",
+    ),
+    [
+        pytest.param(
+            "none",
+            "openai-chat-standard-v1",
+            {"input": 0.9, "output": 0.0},
+            _openai_usage(prompt_tokens=10**308, completion_tokens=0),
+            _openai_usage(prompt_tokens=1, completion_tokens=0),
+            (9e307, 0.0, 9e307),
+            id="ordinary-input",
+        ),
+        pytest.param(
+            "none",
+            "openai-chat-standard-v1",
+            {"input": 0.0, "output": 0.9},
+            _openai_usage(prompt_tokens=1, completion_tokens=10**308),
+            _openai_usage(prompt_tokens=1, completion_tokens=1),
+            (0.0, 9e307, 9e307),
+            id="output",
+        ),
+        pytest.param(
+            "implicit",
+            "openai-chat-cached-tokens-v1",
+            {"input": 0.0, "output": 0.0, "cache_read_input": 0.9},
+            _openai_usage(
+                prompt_tokens=10**308,
+                completion_tokens=0,
+                prompt_tokens_details={"cached_tokens": 10**308},
+            ),
+            _openai_usage(
+                prompt_tokens=1,
+                completion_tokens=0,
+                prompt_tokens_details={"cached_tokens": 1},
+            ),
+            (9e307, 0.0, 9e307),
+            id="cache-read",
+        ),
+        pytest.param(
+            "explicit",
+            "openai-chat-cache-creation-v1",
+            {
+                "input": 0.0,
+                "output": 0.0,
+                "cache_read_input": 0.0,
+                "cache_write_input": 0.9,
+            },
+            _openai_usage(
+                prompt_tokens=10**308,
+                completion_tokens=0,
+                prompt_tokens_details={
+                    "cached_tokens": 0,
+                    "cache_creation_input_tokens": 10**308,
+                },
+            ),
+            _openai_usage(
+                prompt_tokens=1,
+                completion_tokens=0,
+                prompt_tokens_details={
+                    "cached_tokens": 0,
+                    "cache_creation_input_tokens": 1,
+                },
+            ),
+            (9e307, 0.0, 9e307),
+            id="cache-write",
+        ),
+        pytest.param(
+            "none",
+            "openai-chat-standard-v1",
+            {"input": 0.45, "output": 0.45},
+            _openai_usage(
+                prompt_tokens=10**308,
+                completion_tokens=10**308,
+            ),
+            _openai_usage(prompt_tokens=1, completion_tokens=1),
+            (4.5e307, 4.5e307, 9e307),
+            id="total-only",
+        ),
+    ],
+)
+async def test_rich_aggregate_non_finite_cost_stays_unavailable(
+    monkeypatch,
+    cache_mode,
+    usage_accounting,
+    rates,
+    usage,
+    later_usage,
+    expected_costs,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    rule = _rich_client_rule(
+        cache_mode=cache_mode,
+        cache_read_input=rates.get("cache_read_input", USAGE_FIELD_MISSING),
+        cache_write_input=rates.get("cache_write_input", USAGE_FIELD_MISSING),
+    )
+    rule["unit_tokens"] = 1
+    rule["rates"]["input"] = rates["input"]
+    rule["rates"]["output"] = rates["output"]
+    config = _rich_client_config(
+        [rule],
+        usage_accounting=usage_accounting,
+    )
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.side_effect = [
+            _http_response(usage),
+            _http_response(usage),
+            _http_response(later_usage),
+        ]
+        mock_cls.return_value = mock_httpx_client
+        client = LLMClient(
+            "test-model",
+            config_source=config,
+            pricing_context=_rich_client_context(cache_mode),
+        )
+        first = await client.generate("first", request_name="first")
+        second = await client.generate("second", request_name="second")
+        later = await client.generate("later", request_name="later")
+
+    for result in (first, second):
+        assert result.text == "ok"
+        assert (
+            result.usage.input_cost,
+            result.usage.output_cost,
+            result.usage.total_cost,
+        ) == pytest.approx(expected_costs)
+        assert result.usage.currency == "USD"
+        assert result.usage.accounting.tokens_available is True
+        assert result.usage.accounting.cost_available is True
+        assert result.usage.accounting.reason is None
+    assert later.text == "ok"
+    assert later.usage.currency == "USD"
+    assert later.usage.accounting.tokens_available is True
+    assert later.usage.accounting.cost_available is True
+    assert later.usage.accounting.reason is None
+
+    aggregate = client.get_token_usage()
+    assert aggregate["total_input_tokens"] == (
+        usage["prompt_tokens"] * 2 + later_usage["prompt_tokens"]
+    )
+    assert aggregate["total_output_tokens"] == (
+        usage["completion_tokens"] * 2 + later_usage["completion_tokens"]
+    )
+    assert aggregate["cost"] == {
+        "input_cost": None,
+        "output_cost": None,
+        "total_cost": None,
+    }
+    assert aggregate["accounting"] == {
+        "tokens_available": True,
+        "cost_available": False,
+        "reason": "calculation_failure",
+    }
+    assert client.pricing_currency is None
+    assert len(aggregate["requests"]) == 3
+    assert all(
+        math.isfinite(request[field_name])
+        for request in aggregate["requests"]
+        for field_name in ("input_cost", "output_cost", "total_cost")
+    )
+    assert all(
+        "accounting" not in request for request in aggregate["requests"]
+    )
+    json.dumps(aggregate, allow_nan=False)
+    report = format_usage_report(
+        project_name="Aggregate Overflow",
+        model="provider-model-id",
+        model_name="test-model",
+        pricing_currency=client.pricing_currency,
+        token_usage=aggregate,
+    )
+    assert "  Input Cost: N/A" in report
+    assert "  Output Cost: N/A" in report
+    assert "  Total Cost: N/A" in report
+    assert "inf" not in report.lower()
 
 
 @pytest.mark.asyncio

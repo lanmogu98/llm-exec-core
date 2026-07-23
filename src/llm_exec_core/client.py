@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from collections import OrderedDict, deque
@@ -1813,11 +1814,28 @@ class LLMClient:
             and request_cost_available
             and not currency_conflict
         )
+        aggregate_calculation_failure = False
         if aggregate_cost_available:
             aggregate_input_cost = previous_cost["input_cost"] + input_cost
             aggregate_output_cost = previous_cost["output_cost"] + output_cost
             aggregate_total_cost = previous_cost["total_cost"] + total_cost
-            if self._usage_currency is None:
+            aggregate_calculation_failure = isinstance(
+                self.pricing, PricingSchedule
+            ) and not all(
+                math.isfinite(cost)
+                for cost in (
+                    aggregate_input_cost,
+                    aggregate_output_cost,
+                    aggregate_total_cost,
+                )
+            )
+            if aggregate_calculation_failure:
+                aggregate_cost_available = False
+                aggregate_input_cost = None
+                aggregate_output_cost = None
+                aggregate_total_cost = None
+                self._usage_currency = None
+            elif self._usage_currency is None:
                 self._usage_currency = request_currency
         else:
             aggregate_input_cost = None
@@ -1836,6 +1854,8 @@ class LLMClient:
             aggregate_reason = prior_accounting.get("reason")
         elif currency_conflict:
             aggregate_reason = "aggregate_currency_conflict"
+        elif aggregate_calculation_failure:
+            aggregate_reason = "calculation_failure"
         else:
             aggregate_reason = status.reason
         aggregate_status = AccountingStatus(
