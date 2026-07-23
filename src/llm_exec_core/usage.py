@@ -19,20 +19,42 @@ def _as_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _integer_text(value: Any) -> str:
+    if value is None:
+        return "N/A"
+    return str(_as_int(value))
+
+
+def _cost_text(pricing_currency: str | None, value: Any) -> str:
+    if value is None or pricing_currency is None:
+        return "N/A"
+    return f"{pricing_currency}{_as_number(value):.6f}"
+
+
 def format_usage_report(
     project_name: str,
     model: str,
     model_name: str,
-    pricing_currency: str,
+    pricing_currency: str | None,
     token_usage: Dict[str, Any],
     timestamp: str | None = None,
 ) -> str:
     """Return the human-readable token usage report as text only."""
 
     generated_at = timestamp or "N/A"
-    total_input_tokens = _as_int(token_usage.get("total_input_tokens"))
-    total_output_tokens = _as_int(token_usage.get("total_output_tokens"))
-    total_tokens = total_input_tokens + total_output_tokens
+    raw_input_tokens = token_usage.get("total_input_tokens", 0)
+    raw_output_tokens = token_usage.get("total_output_tokens", 0)
+    total_input_tokens = (
+        None if raw_input_tokens is None else _as_int(raw_input_tokens)
+    )
+    total_output_tokens = (
+        None if raw_output_tokens is None else _as_int(raw_output_tokens)
+    )
+    total_tokens = (
+        None
+        if total_input_tokens is None or total_output_tokens is None
+        else total_input_tokens + total_output_tokens
+    )
 
     process_times = token_usage.get("process_times", {})
     if not isinstance(process_times, dict):
@@ -42,9 +64,6 @@ def format_usage_report(
     cost = token_usage.get("cost", {})
     if not isinstance(cost, dict):
         cost = {}
-    input_cost = _as_number(cost.get("input_cost"))
-    output_cost = _as_number(cost.get("output_cost"))
-    total_cost = _as_number(cost.get("total_cost"))
 
     lines = [
         f"Token Usage Report for {project_name}",
@@ -52,13 +71,16 @@ def format_usage_report(
         f"Model: {model} ({model_name})",
         "",
         "Summary:",
-        f"  Total Input Tokens: {total_input_tokens}",
-        f"  Total Output Tokens: {total_output_tokens}",
-        f"  Total Tokens: {total_tokens}",
+        f"  Total Input Tokens: {_integer_text(total_input_tokens)}",
+        f"  Total Output Tokens: {_integer_text(total_output_tokens)}",
+        f"  Total Tokens: {_integer_text(total_tokens)}",
         f"  Total Process Time: {total_process_time:.2f} seconds",
-        f"  Input Cost: {pricing_currency}{input_cost:.6f}",
-        f"  Output Cost: {pricing_currency}{output_cost:.6f}",
-        f"  Total Cost: {pricing_currency}{total_cost:.6f}",
+        "  Input Cost: "
+        f"{_cost_text(pricing_currency, cost.get('input_cost', 0.0))}",
+        "  Output Cost: "
+        f"{_cost_text(pricing_currency, cost.get('output_cost', 0.0))}",
+        "  Total Cost: "
+        f"{_cost_text(pricing_currency, cost.get('total_cost', 0.0))}",
         "",
         "Detailed Usage by Request:",
     ]
@@ -73,28 +95,37 @@ def format_usage_report(
             output_request_cost = request.get("output_cost", 0.0)
             total_request_cost = request.get("total_cost", 0.0)
             process_time = request.get("process_time", 0.0)
-            input_cost_text = _as_number(request_cost)
-            output_cost_text = _as_number(output_request_cost)
-            total_cost_text = _as_number(total_request_cost)
-
+            request_currency = request.get("currency", pricing_currency)
+            if not isinstance(request_currency, str):
+                request_currency = None
             lines.append(f"  Request {index}: {request.get('name')}")
             lines.append(f"    Timestamp: {request.get('timestamp', 'N/A')}")
-            lines.append(f"    Input Tokens: {request.get('input_tokens', 0)}")
             lines.append(
-                f"    Output Tokens: {request.get('output_tokens', 0)}"
+                "    Input Tokens: "
+                f"{_integer_text(request.get('input_tokens', 0))}"
             )
-            lines.append(f"    Total Tokens: {request.get('total_tokens', 0)}")
+            lines.append(
+                "    Output Tokens: "
+                f"{_integer_text(request.get('output_tokens', 0))}"
+            )
+            lines.append(
+                "    Total Tokens: "
+                f"{_integer_text(request.get('total_tokens', 0))}"
+            )
             lines.append(
                 f"    Process Time: {_as_number(process_time):.2f} seconds"
             )
             lines.append(
-                f"    Input Cost: {pricing_currency}{input_cost_text:.6f}"
+                "    Input Cost: "
+                f"{_cost_text(request_currency, request_cost)}"
             )
             lines.append(
-                f"    Output Cost: {pricing_currency}{output_cost_text:.6f}"
+                "    Output Cost: "
+                f"{_cost_text(request_currency, output_request_cost)}"
             )
             lines.append(
-                f"    Total Cost: {pricing_currency}{total_cost_text:.6f}"
+                "    Total Cost: "
+                f"{_cost_text(request_currency, total_request_cost)}"
             )
             lines.append("")
 

@@ -1,9 +1,15 @@
+import math
+import subprocess
+import sys
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from importlib.resources import files
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 import llm_exec_core.config as config_module
 from llm_exec_core.client import LLMClient
@@ -113,6 +119,140 @@ CUSTOM_CONFIG = {
 
 
 OMITTED = object()
+
+
+def _rich_pricing_rule(
+    *,
+    rule_id="standard-us-realtime-none",
+    cache_mode="none",
+    input_tokens_gt=0,
+    input_tokens_lte=100,
+    currency="USD",
+    request_mode="realtime",
+    effective_from="2026-07-01T00:00:00Z",
+    effective_until=None,
+    rate_type="standard",
+    cache_read_input=OMITTED,
+    cache_write_input=OMITTED,
+):
+    cache_rates = {
+        "none": (None, None),
+        "implicit": (0.5, None),
+        "explicit": (0.5, 3.0),
+    }
+    default_cache_read, default_cache_write = cache_rates[cache_mode]
+    if cache_read_input is OMITTED:
+        cache_read_input = default_cache_read
+    if cache_write_input is OMITTED:
+        cache_write_input = default_cache_write
+    return {
+        "rule_id": rule_id,
+        "billing_model_id": "provider-model-id",
+        "capability_snapshot_id": "provider-model-snapshot-2026-07-01",
+        "region": "us-east",
+        "service_scope": "global",
+        "deployment_type": "serverless",
+        "output_mode": "thinking",
+        "request_mode": request_mode,
+        "cache_mode": cache_mode,
+        "input_tokens_gt": input_tokens_gt,
+        "input_tokens_lte": input_tokens_lte,
+        "currency": currency,
+        "unit_tokens": 1_000,
+        "effective_from": effective_from,
+        "effective_until": effective_until,
+        "rate_type": rate_type,
+        "rates": {
+            "input": 2.0,
+            "output": 4.0,
+            "cache_read_input": cache_read_input,
+            "cache_write_input": cache_write_input,
+        },
+        "evidence": [
+            {
+                "url": "https://help.aliyun.com/zh/model-studio/model-pricing",
+                "retrieved_on": "2026-07-23",
+                "facts": ["Prices vary by total request input tier."],
+            }
+        ],
+    }
+
+
+def _cache_policy_for_rules(rules):
+    modes = []
+    for rule in rules:
+        cache_mode = rule["cache_mode"]
+        if cache_mode in {mode["cache_mode"] for mode in modes}:
+            continue
+        activation = {
+            "none": "not-applicable",
+            "implicit": "automatic",
+            "explicit": "request",
+        }[cache_mode]
+        modes.append({"cache_mode": cache_mode, "activation": activation})
+    support = (
+        "supported"
+        if any(mode["cache_mode"] != "none" for mode in modes)
+        else "unsupported"
+    )
+    return {
+        "support": support,
+        "modes": modes
+        or [{"cache_mode": "none", "activation": "not-applicable"}],
+        "evidence": [
+            {
+                "url": "https://example.invalid/cache-policy",
+                "retrieved_on": "2026-07-23",
+                "facts": ["Synthetic offline cache-policy evidence."],
+            }
+        ],
+    }
+
+
+def _usage_profile_for_rules(rules):
+    if any(rule["rates"]["cache_write_input"] is not None for rule in rules):
+        return "openai-chat-cache-creation-v1"
+    if any(rule["cache_mode"] != "none" for rule in rules):
+        return "openai-chat-cached-tokens-v1"
+    return "openai-chat-standard-v1"
+
+
+def _rich_pricing_config(
+    rules, *, usage_accounting=OMITTED, cache_policy=OMITTED
+):
+    if usage_accounting is OMITTED:
+        usage_accounting = _usage_profile_for_rules(rules)
+    if cache_policy is OMITTED:
+        cache_policy = _cache_policy_for_rules(rules)
+    return {
+        "test-provider": {
+            **CUSTOM_CONFIG["test-provider"],
+            "usage_accounting": usage_accounting,
+            "models": {
+                "test-model": {
+                    "id": "provider-model-id",
+                    "cache_policy": deepcopy(cache_policy),
+                    "pricing": {
+                        "schema": "pricing-rules-v1",
+                        "rules": deepcopy(rules),
+                    },
+                }
+            },
+        }
+    }
+
+
+def _pricing_context(**overrides):
+    context = {
+        "region": "us-east",
+        "service_scope": "global",
+        "deployment_type": "serverless",
+        "output_mode": "thinking",
+        "request_mode": "realtime",
+        "cache_mode": "none",
+    }
+    context.update(overrides)
+    return context
 
 
 def _call_catalog_api(api_name, config_source=OMITTED):
@@ -1077,3 +1217,1126 @@ def test_packaged_reference_can_be_copied_and_loaded_explicitly(tmp_path):
         with pytest.raises(ValueError) as error:
             _call_catalog_api("load_all_settings", config_source)
         assert str(error.value) == REQUIRED_SOURCE_MESSAGE
+
+
+def test_legacy_pricing_validation_and_serialization_remain_permissive():
+    pricing = Pricing(
+        input=-1.0,
+        output=float("inf"),
+        ignored_legacy_extra="still-permitted",
+    )
+
+    assert pricing.model_dump() == {"input": -1.0, "output": float("inf")}
+    assert math.isinf(pricing.output)
+
+
+@pytest.mark.parametrize("rules", [[_rich_pricing_rule()], []])
+def test_explicit_rich_schema_never_falls_back_to_legacy_pricing(rules):
+    pricing = {
+        "schema": "pricing-rules-v1",
+        "rules": rules,
+        "input": 1.0,
+        "output": 2.0,
+    }
+
+    with pytest.raises(ValidationError):
+        ModelDetails(id="provider-model-id", pricing=pricing)
+
+
+def test_rich_pricing_canonical_json_serialization_and_raw_lookup():
+    first_rule = _rich_pricing_rule()
+    second_rule = _rich_pricing_rule(
+        rule_id="explicit-upper-tier",
+        cache_mode="explicit",
+        input_tokens_gt=100,
+        input_tokens_lte=None,
+        effective_from=None,
+    )
+    config = _rich_pricing_config([first_rule, second_rule])
+
+    _, _, model = get_model_details("test-model", config)
+    dumped = model.pricing.model_dump(mode="json")
+
+    assert isinstance(model.pricing, config_module.PricingSchedule)
+    assert dumped["schema"] == "pricing-rules-v1"
+    assert [rule["rule_id"] for rule in dumped["rules"]] == [
+        "standard-us-realtime-none",
+        "explicit-upper-tier",
+    ]
+    assert dumped["rules"][0]["effective_from"] == "2026-07-01T00:00:00Z"
+    assert dumped["rules"][0]["effective_until"] is None
+    assert dumped["rules"][0]["rates"]["cache_read_input"] is None
+    assert dumped["rules"][0]["evidence"][0]["retrieved_on"] == "2026-07-23"
+    assert dumped["rules"][0]["evidence"][0]["url"] == (
+        "https://help.aliyun.com/zh/model-studio/model-pricing"
+    )
+
+
+def test_rich_schedule_accepts_only_public_schema_alias():
+    with pytest.raises(ValidationError):
+        config_module.PricingSchedule(
+            schema_="pricing-rules-v1", rules=[_rich_pricing_rule()]
+        )
+
+
+def test_pricing_exception_hierarchy_is_exact():
+    assert issubclass(
+        config_module.PricingContextRequiredError,
+        config_module.PricingSelectionError,
+    )
+    assert issubclass(
+        config_module.PricingNoMatchError,
+        config_module.PricingSelectionError,
+    )
+    assert issubclass(
+        config_module.PricingAmbiguityError,
+        config_module.PricingSelectionError,
+    )
+    assert issubclass(config_module.PricingSelectionError, ValueError)
+    assert issubclass(config_module.PricingCalculationError, ValueError)
+    assert not issubclass(
+        config_module.PricingCalculationError,
+        config_module.PricingSelectionError,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("rule_id", ""),
+        ("rule_id", " surrounded "),
+        ("billing_model_id", " "),
+        ("billing_model_id", " provider-model-id"),
+        ("capability_snapshot_id", ""),
+        ("region", ""),
+        ("service_scope", " global"),
+        ("deployment_type", " "),
+        ("output_mode", "Thinking Mode"),
+    ],
+)
+def test_rich_pricing_rejects_invalid_identifiers(field, value):
+    rule = _rich_pricing_rule()
+    rule[field] = value
+
+    with pytest.raises(ValidationError):
+        config_module.PricingSchedule(schema="pricing-rules-v1", rules=[rule])
+
+
+@pytest.mark.parametrize("fact", ["", " ", " leading", "trailing "])
+def test_rich_pricing_rejects_blank_or_padded_evidence_facts(fact):
+    rule = _rich_pricing_rule()
+    rule["evidence"][0]["facts"] = [fact]
+
+    with pytest.raises(ValidationError):
+        config_module.PricingSchedule(schema="pricing-rules-v1", rules=[rule])
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://help.aliyun.com/zh/model-studio/model-pricing",
+        "not-a-url",
+        "",
+    ],
+)
+def test_rich_pricing_requires_explicit_https_evidence_url(url):
+    rule = _rich_pricing_rule()
+    rule["evidence"][0]["url"] = url
+
+    with pytest.raises(ValidationError):
+        config_module.PricingSchedule(schema="pricing-rules-v1", rules=[rule])
+
+
+@pytest.mark.parametrize(
+    ("rate_field", "value"),
+    [
+        ("input", -0.1),
+        ("output", float("inf")),
+        ("output", float("nan")),
+        ("cache_read_input", -1),
+        ("cache_write_input", float("inf")),
+    ],
+)
+def test_rich_pricing_rejects_negative_or_non_finite_rates(rate_field, value):
+    rule = _rich_pricing_rule(cache_mode="explicit")
+    rule["rates"][rate_field] = value
+
+    with pytest.raises(ValidationError):
+        config_module.PricingSchedule(schema="pricing-rules-v1", rules=[rule])
+
+
+@pytest.mark.parametrize("currency", ["usd", "US", "USDD", "US1", " USD"])
+def test_rich_pricing_requires_uppercase_three_letter_currency(currency):
+    rule = _rich_pricing_rule(currency=currency)
+
+    with pytest.raises(ValidationError):
+        config_module.PricingSchedule(schema="pricing-rules-v1", rules=[rule])
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("unit_tokens", 0),
+        ("unit_tokens", -1),
+        ("unit_tokens", True),
+        ("input_tokens_gt", -1),
+        ("input_tokens_gt", True),
+        ("input_tokens_lte", 0),
+    ],
+)
+def test_rich_pricing_rejects_invalid_units_and_token_ranges(field, value):
+    rule = _rich_pricing_rule()
+    rule[field] = value
+
+    with pytest.raises(ValidationError):
+        config_module.PricingSchedule(schema="pricing-rules-v1", rules=[rule])
+
+
+@pytest.mark.parametrize(
+    ("effective_from", "effective_until", "rate_type"),
+    [
+        ("2026-07-01T00:00:00", None, "standard"),
+        (
+            "2026-07-02T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+            "standard",
+        ),
+        (
+            "2026-07-01T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+            "standard",
+        ),
+        (None, "2026-07-02T00:00:00Z", "promotional"),
+        ("2026-07-01T00:00:00Z", None, "promotional"),
+    ],
+)
+def test_rich_pricing_rejects_invalid_effective_intervals(
+    effective_from, effective_until, rate_type
+):
+    rule = _rich_pricing_rule(
+        effective_from=effective_from,
+        effective_until=effective_until,
+        rate_type=rate_type,
+    )
+
+    with pytest.raises(ValidationError):
+        config_module.PricingSchedule(schema="pricing-rules-v1", rules=[rule])
+
+
+@pytest.mark.parametrize(
+    ("cache_mode", "cache_read", "cache_write"),
+    [
+        ("none", 0.0, None),
+        ("none", None, 0.0),
+        ("implicit", None, None),
+        ("explicit", None, 0.0),
+    ],
+)
+def test_rich_pricing_rejects_cache_rate_structure_mismatches(
+    cache_mode, cache_read, cache_write
+):
+    rule = _rich_pricing_rule(cache_mode=cache_mode)
+    rule["rates"]["cache_read_input"] = cache_read
+    rule["rates"]["cache_write_input"] = cache_write
+
+    with pytest.raises(ValidationError):
+        config_module.PricingSchedule(schema="pricing-rules-v1", rules=[rule])
+
+
+@pytest.mark.parametrize("cache_mode", ["implicit", "explicit"])
+def test_non_none_rule_allows_independent_optional_cache_write_rate(
+    cache_mode,
+):
+    rule = _rich_pricing_rule(
+        cache_mode=cache_mode,
+        cache_write_input=None,
+    )
+
+    schedule = config_module.PricingSchedule(
+        schema="pricing-rules-v1", rules=[rule]
+    )
+
+    assert schedule.rules[0].rates.cache_read_input == 0.5
+    assert schedule.rules[0].rates.cache_write_input is None
+
+
+def test_rich_pricing_allows_zero_cache_rates_when_structurally_applicable():
+    implicit = _rich_pricing_rule(cache_mode="implicit")
+    implicit["rates"]["cache_read_input"] = 0.0
+    explicit = _rich_pricing_rule(rule_id="explicit", cache_mode="explicit")
+    explicit["rates"]["cache_read_input"] = 0.0
+    explicit["rates"]["cache_write_input"] = 0.0
+
+    implicit_schedule = config_module.PricingSchedule(
+        schema="pricing-rules-v1", rules=[implicit]
+    )
+    explicit_schedule = config_module.PricingSchedule(
+        schema="pricing-rules-v1", rules=[explicit]
+    )
+
+    assert implicit_schedule.rules[0].rates.cache_read_input == 0.0
+    assert explicit_schedule.rules[0].rates.cache_write_input == 0.0
+
+
+def test_rich_pricing_rejects_empty_missing_duplicate_or_extra_structure():
+    with pytest.raises(ValidationError):
+        config_module.PricingSchedule(schema="pricing-rules-v1", rules=[])
+
+    missing_evidence = _rich_pricing_rule()
+    missing_evidence["evidence"] = []
+    with pytest.raises(ValidationError):
+        config_module.PricingSchedule(
+            schema="pricing-rules-v1", rules=[missing_evidence]
+        )
+
+    missing_facts = _rich_pricing_rule()
+    missing_facts["evidence"][0]["facts"] = []
+    with pytest.raises(ValidationError):
+        config_module.PricingSchedule(
+            schema="pricing-rules-v1", rules=[missing_facts]
+        )
+
+    duplicate = _rich_pricing_rule()
+    with pytest.raises(ValidationError):
+        config_module.PricingSchedule(
+            schema="pricing-rules-v1", rules=[duplicate, duplicate]
+        )
+
+    extra = _rich_pricing_rule()
+    extra["unexpected"] = True
+    with pytest.raises(ValidationError):
+        config_module.PricingSchedule(schema="pricing-rules-v1", rules=[extra])
+
+
+def test_rich_pricing_context_requires_exact_declared_dimensions():
+    context = config_module.PricingContext(**_pricing_context())
+
+    assert context.model_dump() == _pricing_context()
+
+    with pytest.raises(ValidationError):
+        config_module.PricingContext(
+            **_pricing_context(), unexpected="not-accepted"
+        )
+    with pytest.raises(ValidationError):
+        config_module.PricingContext(**_pricing_context(output_mode=" "))
+
+
+def test_legacy_resolution_ignores_rich_inputs_and_preserves_flat_cost():
+    resolved = config_module.resolve_model_pricing(
+        "test-model",
+        CUSTOM_CONFIG,
+        pricing_context={"not": "a rich context"},
+        input_tokens=-1,
+        effective_at=datetime(2026, 7, 23),
+    )
+    cost = config_module.calculate_pricing_cost(
+        resolved,
+        input_tokens=10,
+        output_tokens=20,
+    )
+
+    assert resolved.source == "legacy"
+    assert resolved.rule_id is None
+    assert resolved.cache_mode == "none"
+    assert resolved.currency == "$"
+    assert resolved.unit_tokens == 1_000_000
+    assert resolved.rates.model_dump() == {
+        "input": 1.0,
+        "output": 2.0,
+        "cache_read_input": None,
+        "cache_write_input": None,
+    }
+    assert cost.input_cost == pytest.approx(0.00001)
+    assert cost.output_cost == pytest.approx(0.00004)
+    assert cost.total_cost == pytest.approx(0.00005)
+    assert cost.currency == "$"
+
+
+@pytest.mark.parametrize(
+    ("input_tokens", "expected_rule"),
+    [
+        (1, "lower"),
+        (100, "lower"),
+        (101, "upper"),
+        (1_000_000, "upper"),
+    ],
+)
+def test_rich_resolution_uses_exact_open_lower_closed_upper_tiers(
+    input_tokens, expected_rule
+):
+    lower = _rich_pricing_rule(
+        rule_id="lower", effective_from=None, input_tokens_lte=100
+    )
+    upper = _rich_pricing_rule(
+        rule_id="upper",
+        effective_from=None,
+        input_tokens_gt=100,
+        input_tokens_lte=None,
+    )
+    config = _rich_pricing_config([lower, upper])
+
+    resolved = config_module.resolve_model_pricing(
+        "test-model",
+        config,
+        pricing_context=_pricing_context(),
+        input_tokens=input_tokens,
+        effective_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+    )
+
+    assert resolved.source == "pricing-rules-v1"
+    assert resolved.rule_id == expected_rule
+
+
+def test_rich_resolution_fails_closed_below_every_tier():
+    config = _rich_pricing_config([_rich_pricing_rule(effective_from=None)])
+
+    with pytest.raises(config_module.PricingNoMatchError):
+        config_module.resolve_model_pricing(
+            "test-model",
+            config,
+            pricing_context=_pricing_context(),
+            input_tokens=0,
+            effective_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+        )
+
+
+@pytest.mark.parametrize(
+    ("effective_at", "matches"),
+    [
+        (datetime(2026, 6, 30, 23, 59, 59, tzinfo=timezone.utc), False),
+        (datetime(2026, 7, 1, tzinfo=timezone.utc), True),
+        (
+            datetime(2026, 7, 2, tzinfo=timezone.utc)
+            - timedelta(microseconds=1),
+            True,
+        ),
+        (datetime(2026, 7, 2, tzinfo=timezone.utc), False),
+    ],
+)
+def test_rich_resolution_uses_closed_open_effective_interval(
+    effective_at, matches
+):
+    rule = _rich_pricing_rule(
+        rate_type="promotional",
+        effective_from="2026-07-01T00:00:00Z",
+        effective_until="2026-07-02T00:00:00Z",
+    )
+    config = _rich_pricing_config([rule])
+
+    if matches:
+        resolved = config_module.resolve_model_pricing(
+            "test-model",
+            config,
+            pricing_context=_pricing_context(),
+            input_tokens=10,
+            effective_at=effective_at,
+        )
+        assert resolved.rule_id == "standard-us-realtime-none"
+    else:
+        with pytest.raises(config_module.PricingNoMatchError):
+            config_module.resolve_model_pricing(
+                "test-model",
+                config,
+                pricing_context=_pricing_context(),
+                input_tokens=10,
+                effective_at=effective_at,
+            )
+
+
+@pytest.mark.parametrize(
+    ("dimension", "value"),
+    [
+        ("region", "eu-west"),
+        ("service_scope", "regional"),
+        ("deployment_type", "provisioned"),
+        ("output_mode", "non-thinking"),
+        ("request_mode", "batch"),
+        ("cache_mode", "implicit"),
+    ],
+)
+def test_rich_resolution_requires_exact_match_for_all_dimensions(
+    dimension, value
+):
+    config = _rich_pricing_config([_rich_pricing_rule(effective_from=None)])
+
+    with pytest.raises(config_module.PricingNoMatchError):
+        config_module.resolve_model_pricing(
+            "test-model",
+            config,
+            pricing_context=_pricing_context(**{dimension: value}),
+            input_tokens=10,
+            effective_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+        )
+
+
+@pytest.mark.parametrize(
+    ("pricing_context", "input_tokens", "effective_at"),
+    [
+        (None, 10, datetime(2026, 7, 23, tzinfo=timezone.utc)),
+        (_pricing_context(), None, datetime(2026, 7, 23, tzinfo=timezone.utc)),
+        (_pricing_context(), True, datetime(2026, 7, 23, tzinfo=timezone.utc)),
+        (_pricing_context(), -1, datetime(2026, 7, 23, tzinfo=timezone.utc)),
+        (_pricing_context(), 10, None),
+        (_pricing_context(), 10, datetime(2026, 7, 23)),
+    ],
+)
+def test_rich_resolution_requires_complete_valid_selection_inputs(
+    pricing_context, input_tokens, effective_at
+):
+    config = _rich_pricing_config([_rich_pricing_rule(effective_from=None)])
+
+    with pytest.raises(config_module.PricingContextRequiredError):
+        config_module.resolve_model_pricing(
+            "test-model",
+            config,
+            pricing_context=pricing_context,
+            input_tokens=input_tokens,
+            effective_at=effective_at,
+        )
+
+
+def test_rich_resolution_reports_ambiguity_without_order_tiebreak():
+    first = _rich_pricing_rule(rule_id="first", effective_from=None)
+    second = _rich_pricing_rule(rule_id="second", effective_from=None)
+    config = _rich_pricing_config([first, second])
+
+    with pytest.raises(config_module.PricingAmbiguityError) as error:
+        config_module.resolve_model_pricing(
+            "test-model",
+            config,
+            pricing_context=_pricing_context(),
+            input_tokens=10,
+            effective_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+        )
+
+    assert "first" in str(error.value)
+    assert "second" in str(error.value)
+
+
+def test_rich_resolution_requires_identity_without_alias_fallback():
+    rule = _rich_pricing_rule(effective_from=None)
+    rule["billing_model_id"] = "provider-model-snapshot-2026-07-01"
+    rule["capability_snapshot_id"] = "provider-model-id"
+    config = _rich_pricing_config([rule])
+
+    with pytest.raises(config_module.PricingNoMatchError):
+        config_module.resolve_model_pricing(
+            "test-model",
+            config,
+            pricing_context=_pricing_context(),
+            input_tokens=10,
+            effective_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+        )
+
+
+def test_rich_raw_lookup_resolution_and_source_are_deeply_isolated():
+    source = _rich_pricing_config([_rich_pricing_rule(effective_from=None)])
+    _, _, first_model = get_model_details("test-model", source)
+    first_model.pricing.rules[0].rates.input = 999.0
+    first_model.pricing.rules[0].evidence[0].facts.append("mutated")
+
+    resolved = config_module.resolve_model_pricing(
+        "test-model",
+        source,
+        pricing_context=_pricing_context(),
+        input_tokens=10,
+        effective_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+    )
+    resolved.rates.input = 888.0
+    _, _, second_model = get_model_details("test-model", source)
+
+    assert second_model.pricing.rules[0].rates.input == 2.0
+    assert second_model.pricing.rules[0].evidence[0].facts == [
+        "Prices vary by total request input tier."
+    ]
+    assert (
+        source["test-provider"]["models"]["test-model"]["pricing"]["rules"][0][
+            "rates"
+        ]["input"]
+        == 2.0
+    )
+    assert resolved.rates.input == 888.0
+
+    with pytest.raises(ValidationError):
+        resolved.currency = "EUR"
+
+
+@pytest.mark.parametrize(
+    ("cache_mode", "read_tokens", "write_tokens", "expected_input_cost"),
+    [
+        ("none", None, None, 0.2),
+        ("implicit", 20, None, 0.17),
+        ("explicit", 20, 30, 0.2),
+    ],
+)
+def test_rich_pricing_calculator_uses_explicit_cache_bucket_rates(
+    cache_mode, read_tokens, write_tokens, expected_input_cost
+):
+    rule = _rich_pricing_rule(cache_mode=cache_mode, effective_from=None)
+    config = _rich_pricing_config([rule])
+    resolved = config_module.resolve_model_pricing(
+        "test-model",
+        config,
+        pricing_context=_pricing_context(cache_mode=cache_mode),
+        input_tokens=100,
+        effective_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+    )
+
+    cost = config_module.calculate_pricing_cost(
+        resolved,
+        input_tokens=100,
+        output_tokens=10,
+        cache_read_input_tokens=read_tokens,
+        cache_write_input_tokens=write_tokens,
+    )
+
+    assert cost.input_cost == pytest.approx(expected_input_cost)
+    assert cost.output_cost == pytest.approx(0.04)
+    assert cost.total_cost == pytest.approx(expected_input_cost + 0.04)
+    assert cost.currency == "USD"
+
+
+@pytest.mark.parametrize(
+    ("cache_mode", "read_tokens", "write_tokens"),
+    [
+        ("none", 1, None),
+        ("none", None, 1),
+        ("implicit", None, None),
+        ("implicit", 20, 1),
+        ("explicit", None, 0),
+        ("explicit", 0, None),
+        ("explicit", 60, 41),
+    ],
+)
+def test_rich_pricing_calculator_fails_closed_for_cache_mode_conflicts(
+    cache_mode, read_tokens, write_tokens
+):
+    rule = _rich_pricing_rule(cache_mode=cache_mode, effective_from=None)
+    config = _rich_pricing_config([rule])
+    resolved = config_module.resolve_model_pricing(
+        "test-model",
+        config,
+        pricing_context=_pricing_context(cache_mode=cache_mode),
+        input_tokens=100,
+        effective_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(config_module.PricingCalculationError):
+        config_module.calculate_pricing_cost(
+            resolved,
+            input_tokens=100,
+            output_tokens=10,
+            cache_read_input_tokens=read_tokens,
+            cache_write_input_tokens=write_tokens,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("input_tokens", True),
+        ("input_tokens", -1),
+        ("output_tokens", 1.5),
+        ("output_tokens", "1"),
+        ("cache_read_input_tokens", False),
+        ("cache_read_input_tokens", -1),
+        ("cache_write_input_tokens", 1.0),
+        ("cache_write_input_tokens", "0"),
+    ],
+)
+def test_rich_pricing_calculator_requires_plain_nonnegative_integers(
+    field, value
+):
+    rule = _rich_pricing_rule(cache_mode="explicit", effective_from=None)
+    config = _rich_pricing_config([rule])
+    resolved = config_module.resolve_model_pricing(
+        "test-model",
+        config,
+        pricing_context=_pricing_context(cache_mode="explicit"),
+        input_tokens=100,
+        effective_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+    )
+    arguments = {
+        "input_tokens": 100,
+        "output_tokens": 10,
+        "cache_read_input_tokens": 20,
+        "cache_write_input_tokens": 30,
+    }
+    arguments[field] = value
+
+    with pytest.raises(config_module.PricingCalculationError):
+        config_module.calculate_pricing_cost(resolved, **arguments)
+
+
+@pytest.mark.parametrize(
+    "token_count",
+    [
+        pytest.param(10**308, id="non-finite-float"),
+        pytest.param(10**400, id="integer-conversion-overflow"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("component", "cache_mode"),
+    [
+        ("ordinary-input", "none"),
+        ("output", "none"),
+        ("cache-read", "implicit"),
+        ("cache-write", "explicit"),
+    ],
+)
+def test_rich_pricing_calculator_fails_closed_for_nonrepresentable_costs(
+    component, cache_mode, token_count
+):
+    rule_arguments = {
+        "cache_mode": cache_mode,
+        "effective_from": None,
+    }
+    if component == "cache-read":
+        rule_arguments["cache_read_input"] = 4.0
+    rule = _rich_pricing_rule(**rule_arguments)
+    config = _rich_pricing_config([rule])
+    resolved = config_module.resolve_model_pricing(
+        "test-model",
+        config,
+        pricing_context=_pricing_context(cache_mode=cache_mode),
+        input_tokens=100,
+        effective_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+    )
+    arguments = {
+        "input_tokens": 1,
+        "output_tokens": 0,
+        "cache_read_input_tokens": None,
+        "cache_write_input_tokens": None,
+    }
+    if component == "ordinary-input":
+        arguments["input_tokens"] = token_count
+    elif component == "output":
+        arguments["output_tokens"] = token_count
+    elif component == "cache-read":
+        arguments["input_tokens"] = token_count
+        arguments["cache_read_input_tokens"] = token_count
+    else:
+        arguments["input_tokens"] = token_count
+        arguments["cache_read_input_tokens"] = 0
+        arguments["cache_write_input_tokens"] = token_count
+
+    with pytest.raises(config_module.PricingCalculationError):
+        config_module.calculate_pricing_cost(resolved, **arguments)
+
+
+def test_rich_pricing_calculator_rejects_non_finite_total_of_finite_costs():
+    token_count = 10**308
+    component_cost = token_count * 0.9
+    assert math.isfinite(component_cost)
+    assert not math.isfinite(component_cost + component_cost)
+    resolved = config_module.ResolvedPricing(
+        source="pricing-rules-v1",
+        rule_id="total-overflow",
+        rates={"input": 0.9, "output": 0.9},
+        cache_mode="none",
+        currency="USD",
+        unit_tokens=1,
+    )
+
+    with pytest.raises(config_module.PricingCalculationError):
+        config_module.calculate_pricing_cost(
+            resolved,
+            input_tokens=token_count,
+            output_tokens=token_count,
+        )
+
+
+def test_batch_rules_remain_available_to_pure_resolver_and_calculator():
+    batch = _rich_pricing_rule(
+        rule_id="batch",
+        request_mode="batch",
+        effective_from=None,
+    )
+    config = _rich_pricing_config([batch])
+
+    resolved = config_module.resolve_model_pricing(
+        "test-model",
+        config,
+        pricing_context=_pricing_context(request_mode="batch"),
+        input_tokens=100,
+        effective_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+    )
+    cost = config_module.calculate_pricing_cost(
+        resolved, input_tokens=100, output_tokens=10
+    )
+
+    assert resolved.rule_id == "batch"
+    assert cost.total_cost == pytest.approx(0.24)
+
+
+def test_built_wheel_exposes_canonical_rich_pricing_config_api(tmp_path):
+    output_directory = tmp_path / "dist"
+    build = subprocess.run(
+        ["uv", "build", "--wheel", "--out-dir", str(output_directory)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert build.returncode == 0, build.stdout + build.stderr
+    wheel = next(output_directory.glob("*.whl"))
+    symbols = [
+        "PricingEvidence",
+        "PricingRates",
+        "PricingRule",
+        "PricingSchedule",
+        "CacheModePolicy",
+        "CachePolicy",
+        "PricingContext",
+        "ResolvedPricing",
+        "PricingCost",
+        "PricingSelectionError",
+        "PricingContextRequiredError",
+        "PricingNoMatchError",
+        "PricingAmbiguityError",
+        "PricingCalculationError",
+        "resolve_model_pricing",
+        "calculate_pricing_cost",
+    ]
+    import_code = (
+        "import inspect, sys; "
+        f"sys.path.insert(0, {str(wheel)!r}); "
+        "import llm_exec_core.config as config; "
+        "from llm_exec_core.client import LLMClient; "
+        f"assert all(hasattr(config, name) for name in {symbols!r}); "
+        "schedule = config.PricingSchedule.model_construct("
+        "schema_='pricing-rules-v1', rules=[]); "
+        "assert schedule.model_dump(mode='json') == "
+        "{'schema': 'pricing-rules-v1', 'rules': []}; "
+        "assert 'pricing_context' in inspect.signature(LLMClient).parameters; "
+        "import llm_exec_core; "
+        "assert hasattr(llm_exec_core, 'AccountingStatus')"
+    )
+    imported = subprocess.run(
+        [sys.executable, "-I", "-c", import_code],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert imported.returncode == 0, imported.stdout + imported.stderr
+
+
+def test_cache_policy_public_models_validate_and_serialize_canonically():
+    policy = config_module.CachePolicy(
+        support="supported",
+        modes=[
+            config_module.CacheModePolicy(
+                cache_mode="implicit", activation="automatic"
+            ),
+            {
+                "cache_mode": "explicit",
+                "activation": "control-plane-and-request",
+            },
+            {"cache_mode": "none", "activation": "not-applicable"},
+        ],
+        evidence=_cache_policy_for_rules([])["evidence"],
+    )
+
+    assert policy.model_dump(mode="json") == {
+        "support": "supported",
+        "modes": [
+            {"cache_mode": "implicit", "activation": "automatic"},
+            {
+                "cache_mode": "explicit",
+                "activation": "control-plane-and-request",
+            },
+            {"cache_mode": "none", "activation": "not-applicable"},
+        ],
+        "evidence": [
+            {
+                "url": "https://example.invalid/cache-policy",
+                "retrieved_on": "2026-07-23",
+                "facts": ["Synthetic offline cache-policy evidence."],
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("cache_mode", "activation"),
+    [
+        ("none", "automatic"),
+        ("none", "request"),
+        ("implicit", "not-applicable"),
+        ("implicit", "request"),
+        ("implicit", "control-plane-and-request"),
+        ("explicit", "not-applicable"),
+        ("explicit", "automatic"),
+        ("explicit", "control-plane"),
+    ],
+)
+def test_cache_mode_policy_rejects_incompatible_activation(
+    cache_mode, activation
+):
+    with pytest.raises(ValidationError):
+        config_module.CacheModePolicy(
+            cache_mode=cache_mode, activation=activation
+        )
+
+
+def test_cache_policy_rejects_duplicate_modes_and_invalid_support_shapes():
+    evidence = _cache_policy_for_rules([])["evidence"]
+    invalid_policies = [
+        {
+            "support": "supported",
+            "modes": [
+                {"cache_mode": "implicit", "activation": "automatic"},
+                {"cache_mode": "implicit", "activation": "control-plane"},
+            ],
+            "evidence": evidence,
+        },
+        {
+            "support": "unsupported",
+            "modes": [
+                {"cache_mode": "implicit", "activation": "automatic"},
+            ],
+            "evidence": evidence,
+        },
+        {
+            "support": "supported",
+            "modes": [
+                {"cache_mode": "none", "activation": "not-applicable"},
+            ],
+            "evidence": evidence,
+        },
+        {
+            "support": "unsupported",
+            "modes": [],
+            "evidence": evidence,
+        },
+        {
+            "support": "unsupported",
+            "modes": [
+                {"cache_mode": "none", "activation": "not-applicable"},
+            ],
+            "evidence": [],
+        },
+    ]
+
+    for policy in invalid_policies:
+        with pytest.raises(ValidationError):
+            config_module.CachePolicy.model_validate(policy)
+
+
+def test_supported_cache_policy_may_omit_or_include_none_exactly():
+    evidence = _cache_policy_for_rules([])["evidence"]
+
+    without_none = config_module.CachePolicy(
+        support="supported",
+        modes=[{"cache_mode": "implicit", "activation": "control-plane"}],
+        evidence=evidence,
+    )
+    with_none = config_module.CachePolicy(
+        support="supported",
+        modes=[
+            {"cache_mode": "implicit", "activation": "automatic"},
+            {"cache_mode": "none", "activation": "not-applicable"},
+        ],
+        evidence=evidence,
+    )
+
+    assert [mode.cache_mode for mode in without_none.modes] == ["implicit"]
+    assert [mode.cache_mode for mode in with_none.modes] == [
+        "implicit",
+        "none",
+    ]
+
+
+def test_rich_schedule_requires_route_profile_and_model_cache_policy():
+    rule = _rich_pricing_rule()
+    missing_profile = _rich_pricing_config([rule], usage_accounting=None)
+    missing_policy = _rich_pricing_config([rule], cache_policy=None)
+
+    with pytest.raises(ValidationError):
+        load_all_settings(missing_profile)
+    with pytest.raises(ValidationError):
+        load_all_settings(missing_policy)
+
+
+def test_legacy_flat_route_may_omit_profile_and_cache_policy_unchanged():
+    settings = load_all_settings(CUSTOM_CONFIG)
+    model = settings["test-provider"].models["test-model"]
+
+    assert settings["test-provider"].usage_accounting is None
+    assert model.cache_policy is None
+    assert isinstance(model.pricing, Pricing)
+
+
+def test_schedule_and_cache_policy_modes_are_exactly_cross_validated():
+    implicit = _rich_pricing_rule(cache_mode="implicit")
+    explicit = _rich_pricing_rule(
+        rule_id="explicit",
+        cache_mode="explicit",
+        cache_write_input=None,
+    )
+    policy_missing_explicit = _cache_policy_for_rules([implicit])
+    policy_has_unpriced_none = deepcopy(
+        _cache_policy_for_rules([implicit, _rich_pricing_rule()])
+    )
+
+    with pytest.raises(ValidationError):
+        load_all_settings(
+            _rich_pricing_config(
+                [implicit, explicit],
+                usage_accounting="openai-chat-cached-tokens-v1",
+                cache_policy=policy_missing_explicit,
+            )
+        )
+    with pytest.raises(ValidationError):
+        load_all_settings(
+            _rich_pricing_config(
+                [implicit],
+                usage_accounting="openai-chat-cached-tokens-v1",
+                cache_policy=policy_has_unpriced_none,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile", "rule"),
+    [
+        (
+            "openai-chat-standard-v1",
+            _rich_pricing_rule(cache_mode="implicit"),
+        ),
+        (
+            "openai-chat-cached-tokens-v1",
+            _rich_pricing_rule(cache_mode="explicit", cache_write_input=1.0),
+        ),
+        (
+            "openai-chat-cache-hit-miss-v1",
+            _rich_pricing_rule(cache_mode="implicit", cache_write_input=0.0),
+        ),
+        (
+            "openai-chat-cache-creation-v1",
+            _rich_pricing_rule(cache_mode="implicit", cache_write_input=None),
+        ),
+        (
+            "openai-chat-cache-write-v1",
+            _rich_pricing_rule(cache_mode="explicit", cache_write_input=None),
+        ),
+    ],
+)
+def test_route_profile_cross_validates_modes_and_direct_rates(profile, rule):
+    with pytest.raises(ValidationError):
+        load_all_settings(
+            _rich_pricing_config([rule], usage_accounting=profile)
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile", "cache_mode", "cache_write"),
+    [
+        ("openai-chat-standard-v1", "none", None),
+        ("openai-chat-cached-tokens-v1", "implicit", None),
+        ("openai-chat-cache-hit-miss-v1", "explicit", None),
+        ("openai-chat-cache-creation-v1", "implicit", 0.0),
+        ("openai-chat-cache-write-v1", "explicit", 3.0),
+    ],
+)
+def test_all_five_route_profiles_accept_exact_policy_and_rate_shapes(
+    profile, cache_mode, cache_write
+):
+    rule = _rich_pricing_rule(
+        cache_mode=cache_mode,
+        cache_write_input=cache_write,
+    )
+
+    provider = load_all_settings(
+        _rich_pricing_config([rule], usage_accounting=profile)
+    )["test-provider"]
+
+    assert provider.usage_accounting == profile
+    assert provider.models["test-model"].cache_policy is not None
+
+
+def test_cache_policy_and_source_are_deeply_isolated():
+    rule = _rich_pricing_rule(cache_mode="implicit")
+    source = _rich_pricing_config([rule])
+    first = load_all_settings(source)["test-provider"].models["test-model"]
+    assert first.cache_policy is not None
+    first.cache_policy.modes[0].activation = "control-plane"
+    first.cache_policy.evidence[0].facts.append("mutated")
+
+    second = load_all_settings(source)["test-provider"].models["test-model"]
+    assert second.cache_policy is not None
+    assert second.cache_policy.modes[0].activation == "automatic"
+    assert second.cache_policy.evidence[0].facts == [
+        "Synthetic offline cache-policy evidence."
+    ]
+    assert (
+        source["test-provider"]["models"]["test-model"]["cache_policy"][
+            "modes"
+        ][0]["activation"]
+        == "automatic"
+    )
+
+
+def test_read_only_bucket_pricing_does_not_require_a_write_bucket_argument():
+    rule = _rich_pricing_rule(
+        cache_mode="explicit",
+        effective_from=None,
+        cache_write_input=None,
+    )
+    config = _rich_pricing_config(
+        [rule], usage_accounting="openai-chat-cached-tokens-v1"
+    )
+    resolved = config_module.resolve_model_pricing(
+        "test-model",
+        config,
+        pricing_context=_pricing_context(cache_mode="explicit"),
+        input_tokens=100,
+        effective_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+    )
+
+    cost = config_module.calculate_pricing_cost(
+        resolved,
+        input_tokens=100,
+        output_tokens=10,
+        cache_read_input_tokens=20,
+    )
+
+    assert cost.input_cost == pytest.approx(0.17)
+    assert cost.total_cost == pytest.approx(0.21)
+
+
+def test_write_bucket_rate_requires_explicit_zero_or_nonzero_argument():
+    rule = _rich_pricing_rule(
+        cache_mode="implicit",
+        effective_from=None,
+        cache_write_input=0.0,
+    )
+    config = _rich_pricing_config(
+        [rule], usage_accounting="openai-chat-cache-write-v1"
+    )
+    resolved = config_module.resolve_model_pricing(
+        "test-model",
+        config,
+        pricing_context=_pricing_context(cache_mode="implicit"),
+        input_tokens=100,
+        effective_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(config_module.PricingCalculationError):
+        config_module.calculate_pricing_cost(
+            resolved,
+            input_tokens=100,
+            output_tokens=10,
+            cache_read_input_tokens=0,
+        )
+
+    cost = config_module.calculate_pricing_cost(
+        resolved,
+        input_tokens=100,
+        output_tokens=10,
+        cache_read_input_tokens=0,
+        cache_write_input_tokens=0,
+    )
+    assert cost.total_cost == pytest.approx(0.24)

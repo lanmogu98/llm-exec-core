@@ -1,3 +1,7 @@
+import pytest
+
+import llm_exec_core
+import llm_exec_core.types as types_module
 from llm_exec_core.types import ExecutionMetadata, LLMResult, TokenUsage
 
 
@@ -126,3 +130,85 @@ def test_llm_result_to_legacy_tuple_preserves_none_metadata_values():
 
     assert usage["metadata"]["request_id"] is None
     assert usage["metadata"]["run_id"] is None
+
+
+def test_accounting_status_is_public_and_defaults_to_available():
+    status = types_module.AccountingStatus()
+    usage = TokenUsage(
+        input_tokens=1,
+        output_tokens=2,
+        total_tokens=3,
+        input_cost=0.1,
+        output_cost=0.2,
+        total_cost=0.3,
+        currency="USD",
+    )
+
+    assert llm_exec_core.AccountingStatus is types_module.AccountingStatus
+    assert status.tokens_available is True
+    assert status.cost_available is True
+    assert status.reason is None
+    assert usage.accounting == status
+    assert "accounting" not in usage.to_legacy_dict()
+
+
+def test_unavailable_accounting_serializes_none_fields_and_finite_status():
+    status = types_module.AccountingStatus(
+        tokens_available=False,
+        cost_available=False,
+        reason="missing_usage",
+    )
+    usage = TokenUsage(
+        input_tokens=None,
+        output_tokens=None,
+        total_tokens=None,
+        input_cost=None,
+        output_cost=None,
+        total_cost=None,
+        currency=None,
+        accounting=status,
+    )
+
+    assert usage.to_legacy_dict() == {
+        "total_input_tokens": None,
+        "total_output_tokens": None,
+        "requests": [],
+        "process_times": {"request_times": [], "total_time": 0.0},
+        "cost": {
+            "input_cost": None,
+            "output_cost": None,
+            "total_cost": None,
+        },
+        "accounting": {
+            "tokens_available": False,
+            "cost_available": False,
+            "reason": "missing_usage",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {
+            "tokens_available": False,
+            "cost_available": False,
+            "reason": None,
+        },
+        {
+            "tokens_available": True,
+            "cost_available": True,
+            "reason": "missing_usage",
+        },
+        {
+            "tokens_available": False,
+            "cost_available": False,
+            "reason": "raw provider error text",
+        },
+    ],
+)
+def test_accounting_status_rejects_inconsistent_or_unbounded_reasons(
+    arguments,
+):
+    with pytest.raises(ValueError):
+        types_module.AccountingStatus(**arguments)

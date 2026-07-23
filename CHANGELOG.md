@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- Add opt-in `pricing-rules-v1` model pricing schedules with explicit token
+  tiers, region, service scope, deployment type, output/request/cache modes,
+  effective periods, provenance, deterministic fail-closed selection, and
+  legacy-flat cost compatibility.
+
 ## 0.4.1
 
 ### Added
