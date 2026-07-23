@@ -48,33 +48,49 @@ running the checksum tool. Release notes come deterministically from the
 matching changelog section and previous reachable tag range. Provenance records
 the exact source, workflow/run, actor, and distribution checksums.
 
-## Separate owner gates
-
-Immutable Releases settings, merge, dispatch, and publication are four
-separate owner gates. The workflow never enables immutable Releases. A
-maintainer must verify that setting separately, merge separately, authorize
-post-merge dry-run evidence separately, and later authorize publication
-separately. Issue #39 creates no stable Release.
-
-Only the publication job has `contents: write`. Immediately before mutation it
-rechecks both actors, remote `main`, the immutable Releases setting,
-collisions, checksums, and the exact five files. It then creates the no-`v` tag
-and an incomplete draft through REST, captures its numeric release ID, uploads
-without clobbering, verifies the draft by ID, publishes that same ID only when
-complete, and reserves the by-tag endpoint for public readback of the tag
-target, assets, digests, and immutability.
-
-## Known publication blocker
+## Credentialed immutable-setting verification
 
 The immutable-Releases repository endpoint requires `Administration: read`.
-The accepted no-secret contract supplies only `GITHUB_TOKEN`, whose Actions
-permission model cannot currently authorize that repository administration
-read. The required preflight therefore remains fail closed and a publish run
-cannot currently pass it, even when an owner has enabled immutable Releases.
-This task does not add a PAT, App token, secret, Action, or broader permission,
-and it does not remove or weaken the preflight. The credential contract must be
-resolved through a separately accepted owner decision before any publication
-attempt; dry-run validation remains the permitted operational path.
+Core #43 is the separate owner-only provisioning gate for a GitHub App with
+that read permission and an installation limited to the current repository.
+The owner places its client ID in the
+`CORE_RELEASE_PREFLIGHT_APP_CLIENT_ID` variable and its private key in the
+`CORE_RELEASE_PREFLIGHT_APP_PRIVATE_KEY` secret of the protected `release`
+environment. The workflow does not create or configure the App, installation,
+environment, variable, secret, or immutable Releases setting.
+
+Only `publish` binds the protected `release` environment and has
+`contents: write`; every other job remains read-only. After its ordinary actor,
+candidate checksum, remote-main, Release-listing, and tag-collision preflight,
+the job mints a short-lived App installation token. Because the token Action
+omits `owner` and `repositories`, it is scoped to the current repository; its
+default revocation remains enabled. The token is passed only to the immediately
+following immutable-setting step, which performs only immutable-Releases setting read.
+It is not used by checkout, outputs, artifacts, summaries, tag
+or Release operations, or public readback; all those operations continue with
+`GITHUB_TOKEN`/`GH_TOKEN`.
+
+Dry-run does not require the App credential because it skips the entire
+`publish` job. In publish mode, a missing or misconfigured environment
+credential, denied immutable-setting request, malformed response, or a false
+`enabled` readback fails before tag or Release mutation.
+
+## Separate owner gates
+
+Core #43 provisioning, immutable Releases settings, merge, dispatch, and
+publication are separate owner gates. The workflow never enables immutable
+Releases. A maintainer must verify the setting and credential provisioning
+separately, merge separately, authorize post-merge dry-run evidence separately,
+and later authorize publication separately. Issue #39 creates no stable
+Release.
+
+Immediately before mutation, the publication job has rechecked both actors,
+remote `main`, collisions, checksums, and the exact five files, then completed
+the isolated immutable-setting read. It creates the no-`v` tag and an
+incomplete draft through REST, captures its numeric release ID, uploads without
+clobbering, verifies the draft by ID, publishes that same ID only when complete,
+and reserves the by-tag endpoint for public readback of the tag target, assets,
+digests, and immutability.
 
 ## Failure and recovery
 

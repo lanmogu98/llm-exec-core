@@ -322,14 +322,16 @@ def test_release_workflow_has_safe_manual_interface_and_pins() -> None:
             "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
             "v8.0.1",
         ),
+        "actions/create-github-app-token": (
+            "bcd2ba49218906704ab6c1aa796996da409d3eb1",
+            "v3.2.0",
+        ),
     }
     action_lines = re.findall(
         r"uses:\s*([^@\s]+)@([0-9a-f]{40})\s+#\s+(\S+)", text
     )
     assert action_lines
-    assert set(action for action, _, _ in action_lines) == set(
-        expected_actions
-    )
+    assert {action for action, _, _ in action_lines} == set(expected_actions)
     assert all(
         (sha, version) == expected_actions[action]
         for action, sha, version in action_lines
@@ -343,10 +345,19 @@ def test_release_workflow_has_safe_manual_interface_and_pins() -> None:
                 assert step["with"]["version"] == "0.11.30"
 
     assert "pull_request_target" not in text
-    assert "secrets." not in text
-    assert "API_KEY" not in text
-    assert "OPENAI" not in text
-    assert "ANTHROPIC" not in text
+    secret_references = re.findall(
+        r"\$\{\{\s*secrets\.([A-Za-z0-9_]+)\s*\}\}", text
+    )
+    assert secret_references == ["CORE_RELEASE_PREFLIGHT_APP_PRIVATE_KEY"]
+    for forbidden in (
+        "PAT",
+        "API_KEY",
+        "OPENAI",
+        "ANTHROPIC",
+        "DEEPSEEK",
+        "GEMINI",
+    ):
+        assert re.search(rf"\b{forbidden}\b", text) is None
     assert "live LLM" not in text
 
 
@@ -553,18 +564,26 @@ def test_release_workflow_gates_immutable_draft_first_publication() -> None:
     assert set(publish["needs"]) == {"validate", "build", "install"}
     assert publish["if"] == "${{ inputs.dry_run == false }}"
     assert publish["permissions"] == {"contents": "write"}
+    assert publish["environment"] == "release"
     assert all(
         job.get("permissions", {}).get("contents") != "write"
         for name, job in jobs.items()
         if name != "publish"
     )
+    assert [
+        name
+        for name, job in jobs.items()
+        if job.get("environment") == "release"
+    ] == ["publish"]
 
     publish_steps = publish["steps"]
     publish_ids = [
         step["id"] for step in publish_steps if step.get("id") is not None
     ]
-    assert publish_ids[-5:] == [
+    assert publish_ids[-7:] == [
         "publish_preflight",
+        "immutable_releases_token",
+        "verify_immutable_releases",
         "create_draft",
         "verify_draft",
         "publish_release",
@@ -581,7 +600,7 @@ def test_release_workflow_gates_immutable_draft_first_publication() -> None:
     preflight_run = preflight["run"]
     for required in (
         "lanmogu98",
-        "immutable-releases",
+        "exact five-file set",
         "remote main",
         "git/ref/tags",
         "releases?per_page=100&page=",
@@ -593,10 +612,62 @@ def test_release_workflow_gates_immutable_draft_first_publication() -> None:
     assert preflight_run.index(
         "releases?per_page=100&page="
     ) < preflight_run.index("git/ref/tags")
+    assert "immutable-releases" not in preflight_run
+
+    token_step = next(
+        step
+        for step in publish_steps
+        if step.get("id") == "immutable_releases_token"
+    )
+    assert token_step["uses"] == (
+        "actions/create-github-app-token@"
+        "bcd2ba49218906704ab6c1aa796996da409d3eb1"
+    )
+    assert token_step["with"] == {
+        "client-id": "${{ vars.CORE_RELEASE_PREFLIGHT_APP_CLIENT_ID }}",
+        "private-key": "${{ secrets.CORE_RELEASE_PREFLIGHT_APP_PRIVATE_KEY }}",
+        "permission-administration": "read",
+    }
+
+    immutable_setting_step = next(
+        step
+        for step in publish_steps
+        if step.get("id") == "verify_immutable_releases"
+    )
+    token_expression = "${{ steps.immutable_releases_token.outputs.token }}"
+    token_locations = [
+        (step.get("id"), name)
+        for step in publish_steps
+        for name, value in step.get("env", {}).items()
+        if value == token_expression
+    ]
+    assert token_locations == [
+        ("verify_immutable_releases", "IMMUTABLE_RELEASES_TOKEN")
+    ]
+    immutable_setting_run = immutable_setting_step["run"]
+    assert (
+        immutable_setting_run.count("repos/$REPOSITORY/immutable-releases")
+        == 1
+    )
+    assert immutable_setting_run.count("gh api") == 1
+    assert "--method GET" in immutable_setting_run
+    assert "enabled" in immutable_setting_run
+    assert "set -euo pipefail" in immutable_setting_run
+    for mutation in ("POST", "PATCH", "PUT", "DELETE"):
+        assert mutation not in immutable_setting_run
+
+    assert publish_steps.index(preflight) < publish_steps.index(token_step)
+    assert publish_steps.index(token_step) < publish_steps.index(
+        immutable_setting_step
+    )
 
     create_draft_step = next(
         step for step in publish_steps if step.get("id") == "create_draft"
     )
+    assert publish_steps.index(immutable_setting_step) < publish_steps.index(
+        create_draft_step
+    )
+    assert create_draft_step["env"]["GH_TOKEN"] == "${{ github.token }}"
     create_draft = create_draft_step["run"]
     assert "git/refs" in create_draft
     assert 'gh api --method POST "repos/$REPOSITORY/releases"' in create_draft
@@ -614,6 +685,7 @@ def test_release_workflow_gates_immutable_draft_first_publication() -> None:
         verify_draft_step["env"]["RELEASE_ID"]
         == "${{ steps.create_draft.outputs.release_id }}"
     )
+    assert verify_draft_step["env"]["GITHUB_TOKEN"] == "${{ github.token }}"
     verify_draft = verify_draft_step["run"]
     for required in (
         "draft",
@@ -632,6 +704,7 @@ def test_release_workflow_gates_immutable_draft_first_publication() -> None:
         publish_release_step["env"]["RELEASE_ID"]
         == "${{ steps.create_draft.outputs.release_id }}"
     )
+    assert publish_release_step["env"]["GH_TOKEN"] == "${{ github.token }}"
     publish_release = publish_release_step["run"]
     expected_publish_api = (
         'gh api --method PATCH "repos/$REPOSITORY/releases/$RELEASE_ID"'
@@ -639,9 +712,11 @@ def test_release_workflow_gates_immutable_draft_first_publication() -> None:
     assert expected_publish_api in publish_release
     assert "-F draft=false" in publish_release
     assert "gh release edit" not in publish_release
-    verify_public = next(
+    verify_public_step = next(
         step for step in publish_steps if step.get("id") == "verify_public"
-    )["run"]
+    )
+    assert verify_public_step["env"]["GITHUB_TOKEN"] == "${{ github.token }}"
+    verify_public = verify_public_step["run"]
     for required in (
         "immutable",
         "git/ref/tags",
@@ -730,7 +805,15 @@ def test_release_runbook_documents_owner_gates_and_recovery() -> None:
         "new version",
         "`setuptools>=64`",
         "Administration: read",
-        "cannot currently authorize",
+        "Core #43",
+        "protected `release` environment",
+        "`CORE_RELEASE_PREFLIGHT_APP_CLIENT_ID`",
+        "`CORE_RELEASE_PREFLIGHT_APP_PRIVATE_KEY`",
+        "current repository",
+        "default revocation",
+        "only immutable-Releases setting read",
+        "Dry-run does not require",
+        "fails before tag or Release mutation",
         "published-only",
     ):
         assert required in text

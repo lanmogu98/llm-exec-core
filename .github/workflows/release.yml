@@ -641,6 +641,7 @@ jobs:
     needs: [validate, build, install]
     if: ${{ inputs.dry_run == false }}
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
     outputs:
@@ -756,16 +757,6 @@ jobs:
           if remote_main != expected_sha:
               fail("remote main changed before publication")
 
-          immutable_state = github_api(
-              f"repos/{repository}/immutable-releases"
-          )
-          immutable_enabled = (
-              immutable_state.get("enabled") is True
-              or immutable_state.get("immutable") is True
-          )
-          if not immutable_enabled:
-              fail("immutable-releases setting is not enabled")
-
           page = 1
           while True:
               releases = github_api(
@@ -789,6 +780,33 @@ jobs:
           )
           if tag_state is not None:
               fail("exact target tag collision detected")
+          PY
+      - name: Create repository-scoped immutable Releases read token
+        id: immutable_releases_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.CORE_RELEASE_PREFLIGHT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CORE_RELEASE_PREFLIGHT_APP_PRIVATE_KEY }}
+          permission-administration: read
+      - name: Verify immutable Releases setting
+        id: verify_immutable_releases
+        env:
+          REPOSITORY: ${{ github.repository }}
+          IMMUTABLE_RELEASES_TOKEN: ${{ steps.immutable_releases_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          immutable_state="$(
+            GH_TOKEN="$IMMUTABLE_RELEASES_TOKEN" gh api --method GET \
+              "repos/$REPOSITORY/immutable-releases"
+          )"
+          IMMUTABLE_RELEASES_STATE="$immutable_state" python - <<'PY'
+          import json
+          import os
+
+
+          state = json.loads(os.environ["IMMUTABLE_RELEASES_STATE"])
+          if state.get("enabled") is not True:
+              raise SystemExit("immutable-Releases setting is not enabled")
           PY
       - name: Create exact tag, draft Release, and assets
         id: create_draft
