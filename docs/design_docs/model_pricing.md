@@ -8,7 +8,8 @@ and `LLMClient.pricing_context`.
 
 Existing catalogs keep using `Pricing(input, output)`. Its validation,
 two-key serialization, provider-level `pricing_currency`, one-million-token
-basis, client estimation, result objects, and cost behavior are unchanged.
+basis, client estimation, available result/tuple shapes, and cost behavior are
+unchanged.
 Rich pricing is enabled only when one model replaces that flat object with a
 schedule whose explicit schema is `pricing-rules-v1`.
 
@@ -29,11 +30,18 @@ The rich public models are:
   input_tokens_gt, input_tokens_lte?, currency, unit_tokens, effective_from?,
   effective_until?, rate_type, rates, evidence)`
 - `PricingSchedule(schema, rules)`
+- `CacheModePolicy(cache_mode, activation)`
+- `CachePolicy(support, modes, evidence)`
 - `PricingContext(region, service_scope, deployment_type, output_mode,
   request_mode, cache_mode)`
 - frozen `ResolvedPricing(source, rule_id?, rates, cache_mode, currency,
   unit_tokens)`
 - `PricingCost(input_cost, output_cost, total_cost, currency)`
+
+`AccountingStatus` is exported from the package root. It separately records
+whether authoritative token counts and cost are available and, only when
+incomplete, one finite sanitized reason. It never retains provider payloads or
+arbitrary exception text.
 
 Every nested rich model forbids extra fields. Schedules contain at least one
 rule and rule IDs are globally unique within one schedule, exact, and
@@ -52,15 +60,28 @@ Effective timestamps must be timezone-aware. Intervals are
 promotional rates require both exact bounds. Promotions without public exact
 bounds are evidence only and cannot be actionable rules.
 
-Cache-rate structure is validated while loading the catalog:
+Cache activation and billing buckets are independent. At rule level:
 
 | `cache_mode` | `cache_read_input` | `cache_write_input` |
 | --- | --- | --- |
 | `none` | `None` | `None` |
-| `implicit` | required | `None` |
-| `explicit` | required | required |
+| `implicit` | required | optional |
+| `explicit` | required | optional |
 
-Zero is a valid documented rate. `None` means the bucket is inapplicable.
+Zero is a valid documented rate. `None` never means free; it means no direct
+price is declared for that bucket.
+
+Every rich model declares a `CachePolicy` with dated evidence. Mode entries are
+unique. `none` pairs only with `not-applicable`; `implicit` pairs only with
+`automatic` or `control-plane`; `explicit` pairs only with `request` or
+`control-plane-and-request`. An unsupported policy declares only
+`none/not-applicable`. A supported policy declares at least one non-`none`
+mode, and includes `none` only when evidence says caching can be disabled or
+unused. Policy modes and pricing-rule modes match exactly.
+
+`PricingContext.cache_mode` asserts the operational mode; it does not enable
+caching. Core neither synthesizes provider cache directives nor inspects a
+control plane or authenticated console.
 
 Canonical rich serialization is `model_dump(mode="json")`. The serialized key
 is `schema`; dates use ISO date strings; datetimes use timezone-bearing RFC
@@ -115,9 +136,11 @@ total input - cache-read input - cache-write input
 
 Each bucket uses its explicit selected rate and the same `unit_tokens` basis;
 output is calculated separately. The helper does not convert currency, apply a
-percentage, derive a rate, or round. Required cache arguments must be supplied
-even when zero. A missing rate, contradictory mode/bucket, invalid type or
-count, or cache sum exceeding total input raises `PricingCalculationError`.
+percentage, derive a rate, or round. Non-`none` modes require the cache-read
+argument even when zero. A declared write rate requires the cache-write
+argument even when zero; a nonzero write bucket without a direct rate fails.
+A contradictory mode/bucket, invalid type or count, or cache sum exceeding
+total input raises `PricingCalculationError`.
 
 Pure resolution and calculation support both realtime and batch rules. The
 current `LLMClient` transport remains realtime-only and rejects a rich batch
@@ -129,35 +152,38 @@ Schedule clients require the keyword-only `pricing_context` argument. The
 client deep-copies it and uses request-start UTC as `effective_at`. Flat clients
 need no context and retain their current behavior.
 
-Rich client pricing recognizes only OpenAI-compatible Chat Completions usage:
+Every provider route containing a rich schedule declares exactly one
+`usage_accounting` profile:
 
-```text
-usage.prompt_tokens
-usage.completion_tokens
-usage.prompt_tokens_details.cached_tokens
-usage.prompt_tokens_details.cache_creation_input_tokens
-```
+| Profile | Normalized OpenAI-compatible Chat Completions fields |
+| --- | --- |
+| `openai-chat-standard-v1` | `prompt_tokens`, `completion_tokens`; only `none` mode |
+| `openai-chat-cached-tokens-v1` | `prompt_tokens_details.cached_tokens` as cache read |
+| `openai-chat-cache-creation-v1` | `cached_tokens` plus `cache_creation_input_tokens` |
+| `openai-chat-cache-write-v1` | `cached_tokens` plus `cache_write_tokens` |
+| `openai-chat-cache-hit-miss-v1` | top-level `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens` |
+
+Runtime dispatch uses only this declaration. It never branches on provider,
+model, endpoint, response-field detection, or declaration order. The standard
+profile permits only `none` rules. Cached-token and hit/miss profiles forbid
+write rates. Creation and write profiles require a direct write rate for every
+non-`none` rule, including numeric zero when documented free.
 
 No `input_tokens`, `output_tokens`, Anthropic Messages, DashScope-native, or
-Responses API aliases are accepted. Consumed fields must be present when their
-mode requires them, have `type(value) is int`, and be nonnegative. Booleans,
-floats, strings, `null`, and numeric-like objects fail.
-
-- `none`: details may be absent or `null`; present cache values must be zero.
-- `implicit`: details and `cached_tokens` are required, including explicit
-  zero; cache creation may be absent or zero but cannot be nonzero.
-- `explicit`: details and both cache keys are required, including explicit
-  zeros.
-
-For implicit and explicit modes, cache buckets cannot exceed
-`prompt_tokens`. Unknown keys inside `prompt_tokens_details` are ignored by
-pricing.
+Responses API aliases are accepted. Every consumed value has
+`type(value) is int` and is nonnegative; booleans, floats, strings, required
+`null` values, negative values, cache sums above `prompt_tokens`, and hit/miss
+sums unequal to `prompt_tokens` make accounting unavailable. For `none`, any
+consumed cache bucket must be zero. Unknown provider fields are ignored rather
+than auto-detected.
 
 Non-streaming reads `response_json["usage"]`. Streaming retains the last
 non-null `chunk["usage"]` before `[DONE]` and passes it to the same parser.
 Missing or malformed authoritative rich usage never falls back to estimation.
-Parsing, rule selection, cost calculation, and mixed-currency checks all
-complete before aggregate token/cost state changes.
+Valid generated text is still returned if post-response normalization,
+selection, calculation, or aggregation is unavailable. Authoritative base
+token counts remain numeric when known; otherwise token fields are `None`.
+Unavailable costs and non-authoritative currency are `None`, never zero.
 
 Legacy non-streaming still uses missing-field zero defaults. Legacy streaming
 still estimates a counter when its final value is zero, and cache detail fields
@@ -165,10 +191,23 @@ do not change flat input pricing. The local `ResponseCache` is unrelated to
 provider cache pricing: a hit keeps zero tokens and zero cost and does not
 mutate aggregate usage.
 
-`TokenUsage`, `LLMResult`, `ExecutionMetadata`, legacy tuples, request detail
-keys, `get_token_usage()`, and `format_usage_report()` are unchanged. A rich
-request's `TokenUsage.currency` is the selected three-letter rule currency. A
-client refuses to accumulate a later request in a different currency.
+`LLMResult.usage` remains `TokenUsage`, and `generate_response()` keeps the
+outer `(text, usage_dict)` tuple. Available flat and rich dictionaries retain
+their prior shape. Only an incomplete rich result adds an `accounting` object;
+`format_usage_report()` renders unavailable fields as `N/A`.
+
+Per-request records and process time are always retained. Aggregate token and
+cost dimensions remain numeric only while complete. Once incomplete, the
+affected aggregate becomes `None` permanently instead of presenting a partial
+sum. A mixed-currency request keeps its correct per-result cost and currency;
+only aggregate cost becomes unavailable with
+`aggregate_currency_conflict`.
+
+Only the post-response accounting pipeline converts the finite accounting
+failures. Invalid catalog/context state still fails before HTTP, and the pure
+resolver/calculator still raise. HTTP failures, cancellation, malformed
+generated content, structured-output failures, and unrelated programming
+errors are not swallowed.
 
 ## Opt-in example
 
@@ -193,8 +232,8 @@ client = LLMClient(
 ```
 
 The model's catalog entry must contain a complete schedule with direct reviewed
-rates for that exact context. There is no automatic conversion from a flat
-price.
+rates for that exact context, a model-route cache policy, and a provider-route
+usage-accounting profile. There is no automatic conversion from a flat price.
 
 ## Official evidence refreshed 2026-07-23
 
@@ -219,6 +258,16 @@ price.
 - [OpenAI-compatible Chat](https://help.aliyun.com/en/model-studio/compatibility-of-openai-with-dashscope):
   endpoints differ by region and `stream_options={"include_usage": true}`
   requests streaming token counts.
+- [Tencent TokenHub common call contract](https://cloud.tencent.com/document/product/1823/130079):
+  the OpenAI-compatible Chat Completions envelope includes prompt, completion,
+  and cached-token details.
+- [Tencent TokenHub Kimi guide](https://cloud.tencent.com/document/product/1823/132232):
+  Kimi K3 documents automatic cache use without a per-request cache ID or TTL.
+- [Tencent TokenHub MiniMax guide](https://cloud.tencent.com/document/product/1823/132246),
+  [model list](https://cloud.tencent.com/document/product/1823/130051), and
+  [ordinary-API pricing](https://cloud.tencent.com/document/product/1823/130055):
+  future catalog children must re-fetch exact model-route activation and direct
+  rates rather than inferring them from another TokenHub model.
 
 These records contain URLs, retrieval date, and verified semantic facts only.
 No authenticated console, credential, live request, provider response, or

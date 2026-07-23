@@ -132,13 +132,19 @@ def _rich_pricing_rule(
     effective_from="2026-07-01T00:00:00Z",
     effective_until=None,
     rate_type="standard",
+    cache_read_input=OMITTED,
+    cache_write_input=OMITTED,
 ):
     cache_rates = {
         "none": (None, None),
         "implicit": (0.5, None),
         "explicit": (0.5, 3.0),
     }
-    cache_read_input, cache_write_input = cache_rates[cache_mode]
+    default_cache_read, default_cache_write = cache_rates[cache_mode]
+    if cache_read_input is OMITTED:
+        cache_read_input = default_cache_read
+    if cache_write_input is OMITTED:
+        cache_write_input = default_cache_write
     return {
         "rule_id": rule_id,
         "billing_model_id": "provider-model-id",
@@ -172,13 +178,60 @@ def _rich_pricing_rule(
     }
 
 
-def _rich_pricing_config(rules):
+def _cache_policy_for_rules(rules):
+    modes = []
+    for rule in rules:
+        cache_mode = rule["cache_mode"]
+        if cache_mode in {mode["cache_mode"] for mode in modes}:
+            continue
+        activation = {
+            "none": "not-applicable",
+            "implicit": "automatic",
+            "explicit": "request",
+        }[cache_mode]
+        modes.append({"cache_mode": cache_mode, "activation": activation})
+    support = (
+        "supported"
+        if any(mode["cache_mode"] != "none" for mode in modes)
+        else "unsupported"
+    )
+    return {
+        "support": support,
+        "modes": modes
+        or [{"cache_mode": "none", "activation": "not-applicable"}],
+        "evidence": [
+            {
+                "url": "https://example.invalid/cache-policy",
+                "retrieved_on": "2026-07-23",
+                "facts": ["Synthetic offline cache-policy evidence."],
+            }
+        ],
+    }
+
+
+def _usage_profile_for_rules(rules):
+    if any(rule["rates"]["cache_write_input"] is not None for rule in rules):
+        return "openai-chat-cache-creation-v1"
+    if any(rule["cache_mode"] != "none" for rule in rules):
+        return "openai-chat-cached-tokens-v1"
+    return "openai-chat-standard-v1"
+
+
+def _rich_pricing_config(
+    rules, *, usage_accounting=OMITTED, cache_policy=OMITTED
+):
+    if usage_accounting is OMITTED:
+        usage_accounting = _usage_profile_for_rules(rules)
+    if cache_policy is OMITTED:
+        cache_policy = _cache_policy_for_rules(rules)
     return {
         "test-provider": {
             **CUSTOM_CONFIG["test-provider"],
+            "usage_accounting": usage_accounting,
             "models": {
                 "test-model": {
                     "id": "provider-model-id",
+                    "cache_policy": deepcopy(cache_policy),
                     "pricing": {
                         "schema": "pricing-rules-v1",
                         "rules": deepcopy(rules),
@@ -1376,9 +1429,7 @@ def test_rich_pricing_rejects_invalid_effective_intervals(
         ("none", 0.0, None),
         ("none", None, 0.0),
         ("implicit", None, None),
-        ("implicit", 0.0, 0.0),
         ("explicit", None, 0.0),
-        ("explicit", 0.0, None),
     ],
 )
 def test_rich_pricing_rejects_cache_rate_structure_mismatches(
@@ -1390,6 +1441,23 @@ def test_rich_pricing_rejects_cache_rate_structure_mismatches(
 
     with pytest.raises(ValidationError):
         config_module.PricingSchedule(schema="pricing-rules-v1", rules=[rule])
+
+
+@pytest.mark.parametrize("cache_mode", ["implicit", "explicit"])
+def test_non_none_rule_allows_independent_optional_cache_write_rate(
+    cache_mode,
+):
+    rule = _rich_pricing_rule(
+        cache_mode=cache_mode,
+        cache_write_input=None,
+    )
+
+    schedule = config_module.PricingSchedule(
+        schema="pricing-rules-v1", rules=[rule]
+    )
+
+    assert schedule.rules[0].rates.cache_read_input == 0.5
+    assert schedule.rules[0].rates.cache_write_input is None
 
 
 def test_rich_pricing_allows_zero_cache_rates_when_structurally_applicable():
@@ -1839,6 +1907,8 @@ def test_built_wheel_exposes_canonical_rich_pricing_config_api(tmp_path):
         "PricingRates",
         "PricingRule",
         "PricingSchedule",
+        "CacheModePolicy",
+        "CachePolicy",
         "PricingContext",
         "ResolvedPricing",
         "PricingCost",
@@ -1860,7 +1930,9 @@ def test_built_wheel_exposes_canonical_rich_pricing_config_api(tmp_path):
         "schema_='pricing-rules-v1', rules=[]); "
         "assert schedule.model_dump(mode='json') == "
         "{'schema': 'pricing-rules-v1', 'rules': []}; "
-        "assert 'pricing_context' in inspect.signature(LLMClient).parameters"
+        "assert 'pricing_context' in inspect.signature(LLMClient).parameters; "
+        "import llm_exec_core; "
+        "assert hasattr(llm_exec_core, 'AccountingStatus')"
     )
     imported = subprocess.run(
         [sys.executable, "-I", "-c", import_code],
@@ -1871,3 +1943,322 @@ def test_built_wheel_exposes_canonical_rich_pricing_config_api(tmp_path):
     )
 
     assert imported.returncode == 0, imported.stdout + imported.stderr
+
+
+def test_cache_policy_public_models_validate_and_serialize_canonically():
+    policy = config_module.CachePolicy(
+        support="supported",
+        modes=[
+            config_module.CacheModePolicy(
+                cache_mode="implicit", activation="automatic"
+            ),
+            {
+                "cache_mode": "explicit",
+                "activation": "control-plane-and-request",
+            },
+            {"cache_mode": "none", "activation": "not-applicable"},
+        ],
+        evidence=_cache_policy_for_rules([])["evidence"],
+    )
+
+    assert policy.model_dump(mode="json") == {
+        "support": "supported",
+        "modes": [
+            {"cache_mode": "implicit", "activation": "automatic"},
+            {
+                "cache_mode": "explicit",
+                "activation": "control-plane-and-request",
+            },
+            {"cache_mode": "none", "activation": "not-applicable"},
+        ],
+        "evidence": [
+            {
+                "url": "https://example.invalid/cache-policy",
+                "retrieved_on": "2026-07-23",
+                "facts": ["Synthetic offline cache-policy evidence."],
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("cache_mode", "activation"),
+    [
+        ("none", "automatic"),
+        ("none", "request"),
+        ("implicit", "not-applicable"),
+        ("implicit", "request"),
+        ("implicit", "control-plane-and-request"),
+        ("explicit", "not-applicable"),
+        ("explicit", "automatic"),
+        ("explicit", "control-plane"),
+    ],
+)
+def test_cache_mode_policy_rejects_incompatible_activation(
+    cache_mode, activation
+):
+    with pytest.raises(ValidationError):
+        config_module.CacheModePolicy(
+            cache_mode=cache_mode, activation=activation
+        )
+
+
+def test_cache_policy_rejects_duplicate_modes_and_invalid_support_shapes():
+    evidence = _cache_policy_for_rules([])["evidence"]
+    invalid_policies = [
+        {
+            "support": "supported",
+            "modes": [
+                {"cache_mode": "implicit", "activation": "automatic"},
+                {"cache_mode": "implicit", "activation": "control-plane"},
+            ],
+            "evidence": evidence,
+        },
+        {
+            "support": "unsupported",
+            "modes": [
+                {"cache_mode": "implicit", "activation": "automatic"},
+            ],
+            "evidence": evidence,
+        },
+        {
+            "support": "supported",
+            "modes": [
+                {"cache_mode": "none", "activation": "not-applicable"},
+            ],
+            "evidence": evidence,
+        },
+        {
+            "support": "unsupported",
+            "modes": [],
+            "evidence": evidence,
+        },
+        {
+            "support": "unsupported",
+            "modes": [
+                {"cache_mode": "none", "activation": "not-applicable"},
+            ],
+            "evidence": [],
+        },
+    ]
+
+    for policy in invalid_policies:
+        with pytest.raises(ValidationError):
+            config_module.CachePolicy.model_validate(policy)
+
+
+def test_supported_cache_policy_may_omit_or_include_none_exactly():
+    evidence = _cache_policy_for_rules([])["evidence"]
+
+    without_none = config_module.CachePolicy(
+        support="supported",
+        modes=[{"cache_mode": "implicit", "activation": "control-plane"}],
+        evidence=evidence,
+    )
+    with_none = config_module.CachePolicy(
+        support="supported",
+        modes=[
+            {"cache_mode": "implicit", "activation": "automatic"},
+            {"cache_mode": "none", "activation": "not-applicable"},
+        ],
+        evidence=evidence,
+    )
+
+    assert [mode.cache_mode for mode in without_none.modes] == ["implicit"]
+    assert [mode.cache_mode for mode in with_none.modes] == [
+        "implicit",
+        "none",
+    ]
+
+
+def test_rich_schedule_requires_route_profile_and_model_cache_policy():
+    rule = _rich_pricing_rule()
+    missing_profile = _rich_pricing_config([rule], usage_accounting=None)
+    missing_policy = _rich_pricing_config([rule], cache_policy=None)
+
+    with pytest.raises(ValidationError):
+        load_all_settings(missing_profile)
+    with pytest.raises(ValidationError):
+        load_all_settings(missing_policy)
+
+
+def test_legacy_flat_route_may_omit_profile_and_cache_policy_unchanged():
+    settings = load_all_settings(CUSTOM_CONFIG)
+    model = settings["test-provider"].models["test-model"]
+
+    assert settings["test-provider"].usage_accounting is None
+    assert model.cache_policy is None
+    assert isinstance(model.pricing, Pricing)
+
+
+def test_schedule_and_cache_policy_modes_are_exactly_cross_validated():
+    implicit = _rich_pricing_rule(cache_mode="implicit")
+    explicit = _rich_pricing_rule(
+        rule_id="explicit",
+        cache_mode="explicit",
+        cache_write_input=None,
+    )
+    policy_missing_explicit = _cache_policy_for_rules([implicit])
+    policy_has_unpriced_none = deepcopy(
+        _cache_policy_for_rules([implicit, _rich_pricing_rule()])
+    )
+
+    with pytest.raises(ValidationError):
+        load_all_settings(
+            _rich_pricing_config(
+                [implicit, explicit],
+                usage_accounting="openai-chat-cached-tokens-v1",
+                cache_policy=policy_missing_explicit,
+            )
+        )
+    with pytest.raises(ValidationError):
+        load_all_settings(
+            _rich_pricing_config(
+                [implicit],
+                usage_accounting="openai-chat-cached-tokens-v1",
+                cache_policy=policy_has_unpriced_none,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile", "rule"),
+    [
+        (
+            "openai-chat-standard-v1",
+            _rich_pricing_rule(cache_mode="implicit"),
+        ),
+        (
+            "openai-chat-cached-tokens-v1",
+            _rich_pricing_rule(cache_mode="explicit", cache_write_input=1.0),
+        ),
+        (
+            "openai-chat-cache-hit-miss-v1",
+            _rich_pricing_rule(cache_mode="implicit", cache_write_input=0.0),
+        ),
+        (
+            "openai-chat-cache-creation-v1",
+            _rich_pricing_rule(cache_mode="implicit", cache_write_input=None),
+        ),
+        (
+            "openai-chat-cache-write-v1",
+            _rich_pricing_rule(cache_mode="explicit", cache_write_input=None),
+        ),
+    ],
+)
+def test_route_profile_cross_validates_modes_and_direct_rates(profile, rule):
+    with pytest.raises(ValidationError):
+        load_all_settings(
+            _rich_pricing_config([rule], usage_accounting=profile)
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile", "cache_mode", "cache_write"),
+    [
+        ("openai-chat-standard-v1", "none", None),
+        ("openai-chat-cached-tokens-v1", "implicit", None),
+        ("openai-chat-cache-hit-miss-v1", "explicit", None),
+        ("openai-chat-cache-creation-v1", "implicit", 0.0),
+        ("openai-chat-cache-write-v1", "explicit", 3.0),
+    ],
+)
+def test_all_five_route_profiles_accept_exact_policy_and_rate_shapes(
+    profile, cache_mode, cache_write
+):
+    rule = _rich_pricing_rule(
+        cache_mode=cache_mode,
+        cache_write_input=cache_write,
+    )
+
+    provider = load_all_settings(
+        _rich_pricing_config([rule], usage_accounting=profile)
+    )["test-provider"]
+
+    assert provider.usage_accounting == profile
+    assert provider.models["test-model"].cache_policy is not None
+
+
+def test_cache_policy_and_source_are_deeply_isolated():
+    rule = _rich_pricing_rule(cache_mode="implicit")
+    source = _rich_pricing_config([rule])
+    first = load_all_settings(source)["test-provider"].models["test-model"]
+    assert first.cache_policy is not None
+    first.cache_policy.modes[0].activation = "control-plane"
+    first.cache_policy.evidence[0].facts.append("mutated")
+
+    second = load_all_settings(source)["test-provider"].models["test-model"]
+    assert second.cache_policy is not None
+    assert second.cache_policy.modes[0].activation == "automatic"
+    assert second.cache_policy.evidence[0].facts == [
+        "Synthetic offline cache-policy evidence."
+    ]
+    assert (
+        source["test-provider"]["models"]["test-model"]["cache_policy"][
+            "modes"
+        ][0]["activation"]
+        == "automatic"
+    )
+
+
+def test_read_only_bucket_pricing_does_not_require_a_write_bucket_argument():
+    rule = _rich_pricing_rule(
+        cache_mode="explicit",
+        effective_from=None,
+        cache_write_input=None,
+    )
+    config = _rich_pricing_config(
+        [rule], usage_accounting="openai-chat-cached-tokens-v1"
+    )
+    resolved = config_module.resolve_model_pricing(
+        "test-model",
+        config,
+        pricing_context=_pricing_context(cache_mode="explicit"),
+        input_tokens=100,
+        effective_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+    )
+
+    cost = config_module.calculate_pricing_cost(
+        resolved,
+        input_tokens=100,
+        output_tokens=10,
+        cache_read_input_tokens=20,
+    )
+
+    assert cost.input_cost == pytest.approx(0.17)
+    assert cost.total_cost == pytest.approx(0.21)
+
+
+def test_write_bucket_rate_requires_explicit_zero_or_nonzero_argument():
+    rule = _rich_pricing_rule(
+        cache_mode="implicit",
+        effective_from=None,
+        cache_write_input=0.0,
+    )
+    config = _rich_pricing_config(
+        [rule], usage_accounting="openai-chat-cache-write-v1"
+    )
+    resolved = config_module.resolve_model_pricing(
+        "test-model",
+        config,
+        pricing_context=_pricing_context(cache_mode="implicit"),
+        input_tokens=100,
+        effective_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(config_module.PricingCalculationError):
+        config_module.calculate_pricing_cost(
+            resolved,
+            input_tokens=100,
+            output_tokens=10,
+            cache_read_input_tokens=0,
+        )
+
+    cost = config_module.calculate_pricing_cost(
+        resolved,
+        input_tokens=100,
+        output_tokens=10,
+        cache_read_input_tokens=0,
+        cache_write_input_tokens=0,
+    )
+    assert cost.total_cost == pytest.approx(0.24)

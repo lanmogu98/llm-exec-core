@@ -46,6 +46,15 @@ class PricingCalculationError(ValueError):
     pass
 
 
+UsageAccountingProfile = Literal[
+    "openai-chat-standard-v1",
+    "openai-chat-cached-tokens-v1",
+    "openai-chat-cache-creation-v1",
+    "openai-chat-cache-write-v1",
+    "openai-chat-cache-hit-miss-v1",
+]
+
+
 def _validate_identifier(value: str, field_name: str) -> str:
     if not value or value != value.strip():
         raise ValueError(
@@ -78,6 +87,57 @@ class PricingEvidence(BaseModel):
         for fact in facts:
             _validate_identifier(fact, "evidence fact")
         return facts
+
+
+class CacheModePolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cache_mode: Literal["none", "implicit", "explicit"]
+    activation: Literal[
+        "not-applicable",
+        "automatic",
+        "request",
+        "control-plane",
+        "control-plane-and-request",
+    ]
+
+    @model_validator(mode="after")
+    def _validate_activation(self) -> "CacheModePolicy":
+        compatible_activations = {
+            "none": {"not-applicable"},
+            "implicit": {"automatic", "control-plane"},
+            "explicit": {"request", "control-plane-and-request"},
+        }
+        if self.activation not in compatible_activations[self.cache_mode]:
+            raise ValueError(
+                f"{self.cache_mode} cache mode is incompatible with "
+                f"{self.activation} activation."
+            )
+        return self
+
+
+class CachePolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    support: Literal["supported", "unsupported"]
+    modes: List[CacheModePolicy] = Field(min_length=1)
+    evidence: List[PricingEvidence] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_support(self) -> "CachePolicy":
+        declared_modes = [mode.cache_mode for mode in self.modes]
+        if len(declared_modes) != len(set(declared_modes)):
+            raise ValueError("Cache-policy modes must be unique.")
+        if self.support == "unsupported":
+            if declared_modes != ["none"]:
+                raise ValueError(
+                    "Unsupported cache policy must declare only none mode."
+                )
+        elif not any(mode != "none" for mode in declared_modes):
+            raise ValueError(
+                "Supported cache policy requires a non-none mode."
+            )
+        return self
 
 
 class PricingRates(BaseModel):
@@ -232,18 +292,8 @@ class PricingRule(BaseModel):
             cache_read is not None or cache_write is not None
         ):
             raise ValueError("none cache mode cannot declare cache rates.")
-        if self.cache_mode == "implicit" and (
-            cache_read is None or cache_write is not None
-        ):
-            raise ValueError(
-                "implicit cache mode requires only cache_read_input."
-            )
-        if self.cache_mode == "explicit" and (
-            cache_read is None or cache_write is None
-        ):
-            raise ValueError(
-                "explicit cache mode requires both cache input rates."
-            )
+        if self.cache_mode != "none" and cache_read is None:
+            raise ValueError("Non-none cache mode requires cache_read_input.")
         return self
 
 
@@ -340,6 +390,7 @@ class ModelCapabilities(BaseModel):
 class ModelDetails(BaseModel):
     id: str
     pricing: Pricing | PricingSchedule
+    cache_policy: Optional[CachePolicy] = None
     capabilities: Optional[ModelCapabilities] = None
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
@@ -355,6 +406,23 @@ class ModelDetails(BaseModel):
         if isinstance(value, Mapping) and "schema" in value:
             return PricingSchedule.model_validate(value)
         return value
+
+    @model_validator(mode="after")
+    def _validate_rich_cache_policy(self) -> "ModelDetails":
+        if not isinstance(self.pricing, PricingSchedule):
+            return self
+        if self.cache_policy is None:
+            raise ValueError(
+                "Rich pricing schedules require a model cache policy."
+            )
+        pricing_modes = {rule.cache_mode for rule in self.pricing.rules}
+        policy_modes = {mode.cache_mode for mode in self.cache_policy.modes}
+        if pricing_modes != policy_modes:
+            raise ValueError(
+                "Pricing-rule cache modes and cache-policy modes must match "
+                "exactly."
+            )
+        return self
 
 
 class RateLimitSettings(BaseModel):
@@ -380,6 +448,7 @@ class ProviderSettings(BaseModel):
         "max_tokens"
     )
     pricing_currency: str
+    usage_accounting: Optional[UsageAccountingProfile] = None
     models: Dict[str, ModelDetails]
     request_overrides: Optional[Dict[str, Any]] = None
     max_tokens_retry: Optional[MaxTokensRetrySettings] = None
@@ -411,6 +480,54 @@ class ProviderSettings(BaseModel):
                 "api_base_url_env_var must differ from every API-key "
                 "environment-variable name."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_rich_usage_accounting(self) -> "ProviderSettings":
+        schedules = [
+            model.pricing
+            for model in self.models.values()
+            if isinstance(model.pricing, PricingSchedule)
+        ]
+        if not schedules:
+            return self
+        if self.usage_accounting is None:
+            raise ValueError(
+                "Routes containing rich pricing schedules require "
+                "usage_accounting."
+            )
+
+        read_only_profiles = {
+            "openai-chat-cached-tokens-v1",
+            "openai-chat-cache-hit-miss-v1",
+        }
+        write_profiles = {
+            "openai-chat-cache-creation-v1",
+            "openai-chat-cache-write-v1",
+        }
+        for schedule in schedules:
+            for rule in schedule.rules:
+                if self.usage_accounting == "openai-chat-standard-v1":
+                    if rule.cache_mode != "none":
+                        raise ValueError(
+                            "Standard usage accounting permits only none "
+                            "cache mode."
+                        )
+                elif self.usage_accounting in read_only_profiles:
+                    if rule.rates.cache_write_input is not None:
+                        raise ValueError(
+                            "Read-only usage accounting forbids a cache-write "
+                            "rate."
+                        )
+                elif (
+                    self.usage_accounting in write_profiles
+                    and rule.cache_mode != "none"
+                    and rule.rates.cache_write_input is None
+                ):
+                    raise ValueError(
+                        "Write-bucket usage accounting requires an explicit "
+                        "cache-write rate for every non-none rule."
+                    )
         return self
 
     @staticmethod
@@ -689,12 +806,12 @@ def calculate_pricing_cost(
     cache_read = _validate_token_count(
         "cache_read_input_tokens",
         cache_read_input_tokens,
-        required=pricing.cache_mode in {"implicit", "explicit"},
+        required=pricing.cache_mode != "none",
     )
     cache_write = _validate_token_count(
         "cache_write_input_tokens",
         cache_write_input_tokens,
-        required=pricing.cache_mode == "explicit",
+        required=pricing.rates.cache_write_input is not None,
     )
     assert total_input is not None
     assert total_output is not None
@@ -713,19 +830,14 @@ def calculate_pricing_cost(
             raise PricingCalculationError(
                 "none cache mode cannot use cache rates."
             )
-    elif pricing.cache_mode == "implicit":
-        if write_tokens != 0:
-            raise PricingCalculationError(
-                "implicit cache mode cannot consume cache-write tokens."
-            )
-        if read_rate is None or write_rate is not None:
-            raise PricingCalculationError(
-                "implicit cache mode requires only a cache-read rate."
-            )
     else:
-        if read_rate is None or write_rate is None:
+        if read_rate is None:
             raise PricingCalculationError(
-                "explicit cache mode requires both cache rates."
+                "Non-none cache mode requires a cache-read rate."
+            )
+        if write_tokens != 0 and write_rate is None:
+            raise PricingCalculationError(
+                "A nonzero cache-write bucket requires an explicit rate."
             )
 
     if read_tokens + write_tokens > total_input:

@@ -1,12 +1,10 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from copy import deepcopy
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import llm_exec_core.config as config_module
 from llm_exec_core.client import LLMClient
 
 STREAM_USAGE_MISSING = object()
@@ -16,23 +14,34 @@ def _stream_usage(
     prompt_tokens=100,
     completion_tokens=10,
     prompt_tokens_details=STREAM_USAGE_MISSING,
+    **extra,
 ):
     usage = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
+        **extra,
     }
     if prompt_tokens_details is not STREAM_USAGE_MISSING:
         usage["prompt_tokens_details"] = prompt_tokens_details
     return usage
 
 
-def _stream_rule(cache_mode="none"):
+def _stream_rule(
+    cache_mode="none",
+    *,
+    cache_read_input=STREAM_USAGE_MISSING,
+    cache_write_input=STREAM_USAGE_MISSING,
+):
     cache_rates = {
         "none": (None, None),
         "implicit": (0.5, None),
         "explicit": (0.5, 3.0),
     }
-    cache_read_input, cache_write_input = cache_rates[cache_mode]
+    default_cache_read, default_cache_write = cache_rates[cache_mode]
+    if cache_read_input is STREAM_USAGE_MISSING:
+        cache_read_input = default_cache_read
+    if cache_write_input is STREAM_USAGE_MISSING:
+        cache_write_input = default_cache_write
     return {
         "rule_id": f"{cache_mode}-rule",
         "billing_model_id": "provider-model-id",
@@ -66,7 +75,24 @@ def _stream_rule(cache_mode="none"):
     }
 
 
-def _stream_config(cache_mode="none"):
+def _stream_profile(cache_mode, cache_write_input):
+    if cache_write_input is not None:
+        return "openai-chat-cache-creation-v1"
+    if cache_mode != "none":
+        return "openai-chat-cached-tokens-v1"
+    return "openai-chat-standard-v1"
+
+
+def _stream_config(
+    cache_mode="none",
+    *,
+    usage_accounting=STREAM_USAGE_MISSING,
+    cache_write_input=STREAM_USAGE_MISSING,
+):
+    rule = _stream_rule(cache_mode, cache_write_input=cache_write_input)
+    selected_write_rate = rule["rates"]["cache_write_input"]
+    if usage_accounting is STREAM_USAGE_MISSING:
+        usage_accounting = _stream_profile(cache_mode, selected_write_rate)
     return {
         "test-provider": {
             "api_key_env_var": "TEST_API_KEY",
@@ -75,12 +101,37 @@ def _stream_config(cache_mode="none"):
             "max_tokens": 128,
             "context_window": 4096,
             "pricing_currency": "$",
+            "usage_accounting": usage_accounting,
             "models": {
                 "test-model": {
                     "id": "provider-model-id",
+                    "cache_policy": {
+                        "support": (
+                            "unsupported"
+                            if cache_mode == "none"
+                            else "supported"
+                        ),
+                        "modes": [
+                            {
+                                "cache_mode": cache_mode,
+                                "activation": {
+                                    "none": "not-applicable",
+                                    "implicit": "automatic",
+                                    "explicit": "request",
+                                }[cache_mode],
+                            }
+                        ],
+                        "evidence": [
+                            {
+                                "url": "https://example.invalid/cache-policy",
+                                "retrieved_on": "2026-07-23",
+                                "facts": ["Synthetic offline cache policy."],
+                            }
+                        ],
+                    },
                     "pricing": {
                         "schema": "pricing-rules-v1",
-                        "rules": [_stream_rule(cache_mode)],
+                        "rules": [rule],
                     },
                 }
             },
@@ -300,34 +351,82 @@ async def test_streaming_cancellation_during_iteration_propagates(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("cache_mode", "usage"),
+    (
+        "profile",
+        "cache_mode",
+        "cache_write_input",
+        "usage",
+        "expected_total_cost",
+    ),
     [
-        ("none", _stream_usage(prompt_tokens_details=None)),
         (
+            "openai-chat-standard-v1",
+            "none",
+            None,
+            _stream_usage(prompt_tokens_details=None),
+            0.24,
+        ),
+        (
+            "openai-chat-cached-tokens-v1",
             "implicit",
+            None,
             _stream_usage(
                 prompt_tokens_details={
                     "cached_tokens": 20,
-                    "cache_creation_input_tokens": 0,
                 }
             ),
+            0.21,
         ),
         (
+            "openai-chat-cache-creation-v1",
             "explicit",
+            3.0,
             _stream_usage(
                 prompt_tokens_details={
                     "cached_tokens": 20,
                     "cache_creation_input_tokens": 30,
                 }
             ),
+            0.24,
+        ),
+        (
+            "openai-chat-cache-write-v1",
+            "explicit",
+            3.0,
+            _stream_usage(
+                prompt_tokens_details={
+                    "cached_tokens": 20,
+                    "cache_write_tokens": 30,
+                }
+            ),
+            0.24,
+        ),
+        (
+            "openai-chat-cache-hit-miss-v1",
+            "implicit",
+            None,
+            _stream_usage(
+                prompt_cache_hit_tokens=20,
+                prompt_cache_miss_tokens=80,
+            ),
+            0.21,
         ),
     ],
 )
-async def test_rich_streaming_and_non_streaming_have_identical_usage_costs(
-    monkeypatch, cache_mode, usage
+async def test_all_profiles_have_streaming_and_non_streaming_parity(
+    monkeypatch,
+    profile,
+    cache_mode,
+    cache_write_input,
+    usage,
+    expected_total_cost,
 ):
     monkeypatch.setenv("TEST_API_KEY", "test-key")
-    config = _stream_config(cache_mode)
+    config = _stream_config(
+        cache_mode,
+        usage_accounting=profile,
+        cache_write_input=cache_write_input,
+    )
     stream_response = _mock_streaming_response(
         [
             {"choices": [{"delta": {"content": "ok"}}]},
@@ -381,76 +480,133 @@ async def test_rich_streaming_and_non_streaming_have_identical_usage_costs(
     )
     assert streaming_values[:-1] == pytest.approx(non_streaming_values[:-1])
     assert streaming_values[-1] == non_streaming_values[-1] == "USD"
+    assert streaming_result.usage.total_cost == pytest.approx(
+        expected_total_cost
+    )
+    assert streaming_result.usage.accounting.reason is None
+    assert non_streaming_result.usage.accounting.reason is None
 
 
 PARITY_INVALID_USAGE_CASES = [
     (
+        "openai-chat-standard-v1",
         "none",
-        _stream_usage(prompt_tokens_details={"cached_tokens": 1}),
+        None,
+        _stream_usage(prompt_tokens=True),
+        "malformed_usage",
+        False,
     ),
-    ("none", _stream_usage(prompt_tokens=True)),
-    ("none", _stream_usage(completion_tokens="10")),
-    ("implicit", _stream_usage()),
     (
+        "openai-chat-cached-tokens-v1",
         "implicit",
+        None,
         _stream_usage(prompt_tokens_details={"cached_tokens": True}),
+        "malformed_usage",
+        True,
     ),
     (
+        "openai-chat-cached-tokens-v1",
         "implicit",
+        None,
         _stream_usage(prompt_tokens_details={"cached_tokens": 101}),
+        "profile_contradiction",
+        True,
     ),
     (
-        "implicit",
+        "openai-chat-cache-creation-v1",
+        "explicit",
+        3.0,
         _stream_usage(
             prompt_tokens_details={
                 "cached_tokens": 0,
-                "cache_creation_input_tokens": 1,
             }
         ),
+        "malformed_usage",
+        True,
     ),
     (
+        "openai-chat-cache-creation-v1",
         "explicit",
-        _stream_usage(prompt_tokens_details={"cached_tokens": 0}),
-    ),
-    (
-        "explicit",
-        _stream_usage(
-            prompt_tokens_details={
-                "cached_tokens": 0.5,
-                "cache_creation_input_tokens": 0,
-            }
-        ),
-    ),
-    (
-        "explicit",
-        _stream_usage(
-            prompt_tokens_details={
-                "cached_tokens": 0,
-                "cache_creation_input_tokens": -1,
-            }
-        ),
-    ),
-    (
-        "explicit",
+        3.0,
         _stream_usage(
             prompt_tokens_details={
                 "cached_tokens": 60,
                 "cache_creation_input_tokens": 41,
             }
         ),
+        "profile_contradiction",
+        True,
+    ),
+    (
+        "openai-chat-cache-write-v1",
+        "explicit",
+        3.0,
+        _stream_usage(
+            prompt_tokens_details={
+                "cached_tokens": 0,
+                "cache_write_tokens": -1,
+            }
+        ),
+        "malformed_usage",
+        True,
+    ),
+    (
+        "openai-chat-cache-hit-miss-v1",
+        "implicit",
+        None,
+        _stream_usage(
+            prompt_cache_hit_tokens=20,
+            prompt_cache_miss_tokens=79,
+        ),
+        "profile_contradiction",
+        True,
+    ),
+    (
+        "openai-chat-cache-hit-miss-v1",
+        "implicit",
+        None,
+        _stream_usage(
+            prompt_cache_hit_tokens=20,
+        ),
+        "malformed_usage",
+        True,
     ),
 ]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("cache_mode", "usage"), PARITY_INVALID_USAGE_CASES)
-async def test_rich_streaming_and_non_streaming_have_identical_failures(
-    monkeypatch, cache_mode, usage
+@pytest.mark.parametrize(
+    (
+        "profile",
+        "cache_mode",
+        "cache_write_input",
+        "usage",
+        "reason",
+        "tokens_available",
+    ),
+    PARITY_INVALID_USAGE_CASES,
+)
+async def test_rich_streaming_and_non_streaming_have_identical_unavailability(
+    monkeypatch,
+    profile,
+    cache_mode,
+    cache_write_input,
+    usage,
+    reason,
+    tokens_available,
 ):
     monkeypatch.setenv("TEST_API_KEY", "test-key")
-    config = _stream_config(cache_mode)
+    config = _stream_config(
+        cache_mode,
+        usage_accounting=profile,
+        cache_write_input=cache_write_input,
+    )
     stream_response = _mock_streaming_response(
-        [{"choices": [], "usage": usage}, "[DONE]"]
+        [
+            {"choices": [{"delta": {"content": "ok"}}]},
+            {"choices": [], "usage": usage},
+            "[DONE]",
+        ]
     )
 
     @asynccontextmanager
@@ -475,21 +631,27 @@ async def test_rich_streaming_and_non_streaming_have_identical_failures(
             config_source=config,
             pricing_context=_stream_context(cache_mode),
         )
-        streaming_before = deepcopy(streaming_client.get_token_usage())
-        non_streaming_before = deepcopy(non_streaming_client.get_token_usage())
+        streaming_result = await streaming_client.generate(
+            "Hello", stream=True
+        )
+        non_streaming_result = await non_streaming_client.generate("Hello")
 
-        with pytest.raises(
-            config_module.PricingCalculationError
-        ) as stream_error:
-            await streaming_client.generate("Hello", stream=True)
-        with pytest.raises(
-            config_module.PricingCalculationError
-        ) as non_stream_error:
-            await non_streaming_client.generate("Hello")
-
-    assert type(stream_error.value) is type(non_stream_error.value)
-    assert streaming_client.get_token_usage() == streaming_before
-    assert non_streaming_client.get_token_usage() == non_streaming_before
+    for result in (streaming_result, non_streaming_result):
+        assert result.text == "ok"
+        assert result.usage.accounting.reason == reason
+        assert result.usage.accounting.tokens_available is tokens_available
+        assert result.usage.accounting.cost_available is False
+        if tokens_available:
+            assert result.usage.input_tokens == 100
+            assert result.usage.output_tokens == 10
+        else:
+            assert result.usage.input_tokens is None
+            assert result.usage.output_tokens is None
+        assert result.usage.total_cost is None
+    assert (
+        streaming_client.get_token_usage()["accounting"]
+        == non_streaming_client.get_token_usage()["accounting"]
+    )
 
 
 @pytest.mark.asyncio
@@ -528,18 +690,24 @@ async def test_rich_streaming_uses_last_non_null_usage(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "chunks",
+    ("chunks", "reason"),
     [
-        [{"choices": [{"delta": {"content": "ok"}}]}, "[DONE]"],
-        [
-            {"choices": [], "usage": _stream_usage()},
-            {"choices": [], "usage": []},
-            "[DONE]",
-        ],
+        (
+            [{"choices": [{"delta": {"content": "ok"}}]}, "[DONE]"],
+            "missing_usage",
+        ),
+        (
+            [
+                {"choices": [], "usage": _stream_usage()},
+                {"choices": [], "usage": []},
+                "[DONE]",
+            ],
+            "malformed_usage",
+        ),
     ],
 )
-async def test_rich_streaming_missing_or_malformed_final_usage_is_atomic(
-    monkeypatch, chunks
+async def test_rich_streaming_missing_or_malformed_final_usage_returns_result(
+    monkeypatch, chunks, reason
 ):
     monkeypatch.setenv("TEST_API_KEY", "test-key")
     config = _stream_config("none")
@@ -559,12 +727,16 @@ async def test_rich_streaming_missing_or_malformed_final_usage_is_atomic(
             config_source=config,
             pricing_context=_stream_context(),
         )
-        before = deepcopy(client.get_token_usage())
+        result = await client.generate("Hello", stream=True)
 
-        with pytest.raises(config_module.PricingCalculationError):
-            await client.generate("Hello", stream=True)
-
-    assert client.get_token_usage() == before
+    assert result.usage.input_tokens is None
+    assert result.usage.output_tokens is None
+    assert result.usage.total_cost is None
+    assert result.usage.accounting.tokens_available is False
+    assert result.usage.accounting.cost_available is False
+    assert result.usage.accounting.reason == reason
+    assert client.get_token_usage()["accounting"]["reason"] == reason
+    assert len(client.get_token_usage()["requests"]) == 1
 
 
 @pytest.mark.asyncio

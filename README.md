@@ -100,6 +100,13 @@ token tiers, region/service/deployment dimensions, output/request/cache modes,
 effective periods, direct rates, currency, and dated provenance. Core never
 infers a missing dimension or converts currencies.
 
+Each rich model also declares a dated model-route cache policy, and its provider
+route declares one finite OpenAI-compatible Chat Completions
+`usage_accounting` profile. The profile normalizes standard, cached-token,
+cache-creation, cache-write, or cache-hit/miss usage without branching on
+provider, model, or endpoint. Cache activation mode, normalized billing
+buckets, and directly evidenced rates remain independent declarations.
+
 Schedule-backed clients require an exact context:
 
 ```python
@@ -123,8 +130,14 @@ client = LLMClient(
 
 See [`docs/design_docs/model_pricing.md`](docs/design_docs/model_pricing.md) for
 the complete schema, deterministic fail-closed resolver/calculator contract,
-OpenAI Chat Completions cache-usage rules, provenance requirements, and
-migration boundary.
+OpenAI Chat Completions usage profiles, cache-policy rules, provenance
+requirements, execution-first accounting status, and migration boundary.
+
+For schedule-backed requests, valid generated text is still returned when only
+post-response accounting is unavailable. `TokenUsage` then uses `None` for
+unknown authoritative token/cost fields and exposes a finite sanitized
+`AccountingStatus`; legacy flat pricing and fully available dictionary shapes
+remain unchanged.
 
 ## Request options
 
