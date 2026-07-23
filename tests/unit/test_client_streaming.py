@@ -740,6 +740,73 @@ async def test_rich_streaming_missing_or_malformed_final_usage_returns_result(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt_tokens",
+    [
+        pytest.param(10**308, id="non-finite-float"),
+        pytest.param(10**400, id="integer-conversion-overflow"),
+    ],
+)
+async def test_rich_streaming_preserves_assembled_text_on_calculation_failure(
+    monkeypatch, prompt_tokens
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    config = _stream_config("none")
+    stream_response = _mock_streaming_response(
+        [
+            {"choices": [{"delta": {"content": "over"}}]},
+            {"choices": [{"delta": {"content": "flow"}}]},
+            {
+                "choices": [],
+                "usage": _stream_usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=10,
+                ),
+            },
+            "[DONE]",
+        ]
+    )
+
+    @asynccontextmanager
+    async def mock_stream(*args, **kwargs):
+        yield stream_response
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.stream = mock_stream
+        mock_cls.return_value = mock_httpx_client
+        client = LLMClient(
+            "test-model",
+            config_source=config,
+            pricing_context=_stream_context(),
+        )
+        result = await client.generate(
+            "Hello",
+            stream=True,
+            request_name="stream-arithmetic-failure",
+        )
+
+    assert result.text == "overflow"
+    assert result.usage.input_tokens == prompt_tokens
+    assert result.usage.output_tokens == 10
+    assert result.usage.total_tokens == prompt_tokens + 10
+    assert result.usage.input_cost is None
+    assert result.usage.output_cost is None
+    assert result.usage.total_cost is None
+    assert result.usage.currency is None
+    assert result.usage.accounting.tokens_available is True
+    assert result.usage.accounting.cost_available is False
+    assert result.usage.accounting.reason == "calculation_failure"
+    aggregate = client.get_token_usage()
+    assert aggregate["total_input_tokens"] == prompt_tokens
+    assert aggregate["total_output_tokens"] == 10
+    assert aggregate["cost"]["total_cost"] is None
+    assert aggregate["accounting"]["reason"] == "calculation_failure"
+    assert len(aggregate["requests"]) == 1
+    assert aggregate["requests"][0]["name"] == "stream-arithmetic-failure"
+
+
+@pytest.mark.asyncio
 async def test_legacy_streaming_still_estimates_zero_or_missing_usage(
     monkeypatch,
 ):

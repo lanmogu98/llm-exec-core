@@ -846,15 +846,29 @@ def calculate_pricing_cost(
         )
 
     ordinary_tokens = total_input - read_tokens - write_tokens
-    input_cost = ordinary_tokens * pricing.rates.input / pricing.unit_tokens
-    if read_rate is not None:
-        input_cost += read_tokens * read_rate / pricing.unit_tokens
-    if write_rate is not None:
-        input_cost += write_tokens * write_rate / pricing.unit_tokens
-    output_cost = total_output * pricing.rates.output / pricing.unit_tokens
+    try:
+        input_cost = (
+            ordinary_tokens * pricing.rates.input / pricing.unit_tokens
+        )
+        if read_rate is not None:
+            input_cost += read_tokens * read_rate / pricing.unit_tokens
+        if write_rate is not None:
+            input_cost += write_tokens * write_rate / pricing.unit_tokens
+        output_cost = total_output * pricing.rates.output / pricing.unit_tokens
+        total_cost = input_cost + output_cost
+    except OverflowError as error:
+        raise PricingCalculationError(
+            "Pricing cost calculation must remain finite."
+        ) from error
+    if not all(
+        math.isfinite(value) for value in (input_cost, output_cost, total_cost)
+    ):
+        raise PricingCalculationError(
+            "Pricing cost calculation must remain finite."
+        )
     return PricingCost(
         input_cost=input_cost,
         output_cost=output_cost,
-        total_cost=input_cost + output_cost,
+        total_cost=total_cost,
         currency=pricing.currency,
     )

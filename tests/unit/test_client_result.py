@@ -1363,6 +1363,73 @@ async def test_rich_calculation_failure_returns_generated_text(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt_tokens",
+    [
+        pytest.param(10**308, id="non-finite-float"),
+        pytest.param(10**400, id="integer-conversion-overflow"),
+    ],
+)
+async def test_rich_arithmetic_failure_preserves_result_and_request(
+    monkeypatch, prompt_tokens
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    config = _rich_client_config([_rich_client_rule()])
+    usage = _openai_usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=10,
+    )
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _http_response(usage)
+        mock_cls.return_value = mock_httpx_client
+        client = LLMClient(
+            "test-model",
+            config_source=config,
+            pricing_context=_rich_client_context(),
+        )
+        result = await client.generate(
+            "Hello", request_name="arithmetic-failure"
+        )
+
+    assert mock_httpx_client.post.await_count == 1
+    assert result.text == "ok"
+    assert result.usage.input_tokens == prompt_tokens
+    assert result.usage.output_tokens == 10
+    assert result.usage.total_tokens == prompt_tokens + 10
+    assert result.usage.input_cost is None
+    assert result.usage.output_cost is None
+    assert result.usage.total_cost is None
+    assert result.usage.currency is None
+    assert result.usage.accounting.tokens_available is True
+    assert result.usage.accounting.cost_available is False
+    assert result.usage.accounting.reason == "calculation_failure"
+    aggregate = client.get_token_usage()
+    assert aggregate["total_input_tokens"] == prompt_tokens
+    assert aggregate["total_output_tokens"] == 10
+    assert aggregate["cost"] == {
+        "input_cost": None,
+        "output_cost": None,
+        "total_cost": None,
+    }
+    assert aggregate["accounting"] == {
+        "tokens_available": True,
+        "cost_available": False,
+        "reason": "calculation_failure",
+    }
+    assert len(aggregate["requests"]) == 1
+    request = aggregate["requests"][0]
+    assert request["name"] == "arithmetic-failure"
+    assert request["input_tokens"] == prompt_tokens
+    assert request["output_tokens"] == 10
+    assert request["input_cost"] is None
+    assert request["output_cost"] is None
+    assert request["total_cost"] is None
+    assert request["accounting"] == aggregate["accounting"]
+
+
+@pytest.mark.asyncio
 async def test_generate_response_returns_text_none_fields_and_status(
     monkeypatch,
 ):

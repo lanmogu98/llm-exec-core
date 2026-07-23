@@ -1868,6 +1868,84 @@ def test_rich_pricing_calculator_requires_plain_nonnegative_integers(
         config_module.calculate_pricing_cost(resolved, **arguments)
 
 
+@pytest.mark.parametrize(
+    "token_count",
+    [
+        pytest.param(10**308, id="non-finite-float"),
+        pytest.param(10**400, id="integer-conversion-overflow"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("component", "cache_mode"),
+    [
+        ("ordinary-input", "none"),
+        ("output", "none"),
+        ("cache-read", "implicit"),
+        ("cache-write", "explicit"),
+    ],
+)
+def test_rich_pricing_calculator_fails_closed_for_nonrepresentable_costs(
+    component, cache_mode, token_count
+):
+    rule_arguments = {
+        "cache_mode": cache_mode,
+        "effective_from": None,
+    }
+    if component == "cache-read":
+        rule_arguments["cache_read_input"] = 4.0
+    rule = _rich_pricing_rule(**rule_arguments)
+    config = _rich_pricing_config([rule])
+    resolved = config_module.resolve_model_pricing(
+        "test-model",
+        config,
+        pricing_context=_pricing_context(cache_mode=cache_mode),
+        input_tokens=100,
+        effective_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+    )
+    arguments = {
+        "input_tokens": 1,
+        "output_tokens": 0,
+        "cache_read_input_tokens": None,
+        "cache_write_input_tokens": None,
+    }
+    if component == "ordinary-input":
+        arguments["input_tokens"] = token_count
+    elif component == "output":
+        arguments["output_tokens"] = token_count
+    elif component == "cache-read":
+        arguments["input_tokens"] = token_count
+        arguments["cache_read_input_tokens"] = token_count
+    else:
+        arguments["input_tokens"] = token_count
+        arguments["cache_read_input_tokens"] = 0
+        arguments["cache_write_input_tokens"] = token_count
+
+    with pytest.raises(config_module.PricingCalculationError):
+        config_module.calculate_pricing_cost(resolved, **arguments)
+
+
+def test_rich_pricing_calculator_rejects_non_finite_total_of_finite_costs():
+    token_count = 10**308
+    component_cost = token_count * 0.9
+    assert math.isfinite(component_cost)
+    assert not math.isfinite(component_cost + component_cost)
+    resolved = config_module.ResolvedPricing(
+        source="pricing-rules-v1",
+        rule_id="total-overflow",
+        rates={"input": 0.9, "output": 0.9},
+        cache_mode="none",
+        currency="USD",
+        unit_tokens=1,
+    )
+
+    with pytest.raises(config_module.PricingCalculationError):
+        config_module.calculate_pricing_cost(
+            resolved,
+            input_tokens=token_count,
+            output_tokens=token_count,
+        )
+
+
 def test_batch_rules_remain_available_to_pure_resolver_and_calculator():
     batch = _rich_pricing_rule(
         rule_id="batch",
