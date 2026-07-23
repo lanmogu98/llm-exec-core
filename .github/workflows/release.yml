@@ -1,0 +1,906 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact normalized PEP 440 package version
+        required: true
+        type: string
+      expected_sha:
+        description: Exact lower-case 40-character main commit SHA
+        required: true
+        type: string
+      dry_run:
+        description: Validate and build without creating a tag or Release
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llm-exec-core-release
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+      tag: ${{ steps.validate.outputs.tag }}
+      expected_sha: ${{ steps.validate.outputs.expected_sha }}
+      artifact_name: ${{ steps.validate.outputs.artifact_name }}
+      publish_blocked: ${{ steps.validate.outputs.publish_blocked }}
+      collision_report: ${{ steps.validate.outputs.collision_report }}
+    steps:
+      - name: Check out exact dispatched commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install locked uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.30
+          python-version: "3.13"
+          enable-cache: true
+      - name: Sync locked validation dependencies
+        run: uv sync --locked --group dev
+      - name: Validate source, version, and collisions
+        id: validate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCHED_REF: ${{ github.ref }}
+          DISPATCHED_SHA: ${{ github.sha }}
+          RAW_VERSION: ${{ inputs.version }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          uv run --frozen python - <<'PY'
+          import ast
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tomllib
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+
+          from packaging.version import InvalidVersion, Version
+
+
+          def fail(message: str) -> None:
+              raise SystemExit(message)
+
+
+          def github_api(path: str, allow_404: bool = False):
+              request = Request(
+                  f"https://api.github.com/{path}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "llm-exec-core-release-validation",
+                  },
+              )
+              try:
+                  with urlopen(request, timeout=30) as response:
+                      return json.load(response)
+              except HTTPError as exc:
+                  if allow_404 and exc.code == 404:
+                      return None
+                  detail = exc.read().decode("utf-8", errors="replace")
+                  fail(f"GitHub API failed closed ({exc.code}): {detail}")
+              except URLError as exc:
+                  fail(f"GitHub API failed closed: {exc.reason}")
+
+
+          event_name = os.environ["EVENT_NAME"]
+          dispatched_ref = os.environ["DISPATCHED_REF"]
+          dispatched_sha = os.environ["DISPATCHED_SHA"]
+          expected_sha = os.environ["EXPECTED_SHA"]
+          raw_version = os.environ["RAW_VERSION"]
+          dry_run = os.environ["DRY_RUN"].lower()
+          repository = os.environ["REPOSITORY"]
+
+          if event_name != "workflow_dispatch":
+              fail("event must be workflow_dispatch")
+          if dispatched_ref != "refs/heads/main":
+              fail("dispatch ref must be exactly refs/heads/main")
+          if not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
+              fail("expected_sha must be a 40-character lower-case SHA")
+          if expected_sha != dispatched_sha:
+              fail("expected_sha must equal github.sha")
+          if dry_run not in {"true", "false"}:
+              fail("dry_run must be a boolean")
+
+          remote = subprocess.run(
+              ["git", "ls-remote", "origin", "refs/heads/main"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.split()
+          if len(remote) != 2 or remote[1] != "refs/heads/main":
+              fail("could not resolve current remote main")
+          if remote[0] != expected_sha:
+              fail("expected_sha is stale relative to current remote main")
+
+          try:
+              parsed_version = Version(raw_version)
+          except InvalidVersion as exc:
+              fail(f"version is not PEP 440: {exc}")
+          if str(parsed_version) != raw_version:
+              fail("version must be exact normalized PEP 440")
+
+          project = tomllib.loads(Path("pyproject.toml").read_text())
+          project_version = project["project"]["version"]
+          if project_version != raw_version:
+              fail("[project].version does not match version")
+
+          init_path = Path("src/llm_exec_core/__init__.py")
+          init_tree = ast.parse(init_path.read_text(), filename=str(init_path))
+          init_versions = [
+              node.value.value
+              for node in init_tree.body
+              if isinstance(node, ast.Assign)
+              and any(
+                  isinstance(target, ast.Name)
+                  and target.id == "__version__"
+                  for target in node.targets
+              )
+              and isinstance(node.value, ast.Constant)
+              and isinstance(node.value.value, str)
+          ]
+          if init_versions != [raw_version]:
+              fail("AST-read llm_exec_core/__version__ does not match version")
+
+          lock = tomllib.loads(Path("uv.lock").read_text())
+          editable_roots = [
+              package
+              for package in lock["package"]
+              if package.get("name") == "llm-exec-core"
+              and package.get("source") == {"editable": "."}
+          ]
+          if len(editable_roots) != 1:
+              fail('uv.lock must contain one llm-exec-core editable = "." root')
+          if editable_roots[0]["version"] != raw_version:
+              fail("editable root package version in uv.lock does not match")
+
+          tag = raw_version
+          filename_version = re.sub(r"[^\w\d.]+", "_", raw_version)
+          expected_assets = {
+              f"llm_exec_core-{filename_version}-py3-none-any.whl",
+              f"llm_exec_core-{filename_version}.tar.gz",
+              "SHA256SUMS",
+              "RELEASE_NOTES.md",
+              "PROVENANCE.json",
+          }
+          encoded_tag = quote(tag, safe="")
+          tag_state = github_api(
+              f"repos/{repository}/git/ref/tags/{encoded_tag}",
+              allow_404=True,
+          )
+          release_state = github_api(
+              f"repos/{repository}/releases/tags/{encoded_tag}",
+              allow_404=True,
+          )
+          target_release_assets = set()
+          if release_state is not None:
+              target_release_assets = {
+                  asset["name"] for asset in release_state.get("assets", [])
+              }
+
+          collisions = []
+          if tag_state is not None:
+              collisions.append(f"tag:{tag}")
+          if release_state is not None:
+              collisions.append(f"release:{tag}")
+          for asset_name in sorted(expected_assets & target_release_assets):
+              collisions.append(f"target-release-asset:{asset_name}")
+
+          publish_blocked = bool(collisions)
+          collision_report = (
+              ", ".join(collisions) if collisions else "none"
+          )
+          if publish_blocked and dry_run == "true":
+              print(f"publish blocked: {collision_report}")
+          elif publish_blocked:
+              fail(f"publish collision detected: {collision_report}")
+
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          with output_path.open("a", encoding="utf-8") as output:
+              print(f"version={raw_version}", file=output)
+              print(f"tag={tag}", file=output)
+              print(f"expected_sha={expected_sha}", file=output)
+              print(
+                  f"artifact_name=release-candidate-{raw_version}-{expected_sha}",
+                  file=output,
+              )
+              print(
+                  f"publish_blocked={str(publish_blocked).lower()}",
+                  file=output,
+              )
+              print(f"collision_report={collision_report}", file=output)
+          PY
+
+  quality:
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - name: Check out exact validated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install locked uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.30
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Sync locked development dependencies
+        run: uv sync --locked --group dev
+      - name: Test
+        run: uv run --frozen pytest -q
+      - name: Check formatting
+        run: uv run --frozen black --check src tests
+      - name: Lint
+        run: uv run --frozen flake8 src tests
+      - name: Type check
+        run: uv run --frozen mypy src
+
+  build:
+    needs: [validate, quality]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out exact validated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install locked uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.30
+          python-version: "3.13"
+          enable-cache: true
+      - name: Sync locked development dependencies
+        run: uv sync --locked --group dev
+      - name: Build authoritative distributions
+        run: |
+          uv build
+      - name: Validate distributions and assemble candidate
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          TARGET_TAG: ${{ needs.validate.outputs.tag }}
+          SOURCE_SHA: ${{ needs.validate.outputs.expected_sha }}
+          SOURCE_REF: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SERVER_URL: ${{ github.server_url }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          uv run --frozen python - <<'PY'
+          from email.parser import BytesParser
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import subprocess
+          import tarfile
+          import zipfile
+
+
+          def sha256(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+
+          version = os.environ["VERSION"]
+          target_tag = os.environ["TARGET_TAG"]
+          filename_version = re.sub(r"[^\w\d.]+", "_", version)
+          dist = Path("dist")
+          wheels = sorted(dist.glob("*.whl"))
+          sdists = sorted(dist.glob("*.tar.gz"))
+          if len(wheels) != 1:
+              raise SystemExit("expected exactly one wheel")
+          if len(sdists) != 1:
+              raise SystemExit("expected exactly one sdist")
+          wheel = wheels[0]
+          sdist = sdists[0]
+          expected_wheel = (
+              f"llm_exec_core-{filename_version}-py3-none-any.whl"
+          )
+          expected_sdist = f"llm_exec_core-{filename_version}.tar.gz"
+          if wheel.name != expected_wheel:
+              raise SystemExit(
+                  f"wheel filename mismatch: {wheel.name} != {expected_wheel}"
+              )
+          if sdist.name != expected_sdist:
+              raise SystemExit(
+                  f"sdist filename mismatch: {sdist.name} != {expected_sdist}"
+              )
+
+          with zipfile.ZipFile(wheel) as archive:
+              metadata_names = [
+                  name
+                  for name in archive.namelist()
+                  if name.endswith(".dist-info/METADATA")
+              ]
+              if len(metadata_names) != 1:
+                  raise SystemExit("wheel must contain one METADATA")
+              wheel_metadata = BytesParser().parsebytes(
+                  archive.read(metadata_names[0])
+              )
+          with tarfile.open(sdist, "r:gz") as archive:
+              pkg_info_names = [
+                  member
+                  for member in archive.getmembers()
+                  if member.name.endswith("/PKG-INFO")
+              ]
+              if len(pkg_info_names) != 1:
+                  raise SystemExit("sdist must contain one PKG-INFO")
+              extracted = archive.extractfile(pkg_info_names[0])
+              if extracted is None:
+                  raise SystemExit("could not read sdist PKG-INFO")
+              sdist_metadata = BytesParser().parsebytes(extracted.read())
+          for label, metadata in (
+              ("wheel", wheel_metadata),
+              ("sdist", sdist_metadata),
+          ):
+              if metadata["Name"] != "llm-exec-core":
+                  raise SystemExit(f"{label} metadata name mismatch")
+              if metadata["Version"] != version:
+                  raise SystemExit(f"{label} metadata version mismatch")
+
+          candidate = Path("candidate")
+          candidate.mkdir()
+          candidate_wheel = candidate / wheel.name
+          candidate_sdist = candidate / sdist.name
+          shutil.copy2(wheel, candidate_wheel)
+          shutil.copy2(sdist, candidate_sdist)
+
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          section_match = re.search(
+              rf"(?m)^## {re.escape(version)}\s*$", changelog
+          )
+          if section_match is None:
+              raise SystemExit("CHANGELOG.md has no exact matching section")
+          next_section = re.search(
+              r"(?m)^## ",
+              changelog[section_match.end() :],
+          )
+          section_end = (
+              section_match.end() + next_section.start()
+              if next_section is not None
+              else len(changelog)
+          )
+          changelog_section = changelog[
+              section_match.end() : section_end
+          ].strip()
+
+          reachable_tags = subprocess.check_output(
+              ["git", "tag", "--merged", "HEAD", "--sort=-version:refname"],
+              text=True,
+          ).splitlines()
+          previous_tag = next(
+              (tag for tag in reachable_tags if tag != target_tag),
+              None,
+          )
+          if previous_tag is None:
+              revision_range = "HEAD"
+              range_label = "repository root..HEAD"
+          else:
+              revision_range = f"{previous_tag}..HEAD"
+              range_label = revision_range
+          commit_lines = subprocess.check_output(
+              [
+                  "git",
+                  "log",
+                  "--reverse",
+                  "--format=- `%H` %s",
+                  revision_range,
+              ],
+              text=True,
+          ).strip()
+          notes = (
+              f"# llm-exec-core {version}\n\n"
+              f"{changelog_section}\n\n"
+              f"## Commits ({range_label})\n\n"
+              f"{commit_lines or '- No commits in range.'}\n"
+          )
+          notes_path = candidate / "RELEASE_NOTES.md"
+          notes_path.write_text(notes, encoding="utf-8")
+
+          package_checksums = {
+              candidate_wheel.name: sha256(candidate_wheel),
+              candidate_sdist.name: sha256(candidate_sdist),
+          }
+          provenance = {
+              "actor": os.environ["ACTOR"],
+              "attempt": os.environ["RUN_ATTEMPT"],
+              "checksums": {
+                  "sdist": {
+                      "filename": candidate_sdist.name,
+                      "sha256": package_checksums[candidate_sdist.name],
+                  },
+                  "wheel": {
+                      "filename": candidate_wheel.name,
+                      "sha256": package_checksums[candidate_wheel.name],
+                  },
+              },
+              "ref": os.environ["SOURCE_REF"],
+              "repository": os.environ["REPOSITORY"],
+              "run_id": os.environ["RUN_ID"],
+              "sha": os.environ["SOURCE_SHA"],
+              "tag": target_tag,
+              "url": (
+                  f"{os.environ['SERVER_URL']}/"
+                  f"{os.environ['REPOSITORY']}/actions/runs/"
+                  f"{os.environ['RUN_ID']}"
+              ),
+              "version": version,
+              "workflow_ref": os.environ["WORKFLOW_REF"],
+          }
+          provenance_path = candidate / "PROVENANCE.json"
+          provenance_path.write_text(
+              json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          checksum_targets = sorted(
+              [
+                  candidate_wheel,
+                  candidate_sdist,
+                  notes_path,
+                  provenance_path,
+              ],
+              key=lambda path: path.name,
+          )
+          checksums_path = candidate / "SHA256SUMS"
+          checksums_path.write_text(
+              "".join(
+                  f"{sha256(path)}  {path.name}\n"
+                  for path in checksum_targets
+              ),
+              encoding="utf-8",
+          )
+
+          actual_files = {path.name for path in candidate.iterdir()}
+          expected_files = {
+              candidate_wheel.name,
+              candidate_sdist.name,
+              "SHA256SUMS",
+              "RELEASE_NOTES.md",
+              "PROVENANCE.json",
+          }
+          if actual_files != expected_files:
+              raise SystemExit("candidate is not the exact five-file candidate set")
+          PY
+      - name: Upload exact release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ needs.validate.outputs.artifact_name }}
+          path: |
+            candidate/*.whl
+            candidate/*.tar.gz
+            candidate/SHA256SUMS
+            candidate/RELEASE_NOTES.md
+            candidate/PROVENANCE.json
+          if-no-files-found: error
+          retention-days: 30
+
+  install:
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+        distribution: ["wheel", "sdist"]
+    steps:
+      - name: Install locked uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.30
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Download authoritative candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.validate.outputs.artifact_name }}
+          path: ${{ runner.temp }}/release-candidate
+      - name: Verify and install selected distribution
+        env:
+          CANDIDATE_DIR: ${{ runner.temp }}/release-candidate
+          INSTALL_ENV: ${{ runner.temp }}/clean-install
+          PYTHON_VERSION: ${{ matrix.python-version }}
+          DISTRIBUTION: ${{ matrix.distribution }}
+          EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd "$CANDIDATE_DIR"
+          sha256sum --check SHA256SUMS
+          wheel_count="$(find . -maxdepth 1 -type f -name '*.whl' | wc -l)"
+          sdist_count="$(find . -maxdepth 1 -type f -name '*.tar.gz' | wc -l)"
+          file_count="$(find . -maxdepth 1 -type f | wc -l)"
+          if [[ "$wheel_count" -ne 1 || "$sdist_count" -ne 1 || "$file_count" -ne 5 ]]; then
+            echo "candidate is not the exact five-file candidate set" >&2
+            exit 1
+          fi
+          wheel="$(find . -maxdepth 1 -type f -name '*.whl')"
+          sdist="$(find . -maxdepth 1 -type f -name '*.tar.gz')"
+          if [[ "$DISTRIBUTION" == "wheel" ]]; then
+            distribution_path="$wheel"
+          else
+            distribution_path="$sdist"
+          fi
+          uv venv --python "$PYTHON_VERSION" "$INSTALL_ENV"
+          uv pip install --python "$INSTALL_ENV/bin/python" "$distribution_path"
+          "$INSTALL_ENV/bin/python" - <<'PY'
+          from importlib import metadata
+          import os
+
+          import llm_exec_core
+
+          expected = os.environ["EXPECTED_VERSION"]
+          assert metadata.version("llm-exec-core") == expected
+          assert llm_exec_core.__version__ == expected
+          PY
+
+  publish:
+    needs: [validate, build, install]
+    if: ${{ inputs.dry_run == false }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_url: ${{ steps.verify_public.outputs.release_url }}
+    steps:
+      - name: Download authoritative candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.validate.outputs.artifact_name }}
+          path: ${{ runner.temp }}/release-candidate
+      - name: Revalidate publication authority and state
+        id: publish_preflight
+        env:
+          ORIGINAL_ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.expected_sha }}
+          TARGET_TAG: ${{ needs.validate.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+          CANDIDATE_DIR: ${{ runner.temp }}/release-candidate
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$ORIGINAL_ACTOR" != "lanmogu98" || "$TRIGGERING_ACTOR" != "lanmogu98" ]]; then
+            echo "original and triggering actors must both be lanmogu98" >&2
+            exit 1
+          fi
+          cd "$CANDIDATE_DIR"
+          sha256sum --check SHA256SUMS
+          wheel_count="$(find . -maxdepth 1 -type f -name '*.whl' | wc -l)"
+          sdist_count="$(find . -maxdepth 1 -type f -name '*.tar.gz' | wc -l)"
+          file_count="$(find . -maxdepth 1 -type f | wc -l)"
+          if [[ "$wheel_count" -ne 1 || "$sdist_count" -ne 1 || "$file_count" -ne 5 ]]; then
+            echo "candidate is not the exact five-file candidate set" >&2
+            exit 1
+          fi
+          python - <<'PY'
+          import json
+          import os
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+
+
+          def fail(message: str) -> None:
+              raise SystemExit(message)
+
+
+          def github_api(path: str, allow_404: bool = False):
+              request = Request(
+                  f"https://api.github.com/{path}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "llm-exec-core-release-preflight",
+                  },
+              )
+              try:
+                  with urlopen(request, timeout=30) as response:
+                      return json.load(response)
+              except HTTPError as exc:
+                  if allow_404 and exc.code == 404:
+                      return None
+                  detail = exc.read().decode("utf-8", errors="replace")
+                  fail(f"GitHub API failed closed ({exc.code}): {detail}")
+              except URLError as exc:
+                  fail(f"GitHub API failed closed: {exc.reason}")
+
+
+          repository = os.environ["REPOSITORY"]
+          expected_sha = os.environ["EXPECTED_SHA"]
+          target_tag = os.environ["TARGET_TAG"]
+          encoded_tag = quote(target_tag, safe="")
+
+          main_ref = github_api(f"repos/{repository}/git/ref/heads/main")
+          remote_main = main_ref["object"]["sha"]
+          if remote_main != expected_sha:
+              fail("remote main changed before publication")
+
+          immutable_state = github_api(
+              f"repos/{repository}/immutable-releases"
+          )
+          immutable_enabled = (
+              immutable_state.get("enabled") is True
+              or immutable_state.get("immutable") is True
+          )
+          if not immutable_enabled:
+              fail("immutable-releases setting is not enabled")
+
+          tag_state = github_api(
+              f"repos/{repository}/git/ref/tags/{encoded_tag}",
+              allow_404=True,
+          )
+          if tag_state is not None:
+              fail("exact target tag collision detected")
+          release_state = github_api(
+              f"repos/{repository}/releases/tags/{encoded_tag}",
+              allow_404=True,
+          )
+          if release_state is not None:
+              if release_state.get("assets"):
+                  fail("target Release asset collision detected")
+              fail("exact target Release collision detected")
+          PY
+      - name: Create exact tag, draft Release, and assets
+        id: create_draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.expected_sha }}
+          TARGET_TAG: ${{ needs.validate.outputs.tag }}
+          CANDIDATE_DIR: ${{ runner.temp }}/release-candidate
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/$REPOSITORY/git/refs" \
+            -f ref="refs/tags/$TARGET_TAG" \
+            -f sha="$EXPECTED_SHA"
+          gh release create "$TARGET_TAG" \
+            --repo "$REPOSITORY" \
+            --draft \
+            --title "$TARGET_TAG" \
+            --notes-file "$CANDIDATE_DIR/RELEASE_NOTES.md" \
+            --verify-tag
+          gh release upload "$TARGET_TAG" \
+            "$CANDIDATE_DIR"/*.whl \
+            "$CANDIDATE_DIR"/*.tar.gz \
+            "$CANDIDATE_DIR/SHA256SUMS" \
+            "$CANDIDATE_DIR/RELEASE_NOTES.md" \
+            "$CANDIDATE_DIR/PROVENANCE.json" \
+            --repo "$REPOSITORY"
+      - name: Verify unpublished draft body and assets
+        id: verify_draft
+        env:
+          REPOSITORY: ${{ github.repository }}
+          TARGET_TAG: ${{ needs.validate.outputs.tag }}
+          CANDIDATE_DIR: ${{ runner.temp }}/release-candidate
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+          repository = os.environ["REPOSITORY"]
+          target_tag = os.environ["TARGET_TAG"]
+          candidate = Path(os.environ["CANDIDATE_DIR"])
+          request = Request(
+              (
+                  f"https://api.github.com/repos/{repository}/releases/tags/"
+                  f"{quote(target_tag, safe='')}"
+              ),
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "llm-exec-core-release-draft-verification",
+              },
+          )
+          with urlopen(request, timeout=30) as response:
+              release = json.load(response)
+          if release.get("draft") is not True:
+              raise SystemExit("Release is not an unpublished draft")
+          notes = (candidate / "RELEASE_NOTES.md").read_text()
+          if release.get("body") != notes:
+              raise SystemExit("draft body does not match RELEASE_NOTES.md")
+          local_files = {
+              path.name: f"sha256:{sha256(path)}"
+              for path in candidate.iterdir()
+              if path.is_file()
+          }
+          remote_assets = {
+              asset["name"]: asset.get("digest")
+              for asset in release.get("assets", [])
+          }
+          if set(remote_assets) != set(local_files):
+              raise SystemExit("draft asset names do not match candidate")
+          for asset_name, digest in local_files.items():
+              if remote_assets[asset_name] != digest:
+                  raise SystemExit(
+                      f"draft asset digest mismatch: {asset_name}"
+                  )
+          PY
+      - name: Publish verified draft
+        id: publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          gh release edit "$TARGET_TAG" \
+            --repo "$REPOSITORY" \
+            --draft=false \
+            --latest=false
+      - name: Verify immutable public Release
+        id: verify_public
+        env:
+          REPOSITORY: ${{ github.repository }}
+          TARGET_TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.expected_sha }}
+          CANDIDATE_DIR: ${{ runner.temp }}/release-candidate
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import time
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+
+
+          def github_api(path: str):
+              request = Request(
+                  f"https://api.github.com/{path}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "llm-exec-core-release-readback",
+                  },
+              )
+              with urlopen(request, timeout=30) as response:
+                  return json.load(response)
+
+
+          repository = os.environ["REPOSITORY"]
+          target_tag = os.environ["TARGET_TAG"]
+          expected_sha = os.environ["EXPECTED_SHA"]
+          candidate = Path(os.environ["CANDIDATE_DIR"])
+          encoded_tag = quote(target_tag, safe="")
+          local_files = {
+              path.name: f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+              for path in candidate.iterdir()
+              if path.is_file()
+          }
+
+          release = None
+          for _ in range(20):
+              current = github_api(
+                  f"repos/{repository}/releases/tags/{encoded_tag}"
+              )
+              if (
+                  current.get("draft") is False
+                  and current.get("immutable") is True
+              ):
+                  release = current
+                  break
+              time.sleep(3)
+          if release is None:
+              raise SystemExit("public Release did not become immutable")
+
+          tag = github_api(
+              f"repos/{repository}/git/ref/tags/{encoded_tag}"
+          )
+          if tag["object"]["sha"] != expected_sha:
+              raise SystemExit("public git/ref/tags target mismatch")
+          remote_assets = {
+              asset["name"]: asset.get("digest")
+              for asset in release.get("assets", [])
+          }
+          if set(remote_assets) != set(local_files):
+              raise SystemExit("public asset names do not match candidate")
+          for asset_name, digest in local_files.items():
+              if remote_assets[asset_name] != digest:
+                  raise SystemExit(
+                      f"public asset digest mismatch: {asset_name}"
+                  )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              print(f"release_url={release['html_url']}", file=output)
+          PY
+
+  summary:
+    needs: [validate, quality, build, install, publish]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write release validation summary
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          TARGET_TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.expected_sha }}
+          SOURCE_REF: ${{ github.ref }}
+          VALIDATION_STATE: ${{ needs.validate.result }}
+          QUALITY_STATE: ${{ needs.quality.result }}
+          BUILD_STATE: ${{ needs.build.result }}
+          INSTALL_STATE: ${{ needs.install.result }}
+          PUBLISH_STATE: ${{ needs.publish.result }}
+          PUBLISH_BLOCKED: ${{ needs.validate.outputs.publish_blocked }}
+          COLLISION_REPORT: ${{ needs.validate.outputs.collision_report }}
+          ARTIFACT_NAME: ${{ needs.validate.outputs.artifact_name }}
+          RELEASE_URL: ${{ needs.publish.outputs.release_url }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mode="publish"
+          publish_result="$PUBLISH_STATE"
+          if [[ "$DRY_RUN" == "true" ]]; then
+            mode="dry-run"
+            publish_result="not requested"
+            if [[ "$PUBLISH_BLOCKED" == "true" ]]; then
+              publish_result="publish blocked"
+            fi
+          fi
+          workflow_url="$SERVER_URL/$REPOSITORY/actions/runs/$RUN_ID"
+          {
+            echo "## Release workflow summary"
+            echo "- Version/tag: \`$VERSION\` / \`$TARGET_TAG\`"
+            echo "- Commit/ref: \`$EXPECTED_SHA\` / \`$SOURCE_REF\`"
+            echo "- Mode: \`$mode\`"
+            echo "- validation: \`$VALIDATION_STATE\`"
+            echo "- Quality/build/install: \`$QUALITY_STATE\` / \`$BUILD_STATE\` / \`$INSTALL_STATE\`"
+            echo "- Publication: \`$publish_result\`"
+            echo "- Collisions: \`$COLLISION_REPORT\`"
+            echo "- Candidate artifact: \`$ARTIFACT_NAME\` (SHA256SUMS verified by consumers)"
+            echo "- Workflow: $workflow_url"
+            if [[ -n "$RELEASE_URL" ]]; then
+              echo "- Release: $RELEASE_URL"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

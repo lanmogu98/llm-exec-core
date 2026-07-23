@@ -7,6 +7,7 @@ import yaml
 
 ROOT = Path(__file__).parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 EXPECTED_CHECKS = {"CI / python-3.10", "CI / python-3.13"}
 CONTRACT = runpy.run_path(str(ROOT / "scripts" / "governance_contract.py"))
 assess_ci_evidence = CONTRACT["assess_ci_evidence"]
@@ -276,6 +277,359 @@ def test_ci_workflow_has_stable_locked_mock_only_contract() -> None:
     action_refs = re.findall(r"uses:\s*[^@\s]+@([^\s#]+)", text)
     assert action_refs
     assert all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in action_refs)
+
+
+def test_release_workflow_has_safe_manual_interface_and_pins() -> None:
+    text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    workflow = yaml.load(text, Loader=yaml.BaseLoader)
+    dispatch = workflow["on"]["workflow_dispatch"]
+    inputs = dispatch["inputs"]
+
+    assert workflow["name"] == "Release"
+    assert set(workflow["on"]) == {"workflow_dispatch"}
+    assert set(inputs) == {"version", "expected_sha", "dry_run"}
+    assert inputs["version"]["required"] == "true"
+    assert inputs["version"]["type"] == "string"
+    assert inputs["expected_sha"]["required"] == "true"
+    assert inputs["expected_sha"]["type"] == "string"
+    assert inputs["dry_run"] == {
+        "description": inputs["dry_run"]["description"],
+        "required": "true",
+        "type": "boolean",
+        "default": "true",
+    }
+    assert workflow["permissions"] == {"contents": "read"}
+    assert workflow["concurrency"] == {
+        "group": "llm-exec-core-release",
+        "queue": "max",
+        "cancel-in-progress": "false",
+    }
+
+    expected_actions = {
+        "actions/checkout": (
+            "3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "v7.0.1",
+        ),
+        "astral-sh/setup-uv": (
+            "c771a70e6277c0a99b617c7a806ffedaca235ff9",
+            "v9.0.0",
+        ),
+        "actions/upload-artifact": (
+            "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+            "v7.0.1",
+        ),
+        "actions/download-artifact": (
+            "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+            "v8.0.1",
+        ),
+    }
+    action_lines = re.findall(
+        r"uses:\s*([^@\s]+)@([0-9a-f]{40})\s+#\s+(\S+)", text
+    )
+    assert action_lines
+    assert set(action for action, _, _ in action_lines) == set(
+        expected_actions
+    )
+    assert all(
+        (sha, version) == expected_actions[action]
+        for action, sha, version in action_lines
+    )
+
+    for job in workflow["jobs"].values():
+        for step in job.get("steps", []):
+            run = step.get("run", "")
+            assert not re.search(r"\$\{\{\s*inputs\.", run)
+            if step.get("uses", "").startswith("astral-sh/setup-uv@"):
+                assert step["with"]["version"] == "0.11.30"
+
+    assert "pull_request_target" not in text
+    assert "secrets." not in text
+    assert "API_KEY" not in text
+    assert "OPENAI" not in text
+    assert "ANTHROPIC" not in text
+    assert "live LLM" not in text
+
+
+def test_release_workflow_fails_closed_on_source_version_and_collisions() -> (
+    None
+):
+    text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    workflow = yaml.load(text, Loader=yaml.BaseLoader)
+    validate = workflow["jobs"]["validate"]
+    checkout = next(
+        step
+        for step in validate["steps"]
+        if step.get("uses", "").startswith("actions/checkout@")
+    )
+    validation = next(
+        step for step in validate["steps"] if step.get("id") == "validate"
+    )
+    validation_run = validation["run"]
+
+    assert checkout["with"] == {
+        "ref": "${{ github.sha }}",
+        "fetch-depth": "0",
+        "persist-credentials": "false",
+    }
+    assert validation["env"]["RAW_VERSION"] == "${{ inputs.version }}"
+    assert validation["env"]["EXPECTED_SHA"] == "${{ inputs.expected_sha }}"
+    assert validation["env"]["DRY_RUN"] == "${{ inputs.dry_run }}"
+    assert validation["env"]["DISPATCHED_SHA"] == "${{ github.sha }}"
+    for required in (
+        "workflow_dispatch",
+        "refs/heads/main",
+        '"ls-remote"',
+        "packaging.version",
+        "Version(",
+        "pyproject.toml",
+        "ast.parse",
+        "llm_exec_core/__init__.py",
+        "uv.lock",
+        'editable = "."',
+        "40-character lower-case SHA",
+        "git/ref/tags",
+        "releases/tags",
+        "assets",
+        "publish blocked",
+    ):
+        assert required in validation_run
+    assert "str(parsed_version) != raw_version" in validation_run
+    assert set(validate["outputs"]) == {
+        "version",
+        "tag",
+        "expected_sha",
+        "artifact_name",
+        "publish_blocked",
+        "collision_report",
+    }
+
+
+def test_release_workflow_builds_once_and_reuses_exact_candidate() -> None:
+    text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    workflow = yaml.load(text, Loader=yaml.BaseLoader)
+    jobs = workflow["jobs"]
+    assert set(jobs) == {
+        "validate",
+        "quality",
+        "build",
+        "install",
+        "publish",
+        "summary",
+    }
+
+    quality = jobs["quality"]
+    assert quality["needs"] == "validate"
+    assert quality["strategy"]["fail-fast"] == "false"
+    assert quality["strategy"]["matrix"]["python-version"] == [
+        "3.10",
+        "3.13",
+    ]
+    quality_run = "\n".join(step.get("run", "") for step in quality["steps"])
+    for command in (
+        "uv sync --locked --group dev",
+        "uv run --frozen pytest -q",
+        "uv run --frozen black --check src tests",
+        "uv run --frozen flake8 src tests",
+        "uv run --frozen mypy src",
+    ):
+        assert command in quality_run
+    assert "uv build" not in quality_run
+
+    build = jobs["build"]
+    assert set(build["needs"]) == {"validate", "quality"}
+    install = jobs["install"]
+    assert set(install["needs"]) == {"validate", "build"}
+    assert install["strategy"]["fail-fast"] == "false"
+    assert install["strategy"]["matrix"] == {
+        "python-version": ["3.10", "3.13"],
+        "distribution": ["wheel", "sdist"],
+    }
+    all_run = "\n".join(
+        step.get("run", "")
+        for job in jobs.values()
+        for step in job.get("steps", [])
+    )
+    assert len(re.findall(r"(?m)^\s*uv build\s*$", all_run)) == 1
+
+    build_run = "\n".join(step.get("run", "") for step in build["steps"])
+    for required in (
+        "exactly one wheel",
+        "exactly one sdist",
+        "METADATA",
+        "PKG-INFO",
+        "CHANGELOG.md",
+        "previous_tag",
+        "RELEASE_NOTES.md",
+        "PROVENANCE.json",
+        "sort_keys=True",
+        "SHA256SUMS",
+        "exact five-file candidate set",
+    ):
+        assert required in build_run
+    assert build_run.index("PROVENANCE.json") < build_run.index("SHA256SUMS")
+
+    upload_steps = [
+        step
+        for step in build["steps"]
+        if step.get("uses", "").startswith("actions/upload-artifact@")
+    ]
+    assert len(upload_steps) == 1
+    assert set(upload_steps[0]["with"]["path"].splitlines()) == {
+        "candidate/*.whl",
+        "candidate/*.tar.gz",
+        "candidate/SHA256SUMS",
+        "candidate/RELEASE_NOTES.md",
+        "candidate/PROVENANCE.json",
+    }
+
+    for job_name in ("install", "publish"):
+        steps = jobs[job_name]["steps"]
+        assert any(
+            step.get("uses", "").startswith("actions/download-artifact@")
+            for step in steps
+        )
+        run = "\n".join(step.get("run", "") for step in steps)
+        assert "sha256sum --check SHA256SUMS" in run
+        assert "exact five-file candidate set" in run
+
+    install_run = "\n".join(step.get("run", "") for step in install["steps"])
+    install_step = next(
+        step
+        for step in install["steps"]
+        if step["name"] == "Verify and install selected distribution"
+    )
+    assert "${{ runner.temp }}" in install_step["env"]["CANDIDATE_DIR"]
+    assert "${{ runner.temp }}" in install_step["env"]["INSTALL_ENV"]
+    assert "uv venv" in install_run
+    assert "uv pip install" in install_run
+    assert 'metadata.version("llm-exec-core")' in install_run
+    assert "llm_exec_core.__version__" in install_run
+
+
+def test_release_workflow_gates_immutable_draft_first_publication() -> None:
+    text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    workflow = yaml.load(text, Loader=yaml.BaseLoader)
+    jobs = workflow["jobs"]
+    publish = jobs["publish"]
+
+    assert set(publish["needs"]) == {"validate", "build", "install"}
+    assert publish["if"] == "${{ inputs.dry_run == false }}"
+    assert publish["permissions"] == {"contents": "write"}
+    assert all(
+        job.get("permissions", {}).get("contents") != "write"
+        for name, job in jobs.items()
+        if name != "publish"
+    )
+
+    publish_steps = publish["steps"]
+    publish_ids = [
+        step["id"] for step in publish_steps if step.get("id") is not None
+    ]
+    assert publish_ids[-5:] == [
+        "publish_preflight",
+        "create_draft",
+        "verify_draft",
+        "publish_release",
+        "verify_public",
+    ]
+    preflight = next(
+        step for step in publish_steps if step.get("id") == "publish_preflight"
+    )
+    assert preflight["env"]["ORIGINAL_ACTOR"] == "${{ github.actor }}"
+    assert (
+        preflight["env"]["TRIGGERING_ACTOR"]
+        == "${{ github.triggering_actor }}"
+    )
+    preflight_run = preflight["run"]
+    for required in (
+        "lanmogu98",
+        "immutable-releases",
+        "remote main",
+        "git/ref/tags",
+        "releases/tags",
+        "target Release asset",
+        "sha256sum --check SHA256SUMS",
+        "exact five-file candidate set",
+    ):
+        assert required in preflight_run
+
+    create_draft = next(
+        step for step in publish_steps if step.get("id") == "create_draft"
+    )["run"]
+    assert "git/refs" in create_draft
+    assert "--draft" in create_draft
+    assert "--notes-file" in create_draft
+    assert "--clobber" not in create_draft
+
+    verify_draft = next(
+        step for step in publish_steps if step.get("id") == "verify_draft"
+    )["run"]
+    for required in (
+        "draft",
+        "RELEASE_NOTES.md",
+        "asset names",
+        "digest",
+    ):
+        assert required in verify_draft
+
+    publish_release = next(
+        step for step in publish_steps if step.get("id") == "publish_release"
+    )["run"]
+    assert "--draft=false" in publish_release
+    verify_public = next(
+        step for step in publish_steps if step.get("id") == "verify_public"
+    )["run"]
+    for required in (
+        "immutable",
+        "git/ref/tags",
+        "asset names",
+        "digest",
+        "time.sleep",
+    ):
+        assert required in verify_public
+
+    summary = jobs["summary"]
+    assert summary["if"] == "${{ always() }}"
+    assert set(summary["needs"]) == {
+        "validate",
+        "quality",
+        "build",
+        "install",
+        "publish",
+    }
+    summary_run = "\n".join(step.get("run", "") for step in summary["steps"])
+    assert "publish blocked" in summary_run
+    assert "validation" in summary_run
+
+
+def test_release_runbook_documents_owner_gates_and_recovery() -> None:
+    text = (ROOT / "docs" / "governance" / "release.md").read_text(
+        encoding="utf-8"
+    )
+    for required in (
+        "default branch",
+        "workflow_dispatch",
+        "expected_sha",
+        "remote `main`",
+        "`dry_run=true`",
+        "`0.4.1`",
+        "publish blocked",
+        "Python 3.10 and 3.13",
+        "four clean-install",
+        "`SHA256SUMS`",
+        "`RELEASE_NOTES.md`",
+        "`PROVENANCE.json`",
+        "immutable Releases",
+        "merge",
+        "dispatch",
+        "publication",
+        "incomplete draft",
+        "revert",
+        "never rewrite",
+        "new version",
+        "`setuptools>=64`",
+    ):
+        assert required in text
 
 
 def test_public_intake_and_policy_files_are_consistent() -> None:
