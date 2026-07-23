@@ -10,15 +10,28 @@ import os
 import time
 from collections import OrderedDict, deque
 from copy import deepcopy
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Literal, Mapping, Optional, Tuple
 from urllib.parse import SplitResult, urlsplit
 
 import httpx
 import jsonschema
 
-from .config import ModelCapabilities, get_model_details, get_supported_models
+from .config import (
+    ModelCapabilities,
+    Pricing,
+    PricingCalculationError,
+    PricingContext,
+    PricingContextRequiredError,
+    PricingCost,
+    PricingSchedule,
+    _resolve_declared_pricing,
+    calculate_pricing_cost,
+    get_model_details,
+    get_supported_models,
+)
 from .constants import (
     API_REQUEST_TIMEOUT_SECONDS,
     INITIAL_RETRY_DELAY_SECONDS,
@@ -46,6 +59,102 @@ _KNOWN_CAPABILITY_CONTROL_FIELDS = {
 }
 _MISSING = object()
 _ASCII_EDGE_WHITESPACE = " \t\n\r\v\f"
+
+
+@dataclass(frozen=True, slots=True)
+class _PricingUsageParts:
+    prompt_tokens: int
+    completion_tokens: int
+    ordinary_input_tokens: int
+    cache_read_input_tokens: int
+    cache_write_input_tokens: int
+
+
+def _usage_token(
+    values: Dict[str, Any], field_name: str, *, required: bool
+) -> int:
+    if field_name not in values:
+        if required:
+            raise PricingCalculationError(
+                f"OpenAI Chat Completions usage requires {field_name}."
+            )
+        return 0
+    value = values[field_name]
+    if type(value) is not int or value < 0:
+        raise PricingCalculationError(
+            f"OpenAI Chat Completions usage {field_name} must be a plain "
+            "nonnegative integer."
+        )
+    return value
+
+
+def _parse_openai_chat_usage(
+    usage: Any,
+    cache_mode: Literal["none", "implicit", "explicit"],
+) -> _PricingUsageParts:
+    if type(usage) is not dict:
+        raise PricingCalculationError(
+            "OpenAI Chat Completions usage must be a JSON object."
+        )
+
+    prompt_tokens = _usage_token(usage, "prompt_tokens", required=True)
+    completion_tokens = _usage_token(usage, "completion_tokens", required=True)
+    details_value = usage.get("prompt_tokens_details", _MISSING)
+
+    if cache_mode == "none":
+        if details_value is _MISSING or details_value is None:
+            details = {}
+        elif type(details_value) is dict:
+            details = details_value
+        else:
+            raise PricingCalculationError(
+                "prompt_tokens_details must be a JSON object or null for "
+                "none cache mode."
+            )
+        cache_read = _usage_token(details, "cached_tokens", required=False)
+        cache_write = _usage_token(
+            details, "cache_creation_input_tokens", required=False
+        )
+        if cache_read != 0 or cache_write != 0:
+            raise PricingCalculationError(
+                "none cache mode contradicts nonzero cache token buckets."
+            )
+    elif cache_mode == "implicit":
+        if type(details_value) is not dict:
+            raise PricingCalculationError(
+                "implicit cache mode requires prompt_tokens_details."
+            )
+        details = details_value
+        cache_read = _usage_token(details, "cached_tokens", required=True)
+        cache_write = _usage_token(
+            details, "cache_creation_input_tokens", required=False
+        )
+        if cache_write != 0:
+            raise PricingCalculationError(
+                "implicit cache mode contradicts cache creation tokens."
+            )
+    else:
+        if type(details_value) is not dict:
+            raise PricingCalculationError(
+                "explicit cache mode requires prompt_tokens_details."
+            )
+        details = details_value
+        cache_read = _usage_token(details, "cached_tokens", required=True)
+        cache_write = _usage_token(
+            details, "cache_creation_input_tokens", required=True
+        )
+
+    if cache_read + cache_write > prompt_tokens:
+        raise PricingCalculationError(
+            "Cache token buckets cannot exceed prompt_tokens."
+        )
+    return _PricingUsageParts(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        ordinary_input_tokens=prompt_tokens - cache_read - cache_write,
+        cache_read_input_tokens=cache_read,
+        cache_write_input_tokens=cache_write,
+    )
 
 
 def _reject_non_finite_json_constant(value: str) -> None:
@@ -274,6 +383,8 @@ class LLMClient:
         model_name: str,
         thinking_level: str | None = None,
         config_source: Path | Dict[str, Any] | None = None,
+        *,
+        pricing_context: PricingContext | Mapping[str, Any] | None = None,
     ) -> None:
         """
         Initialize the LLM client for a specific model.
@@ -285,6 +396,7 @@ class LLMClient:
                 For Gemini 3+, maps to reasoning_effort.
             config_source: Required complete config Path or raw dictionary.
                 Omitting it or passing None raises ValueError.
+            pricing_context: Exact context required by rich pricing schedules.
         """
         provider_name, provider_settings, model_details = get_model_details(
             model_name, config_source
@@ -321,7 +433,33 @@ class LLMClient:
         self.capabilities = model_details.capabilities
         self.provider_name = provider_name
         self.pricing = model_details.pricing
+        self._provider_pricing_currency = provider_settings.pricing_currency
         self.pricing_currency = provider_settings.pricing_currency
+        self._usage_currency: str | None = (
+            None
+            if isinstance(self.pricing, PricingSchedule)
+            else provider_settings.pricing_currency
+        )
+        self.pricing_context: PricingContext | None = None
+        if isinstance(self.pricing, PricingSchedule):
+            if pricing_context is None:
+                raise PricingContextRequiredError(
+                    f"Pricing context is required for model '{model_name}'."
+                )
+            if isinstance(pricing_context, PricingContext):
+                self.pricing_context = pricing_context.model_copy(deep=True)
+            elif isinstance(pricing_context, Mapping):
+                self.pricing_context = PricingContext.model_validate(
+                    deepcopy(dict(pricing_context))
+                )
+            else:
+                raise PricingContextRequiredError(
+                    f"Pricing context is required for model '{model_name}'."
+                )
+            if self.pricing_context.request_mode == "batch":
+                raise PricingCalculationError(
+                    "LLMClient supports realtime pricing contexts only."
+                )
         self.temperature = (
             model_details.temperature
             if model_details.temperature is not None
@@ -966,6 +1104,7 @@ class LLMClient:
         structured_output: Mapping[str, Any] | None = None,
     ) -> LLMResult:
         """Generate a structured LLM result."""
+        pricing_effective_at = datetime.now(timezone.utc)
         started_at = datetime.now()
         start_time = time.time()
         data, planning_metadata = self._build_request_plan(
@@ -1026,7 +1165,12 @@ class LLMClient:
             try:
                 if stream:
                     response_text, legacy_usage = await self._stream_response(
-                        client, data, start_time, request_name, stream_callback
+                        client,
+                        data,
+                        start_time,
+                        request_name,
+                        pricing_effective_at,
+                        stream_callback,
                     )
                 else:
                     legacy_result = await self._non_stream_response(
@@ -1034,6 +1178,7 @@ class LLMClient:
                         data,
                         start_time,
                         request_name,
+                        pricing_effective_at,
                     )
                     response_text, legacy_usage = legacy_result
 
@@ -1189,6 +1334,7 @@ class LLMClient:
         data: dict,
         start_time: float,
         request_name: str,
+        pricing_effective_at: datetime,
     ) -> Tuple[str, Dict[str, Any]]:
         """Handle non-streaming API response."""
         response = await client.post(
@@ -1201,11 +1347,27 @@ class LLMClient:
         result = response.json()
         response_text = result["choices"][0]["message"]["content"]
 
-        input_tokens = result.get("usage", {}).get("prompt_tokens", 0)
-        output_tokens = result.get("usage", {}).get("completion_tokens", 0)
+        pricing_cost = None
+        if isinstance(self.pricing, PricingSchedule):
+            assert self.pricing_context is not None
+            usage_parts = _parse_openai_chat_usage(
+                result.get("usage"), self.pricing_context.cache_mode
+            )
+            pricing_cost = self._calculate_rich_pricing(
+                usage_parts, pricing_effective_at
+            )
+            input_tokens = usage_parts.prompt_tokens
+            output_tokens = usage_parts.completion_tokens
+        else:
+            input_tokens = result.get("usage", {}).get("prompt_tokens", 0)
+            output_tokens = result.get("usage", {}).get("completion_tokens", 0)
 
         usage = self._track_usage(
-            input_tokens, output_tokens, start_time, request_name
+            input_tokens,
+            output_tokens,
+            start_time,
+            request_name,
+            pricing_cost=pricing_cost,
         )
         return response_text, usage
 
@@ -1215,12 +1377,14 @@ class LLMClient:
         data: dict,
         start_time: float,
         request_name: str,
+        pricing_effective_at: datetime,
         stream_callback: Optional[Callable[[str], None]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Handle streaming API response with real-time output or callback."""
         full_content = []
         input_tokens = 0
         output_tokens = 0
+        raw_usage = None
 
         async with client.stream(
             "POST", self.api_url, headers=self.headers, json=data
@@ -1250,28 +1414,68 @@ class LLMClient:
                                 stream_callback(content)
 
                     if "usage" in chunk and chunk["usage"] is not None:
-                        input_tokens = chunk["usage"].get("prompt_tokens", 0)
-                        output_tokens = chunk["usage"].get(
-                            "completion_tokens", 0
-                        )
+                        raw_usage = chunk["usage"]
                 except json.JSONDecodeError:
                     continue
 
         response_text = "".join(full_content)
 
-        if input_tokens == 0:
-            prompt_content = ""
-            for msg in data.get("messages", []):
-                prompt_content += msg.get("content", "")
-            input_tokens = estimate_tokens(prompt_content)
+        pricing_cost = None
+        if isinstance(self.pricing, PricingSchedule):
+            assert self.pricing_context is not None
+            usage_parts = _parse_openai_chat_usage(
+                raw_usage, self.pricing_context.cache_mode
+            )
+            pricing_cost = self._calculate_rich_pricing(
+                usage_parts, pricing_effective_at
+            )
+            input_tokens = usage_parts.prompt_tokens
+            output_tokens = usage_parts.completion_tokens
+        else:
+            if raw_usage is not None:
+                input_tokens = raw_usage.get("prompt_tokens", 0)
+                output_tokens = raw_usage.get("completion_tokens", 0)
+            if input_tokens == 0:
+                prompt_content = ""
+                for msg in data.get("messages", []):
+                    prompt_content += msg.get("content", "")
+                input_tokens = estimate_tokens(prompt_content)
 
-        if output_tokens == 0:
-            output_tokens = estimate_tokens(response_text)
+            if output_tokens == 0:
+                output_tokens = estimate_tokens(response_text)
 
         usage = self._track_usage(
-            input_tokens, output_tokens, start_time, request_name
+            input_tokens,
+            output_tokens,
+            start_time,
+            request_name,
+            pricing_cost=pricing_cost,
         )
         return response_text, usage
+
+    def _calculate_rich_pricing(
+        self,
+        usage_parts: _PricingUsageParts,
+        effective_at: datetime,
+    ) -> PricingCost:
+        assert isinstance(self.pricing, PricingSchedule)
+        assert self.pricing_context is not None
+        resolved = _resolve_declared_pricing(
+            self.model_name,
+            self.model,
+            self.pricing,
+            self._provider_pricing_currency,
+            pricing_context=self.pricing_context,
+            input_tokens=usage_parts.prompt_tokens,
+            effective_at=effective_at,
+        )
+        return calculate_pricing_cost(
+            resolved,
+            input_tokens=usage_parts.prompt_tokens,
+            output_tokens=usage_parts.completion_tokens,
+            cache_read_input_tokens=usage_parts.cache_read_input_tokens,
+            cache_write_input_tokens=usage_parts.cache_write_input_tokens,
+        )
 
     def _track_usage(
         self,
@@ -1279,39 +1483,78 @@ class LLMClient:
         output_tokens: int,
         start_time: float,
         request_name: str,
+        *,
+        pricing_cost: PricingCost | None = None,
     ) -> Dict[str, Any]:
         """Track token usage and costs. Returns usage for this request."""
-        input_cost = (input_tokens / 1_000_000) * self.pricing.input
-        output_cost = (output_tokens / 1_000_000) * self.pricing.output
-        total_cost = input_cost + output_cost
+        if pricing_cost is None:
+            assert isinstance(self.pricing, Pricing)
+            input_cost = (input_tokens / 1_000_000) * self.pricing.input
+            output_cost = (output_tokens / 1_000_000) * self.pricing.output
+            total_cost = input_cost + output_cost
+            request_currency = self._provider_pricing_currency
+        else:
+            input_cost = pricing_cost.input_cost
+            output_cost = pricing_cost.output_cost
+            total_cost = pricing_cost.total_cost
+            request_currency = pricing_cost.currency
+
+        if (
+            self._usage_currency is not None
+            and self._usage_currency != request_currency
+        ):
+            raise PricingCalculationError(
+                "Client usage accumulation cannot combine currencies."
+            )
 
         end_time = time.time()
         process_time = end_time - start_time
-
-        self.token_usage["total_input_tokens"] += input_tokens
-        self.token_usage["total_output_tokens"] += output_tokens
-        self.token_usage["process_times"]["total_time"] += process_time
-        self.token_usage["cost"]["input_cost"] += input_cost
-        self.token_usage["cost"]["output_cost"] += output_cost
-        self.token_usage["cost"]["total_cost"] += total_cost
-
-        self.token_usage["requests"].append(
-            {
-                "name": request_name,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens,
-                "process_time": process_time,
-                "input_cost": input_cost,
-                "output_cost": output_cost,
-                "total_cost": total_cost,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
+        request_record = {
+            "name": request_name,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "process_time": process_time,
+            "input_cost": input_cost,
+            "output_cost": output_cost,
+            "total_cost": total_cost,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        request_time = {"name": request_name, "process_time": process_time}
+        total_input_tokens = (
+            self.token_usage["total_input_tokens"] + input_tokens
         )
-
-        self.token_usage["process_times"]["request_times"].append(
-            {"name": request_name, "process_time": process_time}
+        total_output_tokens = (
+            self.token_usage["total_output_tokens"] + output_tokens
         )
+        total_process_time = (
+            self.token_usage["process_times"]["total_time"] + process_time
+        )
+        aggregate_input_cost = (
+            self.token_usage["cost"]["input_cost"] + input_cost
+        )
+        aggregate_output_cost = (
+            self.token_usage["cost"]["output_cost"] + output_cost
+        )
+        aggregate_total_cost = (
+            self.token_usage["cost"]["total_cost"] + total_cost
+        )
+        requests = [*self.token_usage["requests"], request_record]
+        request_times = [
+            *self.token_usage["process_times"]["request_times"],
+            request_time,
+        ]
+
+        self._usage_currency = request_currency
+        self.pricing_currency = request_currency
+        self.token_usage["total_input_tokens"] = total_input_tokens
+        self.token_usage["total_output_tokens"] = total_output_tokens
+        self.token_usage["process_times"]["total_time"] = total_process_time
+        self.token_usage["process_times"]["request_times"] = request_times
+        self.token_usage["cost"]["input_cost"] = aggregate_input_cost
+        self.token_usage["cost"]["output_cost"] = aggregate_output_cost
+        self.token_usage["cost"]["total_cost"] = aggregate_total_cost
+        self.token_usage["requests"] = requests
 
         return {
             "total_input_tokens": input_tokens,
