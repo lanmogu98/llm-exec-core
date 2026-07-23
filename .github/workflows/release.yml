@@ -504,7 +504,6 @@ jobs:
       name: pypi
       url: https://pypi.org/project/llm-exec-core/${{ inputs.version }}/
     permissions:
-      contents: read
       id-token: write # Required only here for PyPI Trusted Publishing OIDC.
     steps:
       - name: Download validated distributions
@@ -545,7 +544,6 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import base64
           import hashlib
           import json
           import os
@@ -573,6 +571,8 @@ jobs:
           RETRY_SECONDS = 10
           MAX_REDIRECTS = 0
           RUNNER_TEMP = Path(os.environ["RUNNER_TEMP"])
+          VERIFICATION_DIR = RUNNER_TEMP / "public-verification"
+          VERIFICATION_DIR.mkdir(parents=True, exist_ok=True)
 
 
           class PendingPublication(Exception):
@@ -695,7 +695,7 @@ jobs:
               raise SystemExit("release evidence does not match the dispatch")
 
 
-          def verify_registry() -> list[str]:
+          def verify_registry() -> None:
               encoded_version = urllib.parse.quote(VERSION, safe="")
               release_url = f"{PYPI_JSON_PREFIX}{encoded_version}/json"
               release = fetch_json(
@@ -730,7 +730,6 @@ jobs:
               if set(simple_rows) != expected_names:
                   raise SystemExit("PyPI Simple file set mismatch")
 
-              urls = []
               for name in sorted(expected_names):
                   json_row = json_rows[name]
                   simple_row = simple_rows[name]
@@ -768,6 +767,7 @@ jobs:
                       != expected_hashes[name]
                   ):
                       raise SystemExit(f"{name} downloaded hash mismatch")
+                  (VERIFICATION_DIR / name).write_bytes(file_bytes)
 
                   encoded_name = urllib.parse.quote(name, safe="")
                   provenance_url = (
@@ -811,49 +811,18 @@ jobs:
                   if publisher.get("environment") != EXPECTED_ENVIRONMENT:
                       raise SystemExit("publisher environment mismatch")
 
-                  publish_statements = []
-                  for attestation in matching_bundles[0]["attestations"]:
-                      statement = json.loads(
-                          base64.b64decode(
-                              attestation["envelope"]["statement"],
-                              validate=True,
-                          )
-                      )
-                      if (
-                          statement.get("predicateType")
-                          == "https://docs.pypi.org/attestations/publish/v1"
-                      ):
-                          publish_statements.append(statement)
-                  if len(publish_statements) != 1:
-                      raise SystemExit(
-                          f"{name} must have one publish attestation"
-                      )
-                  if publish_statements[0].get("subject") != [
-                      {
-                          "name": name,
-                          "digest": {
-                              "sha256": expected_hashes[name],
-                          },
-                      }
-                  ]:
-                      raise SystemExit(
-                          f"{name} attestation subject mismatch"
-                      )
-
-                  provenance_path = (
-                      RUNNER_TEMP / f"provenance-{name}.json"
+                  provenance_path = VERIFICATION_DIR / (
+                      f"{name}.provenance.json"
                   )
                   provenance_path.write_text(
                       json.dumps(provenance, sort_keys=True),
                       encoding="utf-8",
                   )
-                  urls.append(file_url)
-              return urls
 
 
           for attempt in range(1, MAX_ATTEMPTS + 1):
               try:
-                  verified_urls = verify_registry()
+                  verify_registry()
                   break
               except PendingPublication as error:
                   if attempt == MAX_ATTEMPTS:
@@ -863,41 +832,36 @@ jobs:
                   time.sleep(RETRY_SECONDS)
           else:
               raise SystemExit("bounded publication verification failed")
-
-          (RUNNER_TEMP / "pypi-urls.txt").write_text(
-              "".join(f"{url}\n" for url in verified_urls),
-              encoding="utf-8",
-          )
           PY
-      - name: Cryptographically verify each PyPI attestation
+      - name: Cryptographically verify saved provenance and signed claims
         shell: bash
         run: |
           set -euo pipefail
-          while IFS= read -r artifact_url; do
-            timeout 90s uvx \
-              --from "pypi-attestations==0.0.29" \
-              --python "3.13.14" \
-              pypi-attestations verify pypi \
-              --repository https://github.com/lanmogu98/llm-exec-core \
-              "$artifact_url"
-          done < "$RUNNER_TEMP/pypi-urls.txt"
-      - name: Verify signed workflow, source SHA, ref, and environment claims
-        shell: bash
-        run: |
-          set -euo pipefail
-          uv run --no-project \
+          timeout 120s uv run \
+            --no-project \
             --python "3.13.14" \
             --with "pypi-attestations==0.0.29" \
             python - <<'PY'
-          import base64
+          import hashlib
           import json
           import os
           from pathlib import Path
 
           from cryptography import x509
           from cryptography.x509.oid import ExtensionOID, ObjectIdentifier
+          from pypi_attestations import (
+              Distribution,
+              GitHubPublisher,
+              Provenance,
+          )
 
           EXPECTED_SHA = os.environ["EXPECTED_SHA"]
+          EXPECTED_REPOSITORY = "lanmogu98/llm-exec-core"
+          EXPECTED_WORKFLOW = "release.yml"
+          EXPECTED_ENVIRONMENT = "pypi"
+          PUBLISH_ATTESTATION = (
+              "https://docs.pypi.org/attestations/publish/v1"
+          )
           EXPECTED_SIGNER = (
               "https://github.com/lanmogu98/llm-exec-core/"
               ".github/workflows/release.yml@refs/heads/main"
@@ -942,37 +906,99 @@ jobs:
               "1.3.6.1.4.1.57264.1.23": "pypi",
           }
 
-          provenance_paths = sorted(
-              Path(os.environ["RUNNER_TEMP"]).glob(
-                  "provenance-*.json"
+          evidence = json.loads(
+              Path("release-artifact/release-evidence.json").read_text(
+                  encoding="utf-8"
               )
           )
-          if len(provenance_paths) != 2:
-              raise SystemExit("expected two saved provenance documents")
+          expected_hashes = evidence.get("files")
+          if not isinstance(expected_hashes, dict) or len(expected_hashes) != 2:
+              raise SystemExit("release evidence must name two files")
+          verification_dir = (
+              Path(os.environ["RUNNER_TEMP"]) / "public-verification"
+          )
 
-          for path in provenance_paths:
-              provenance = json.loads(path.read_text(encoding="utf-8"))
-              bundles = provenance["attestation_bundles"]
-              matching = [
-                  bundle
-                  for bundle in bundles
-                  if bundle["publisher"] == {
-                      "environment": "pypi",
-                      "kind": "GitHub",
-                      "repository": "lanmogu98/llm-exec-core",
-                      "workflow": "release.yml",
-                  }
-              ]
-              if len(matching) != 1:
-                  raise SystemExit("exact publisher bundle not found")
-              attestations = matching[0]["attestations"]
-              if len(attestations) != 1:
-                  raise SystemExit("unexpected attestation count")
-              certificate_der = base64.b64decode(
-                  attestations[0]["verification_material"]["certificate"],
-                  validate=True,
+          for name, expected_hash in sorted(expected_hashes.items()):
+              if Path(name).name != name:
+                  raise SystemExit("unsafe distribution filename")
+              distribution_path = verification_dir / name
+              provenance_path = verification_dir / (
+                  f"{name}.provenance.json"
               )
-              certificate = x509.load_der_x509_certificate(certificate_der)
+              if not distribution_path.is_file():
+                  raise SystemExit(f"missing downloaded distribution: {name}")
+              if not provenance_path.is_file():
+                  raise SystemExit(f"missing saved provenance: {name}")
+
+              distribution = Distribution.from_file(distribution_path)
+              if (
+                  not isinstance(expected_hash, str)
+                  or len(expected_hash) != 64
+                  or distribution.digest != expected_hash
+                  or hashlib.sha256(
+                      distribution_path.read_bytes()
+                  ).hexdigest()
+                  != expected_hash
+              ):
+                  raise SystemExit(f"{name} verifier digest mismatch")
+
+              raw_provenance = json.loads(
+                  provenance_path.read_text(encoding="utf-8")
+              )
+              raw_bundles = raw_provenance.get("attestation_bundles")
+              if not isinstance(raw_bundles, list):
+                  raise SystemExit("invalid attestation bundle list")
+              matching_indexes = []
+              for index, raw_bundle in enumerate(raw_bundles):
+                  if not isinstance(raw_bundle, dict):
+                      continue
+                  publisher = raw_bundle.get("publisher")
+                  if not isinstance(publisher, dict):
+                      continue
+                  if (
+                      publisher.get("kind") == "GitHub"
+                      and publisher.get("repository")
+                      == EXPECTED_REPOSITORY
+                      and publisher.get("workflow") == EXPECTED_WORKFLOW
+                      and publisher.get("environment")
+                      == EXPECTED_ENVIRONMENT
+                  ):
+                      matching_indexes.append(index)
+              if len(matching_indexes) != 1:
+                  raise SystemExit("exact publisher bundle not found")
+
+              provenance = Provenance.model_validate(raw_provenance)
+              if len(provenance.attestation_bundles) != len(raw_bundles):
+                  raise SystemExit("parsed provenance bundle mismatch")
+              bundle = provenance.attestation_bundles[
+                  matching_indexes[0]
+              ]
+              publisher = bundle.publisher
+              if (
+                  not isinstance(publisher, GitHubPublisher)
+                  or publisher.repository != EXPECTED_REPOSITORY
+                  or publisher.workflow != EXPECTED_WORKFLOW
+                  or publisher.environment != EXPECTED_ENVIRONMENT
+              ):
+                  raise SystemExit("parsed publisher identity mismatch")
+
+              verified_publish_attestations = []
+              for attestation in bundle.attestations:
+                  predicate_type, _ = attestation.verify(
+                      publisher,
+                      distribution,
+                  )
+                  if predicate_type == PUBLISH_ATTESTATION:
+                      verified_publish_attestations.append(attestation)
+              if len(verified_publish_attestations) != 1:
+                  raise SystemExit(
+                      f"{name} must have one verified publish attestation"
+                  )
+
+              verified_attestation = verified_publish_attestations[0]
+              certificate = x509.load_der_x509_certificate(
+                  verified_attestation.verification_material.certificate
+              )
               san = certificate.extensions.get_extension_for_oid(
                   ExtensionOID.SUBJECT_ALTERNATIVE_NAME
               ).value

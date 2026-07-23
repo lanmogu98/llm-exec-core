@@ -58,10 +58,18 @@ secret, PAT, or PyPI API token. Attestations remain enabled and
 After upload, a read-only job compares the local files against PyPI's version
 JSON API and Simple JSON API, downloads only bounded HTTPS responses from
 `pypi.org` and `files.pythonhosted.org`, and verifies filenames, sizes,
-non-yanked state, SHA-256 digests, Integrity subjects, publisher identity, and
-certificate claims. It then runs `pypi-attestations verify pypi` for each file
-and requires cryptographic provenance from the exact repository, workflow,
-`main` ref, protected environment, and source SHA.
+non-yanked state, SHA-256 digests, Integrity subjects, and publisher identity.
+One 120-second-bounded verifier then parses each saved provenance document with
+`pypi-attestations` 0.0.29, cryptographically verifies its attestations against
+the exact downloaded distribution, and inspects the certificate on that same
+verified publish-attestation object. It requires the exact repository,
+workflow, `main` ref, protected environment, and source SHA.
+
+The Integrity publisher object is open-ended. Its index-retained `claims`
+member may be omitted, null, or an object and is never treated as authenticated
+release identity. Required publisher fields are matched individually; the
+cryptographically verified Sigstore certificate extensions are authoritative
+for workflow, ref, environment, and source-SHA claims.
 
 ## Ordered owner gates
 

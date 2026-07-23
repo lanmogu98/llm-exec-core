@@ -1,6 +1,10 @@
+import hashlib
+import json
 from pathlib import Path
 import re
 import runpy
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import yaml
@@ -27,6 +31,28 @@ dispatch_requires_refresh = CONTRACT["dispatch_requires_refresh"]
 implementation_action_allowed = CONTRACT["implementation_action_allowed"]
 independent_review_is_valid = CONTRACT["independent_review_is_valid"]
 independent_review_required = CONTRACT["independent_review_required"]
+
+
+def _release_step_run(step_name: str) -> str:
+    text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    workflow = yaml.load(text, Loader=yaml.BaseLoader)
+    matches = [
+        step["run"]
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
+        if step.get("name") == step_name
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _embedded_python(step_name: str) -> str:
+    run = _release_step_run(step_name)
+    marker = "python - <<'PY'\n"
+    assert run.count(marker) == 1
+    script = run.split(marker, 1)[1]
+    assert script.endswith("\nPY\n")
+    return script[: -len("\nPY\n")]
 
 
 def test_ordinary_change_uses_dispatch_without_hash_or_attestation() -> None:
@@ -445,10 +471,7 @@ def test_publish_job_is_minimal_oidc_and_protected_environment_only() -> None:
     assert publish["if"] == "${{ !inputs.dry_run }}"
     assert publish["needs"] == "publication_gate"
     assert publish["environment"]["name"] == "pypi"
-    assert publish["permissions"] == {
-        "contents": "read",
-        "id-token": "write",
-    }
+    assert publish["permissions"] == {"id-token": "write"}
     assert len(publish_steps) == 2
     assert publish_steps[0]["uses"].startswith("actions/download-artifact@")
     assert publisher["uses"].startswith("pypa/gh-action-pypi-publish@")
@@ -497,12 +520,236 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
     assert "1.3.6.1.4.1.57264.1.13" in verify_runs
     assert "EXPECTED_SHA" in verify_runs
     assert "pypi-attestations==0.0.29" in verify_runs
-    assert "pypi-attestations verify pypi" in verify_runs
-    assert (
-        "--repository https://github.com/lanmogu98/llm-exec-core"
-        in verify_runs
+    assert "Provenance.model_validate" in verify_runs
+    assert "attestation.verify(" in verify_runs
+    assert "verification_material.certificate" in verify_runs
+    assert "timeout 120s" in verify_runs
+
+
+@pytest.mark.parametrize(
+    "publisher_extra",
+    [
+        pytest.param({}, id="claims-omitted"),
+        pytest.param({"claims": None}, id="claims-null"),
+        pytest.param(
+            {"claims": {"index-retained": "not-authoritative"}},
+            id="claims-object",
+        ),
+    ],
+)
+def test_saved_provenance_is_verified_before_its_claims_are_inspected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    publisher_extra: dict,
+) -> None:
+    script = _embedded_python(
+        "Cryptographically verify saved provenance and signed claims"
     )
-    assert "timeout 90s" in verify_runs
+    expected_sha = "a" * 40
+    expected_signer = (
+        "https://github.com/lanmogu98/llm-exec-core/"
+        ".github/workflows/release.yml@refs/heads/main"
+    )
+    expected_extensions = {
+        "1.3.6.1.4.1.57264.1.8": (
+            "https://token.actions.githubusercontent.com"
+        ),
+        "1.3.6.1.4.1.57264.1.9": expected_signer,
+        "1.3.6.1.4.1.57264.1.10": expected_sha,
+        "1.3.6.1.4.1.57264.1.11": "github-hosted",
+        "1.3.6.1.4.1.57264.1.12": (
+            "https://github.com/lanmogu98/llm-exec-core"
+        ),
+        "1.3.6.1.4.1.57264.1.13": expected_sha,
+        "1.3.6.1.4.1.57264.1.14": "refs/heads/main",
+        "1.3.6.1.4.1.57264.1.18": expected_signer,
+        "1.3.6.1.4.1.57264.1.19": expected_sha,
+        "1.3.6.1.4.1.57264.1.20": "workflow_dispatch",
+        "1.3.6.1.4.1.57264.1.22": "public",
+        "1.3.6.1.4.1.57264.1.23": "pypi",
+    }
+    verified_attestations = []
+    inspected_attestations = []
+
+    class FakeDistribution:
+        def __init__(self, path: Path) -> None:
+            self.name = path.name
+            self.digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+        @classmethod
+        def from_file(cls, path: Path) -> "FakeDistribution":
+            return cls(path)
+
+    class FakeGitHubPublisher:
+        def __init__(
+            self,
+            *,
+            kind: str,
+            repository: str,
+            workflow: str,
+            environment: str,
+        ) -> None:
+            self.kind = kind
+            self.repository = repository
+            self.workflow = workflow
+            self.environment = environment
+
+    class FakeVerificationMaterial:
+        def __init__(self, attestation: "FakeAttestation") -> None:
+            self.attestation = attestation
+
+        @property
+        def certificate(self) -> bytes:
+            assert self.attestation in verified_attestations
+            inspected_attestations.append(self.attestation)
+            return self.attestation.certificate
+
+    class FakeAttestation:
+        def __init__(self, certificate: bytes) -> None:
+            self.certificate = certificate
+            self.verification_material = FakeVerificationMaterial(self)
+
+        def verify(
+            self,
+            publisher: FakeGitHubPublisher,
+            distribution: FakeDistribution,
+        ) -> tuple[str, None]:
+            assert publisher.repository == "lanmogu98/llm-exec-core"
+            assert distribution.digest
+            verified_attestations.append(self)
+            return (
+                "https://docs.pypi.org/attestations/publish/v1",
+                None,
+            )
+
+    class FakeProvenance:
+        def __init__(self, bundles: list) -> None:
+            self.attestation_bundles = bundles
+
+        @classmethod
+        def model_validate(cls, raw: dict) -> "FakeProvenance":
+            bundles = []
+            for raw_bundle in raw["attestation_bundles"]:
+                raw_publisher = raw_bundle["publisher"]
+                publisher = FakeGitHubPublisher(
+                    kind=raw_publisher["kind"],
+                    repository=raw_publisher["repository"],
+                    workflow=raw_publisher["workflow"],
+                    environment=raw_publisher["environment"],
+                )
+                attestations = [
+                    FakeAttestation(item["certificate"].encode("utf-8"))
+                    for item in raw_bundle["attestations"]
+                ]
+                bundles.append(
+                    SimpleNamespace(
+                        publisher=publisher,
+                        attestations=attestations,
+                    )
+                )
+            return cls(bundles)
+
+    class FakeObjectIdentifier:
+        def __init__(self, dotted_string: str) -> None:
+            self.dotted_string = dotted_string
+
+    class FakeExtensionOID:
+        SUBJECT_ALTERNATIVE_NAME = FakeObjectIdentifier("san")
+
+    class FakeUniformResourceIdentifier:
+        pass
+
+    class FakeSubjectAlternativeName:
+        def get_values_for_type(self, value_type: type) -> list[str]:
+            assert value_type is FakeUniformResourceIdentifier
+            return [expected_signer]
+
+    class FakeExtensions:
+        def get_extension_for_oid(
+            self, oid: FakeObjectIdentifier
+        ) -> SimpleNamespace:
+            if oid.dotted_string == "san":
+                return SimpleNamespace(value=FakeSubjectAlternativeName())
+            value = expected_extensions[oid.dotted_string].encode("utf-8")
+            assert len(value) < 128
+            der_value = b"\x0c" + bytes([len(value)]) + value
+            return SimpleNamespace(value=SimpleNamespace(value=der_value))
+
+    class FakeCertificate:
+        extensions = FakeExtensions()
+
+    def fake_load_der_x509_certificate(value: bytes) -> FakeCertificate:
+        assert value.startswith(b"certificate-")
+        return FakeCertificate()
+
+    pypi_module = ModuleType("pypi_attestations")
+    pypi_module.Distribution = FakeDistribution
+    pypi_module.GitHubPublisher = FakeGitHubPublisher
+    pypi_module.Provenance = FakeProvenance
+    cryptography_module = ModuleType("cryptography")
+    x509_module = ModuleType("cryptography.x509")
+    oid_module = ModuleType("cryptography.x509.oid")
+    x509_module.UniformResourceIdentifier = FakeUniformResourceIdentifier
+    x509_module.load_der_x509_certificate = fake_load_der_x509_certificate
+    oid_module.ExtensionOID = FakeExtensionOID
+    oid_module.ObjectIdentifier = FakeObjectIdentifier
+    cryptography_module.x509 = x509_module
+
+    monkeypatch.setitem(sys.modules, "pypi_attestations", pypi_module)
+    monkeypatch.setitem(sys.modules, "cryptography", cryptography_module)
+    monkeypatch.setitem(sys.modules, "cryptography.x509", x509_module)
+    monkeypatch.setitem(sys.modules, "cryptography.x509.oid", oid_module)
+
+    runner_temp = tmp_path / "runner"
+    verification_dir = runner_temp / "public-verification"
+    verification_dir.mkdir(parents=True)
+    evidence_files = {}
+    for index, name in enumerate(
+        (
+            "llm_exec_core-0.4.2-py3-none-any.whl",
+            "llm_exec_core-0.4.2.tar.gz",
+        )
+    ):
+        distribution = verification_dir / name
+        distribution.write_bytes(f"distribution-{index}".encode("utf-8"))
+        evidence_files[name] = hashlib.sha256(
+            distribution.read_bytes()
+        ).hexdigest()
+        publisher = {
+            "environment": "pypi",
+            "kind": "GitHub",
+            "repository": "lanmogu98/llm-exec-core",
+            "workflow": "release.yml",
+            **publisher_extra,
+        }
+        provenance = {
+            "version": 1,
+            "attestation_bundles": [
+                {
+                    "publisher": publisher,
+                    "attestations": [{"certificate": f"certificate-{index}"}],
+                }
+            ],
+        }
+        (verification_dir / f"{name}.provenance.json").write_text(
+            json.dumps(provenance),
+            encoding="utf-8",
+        )
+
+    evidence_dir = tmp_path / "release-artifact"
+    evidence_dir.mkdir()
+    (evidence_dir / "release-evidence.json").write_text(
+        json.dumps({"files": evidence_files}),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("EXPECTED_SHA", expected_sha)
+    monkeypatch.setenv("RUNNER_TEMP", str(runner_temp))
+
+    exec(compile(script, "<release-verifier>", "exec"), {})
+
+    assert len(verified_attestations) == 2
+    assert inspected_attestations == verified_attestations
 
 
 def test_release_runbook_records_owner_gates_and_safe_recovery() -> None:
