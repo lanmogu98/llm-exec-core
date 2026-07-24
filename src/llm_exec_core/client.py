@@ -19,9 +19,13 @@ from urllib.parse import SplitResult, urlsplit
 
 import httpx
 import jsonschema
+from pydantic import ValidationError
 
 from .config import (
+    GenerationControls,
+    GenerationPolicy,
     ModelCapabilities,
+    NumericRange,
     Pricing,
     PricingAmbiguityError,
     PricingCalculationError,
@@ -30,7 +34,12 @@ from .config import (
     PricingCost,
     PricingNoMatchError,
     PricingSchedule,
+    ActiveReasoningMode,
+    ReasoningEffortPolicy,
+    SelectableReasoningMode,
+    SamplingRule,
     UsageAccountingProfile,
+    WirePath,
     _resolve_declared_pricing,
     calculate_pricing_cost,
     get_model_details,
@@ -499,17 +508,37 @@ class LLMClient:
         provider_name, provider_settings, model_details = get_model_details(
             model_name, config_source
         )
-        if (
-            thinking_level
-            and model_details.capabilities is not None
-            and "reasoning_effort"
-            not in model_details.capabilities.reasoning_controls
-        ):
-            raise ValueError(
-                f"{model_name} thinking_level requires reasoning_effort "
-                "in model capabilities."
+        self.model_name = model_name
+        self.capabilities = model_details.capabilities
+        generation_policy = (
+            None
+            if self.capabilities is None
+            else self.capabilities.generation_policy
+        )
+        self._thinking_level: str | None
+        if thinking_level and generation_policy is not None:
+            effort_policy = generation_policy.reasoning.effort
+            if effort_policy is None:
+                raise ValueError(
+                    f"{model_name} generation policy does not declare effort "
+                    "for thinking_level."
+                )
+            self._thinking_level = self._normalize_effort_value(
+                effort_policy,
+                thinking_level,
             )
-        self._thinking_level = thinking_level
+        else:
+            if (
+                thinking_level
+                and self.capabilities is not None
+                and "reasoning_effort"
+                not in self.capabilities.reasoning_controls
+            ):
+                raise ValueError(
+                    f"{model_name} thinking_level requires reasoning_effort "
+                    "in model capabilities."
+                )
+            self._thinking_level = thinking_level
 
         self.api_key = _resolve_api_key(
             provider_settings.api_key_env_var,
@@ -526,9 +555,7 @@ class LLMClient:
             if model_details.max_tokens is not None
             else provider_settings.max_tokens
         )
-        self.model_name = model_name
         self.model = model_details.id
-        self.capabilities = model_details.capabilities
         self.provider_name = provider_name
         self.pricing = model_details.pricing
         self._provider_pricing_currency = provider_settings.pricing_currency
@@ -568,6 +595,8 @@ class LLMClient:
                     "LLMClient supports realtime pricing contexts only."
                 )
             self._pricing_context = resolved_pricing_context
+        self._provider_temperature = provider_settings.temperature
+        self._model_temperature = model_details.temperature
         self.temperature = (
             model_details.temperature
             if model_details.temperature is not None
@@ -595,6 +624,8 @@ class LLMClient:
         model_request_overrides = self._normalize_request_options(
             model_details.request_overrides
         )
+        self._provider_request_overrides = deepcopy(provider_request_overrides)
+        self._model_request_overrides = deepcopy(model_request_overrides)
         provider_stream_options = provider_request_overrides.pop(
             "stream_options", _MISSING
         )
@@ -608,7 +639,7 @@ class LLMClient:
         )
         if stream_options is not _MISSING:
             self.request_overrides["stream_options"] = stream_options
-        if self._thinking_level:
+        if self._thinking_level and generation_policy is None:
             self.request_overrides["reasoning_effort"] = self._thinking_level
 
         self.token_usage: Dict[str, Any] = {
@@ -778,11 +809,12 @@ class LLMClient:
         prompt: str,
         stream: bool,
         request_options: Mapping[str, Any] | None,
-    ) -> Tuple[Dict[str, Any], set[str]]:
+    ) -> Tuple[Dict[str, Any], set[str], Dict[str, Any]]:
         provider_options = self._normalize_request_options(
             self.request_overrides
         )
         per_call_options = self._normalize_request_options(request_options)
+        policy_per_call_options = deepcopy(per_call_options)
 
         self._validate_no_protected_fields(
             provider_options, "provider request override"
@@ -811,10 +843,12 @@ class LLMClient:
         data: Dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": self.temperature,
             "stream": stream,
         }
-        core_default_fields = {"temperature"}
+        core_default_fields: set[str] = set()
+        if self.temperature is not None:
+            data["temperature"] = self.temperature
+            core_default_fields.add("temperature")
         if not has_explicit_token_limit:
             data[self.output_token_field] = self.max_tokens
             core_default_fields.add(self.output_token_field)
@@ -840,7 +874,916 @@ class LLMClient:
                 merged_stream_options.setdefault("include_usage", True)
                 data["stream_options"] = merged_stream_options
 
-        return data, core_default_fields
+        return data, core_default_fields, policy_per_call_options
+
+    def _generation_policy(self) -> GenerationPolicy | None:
+        if self.capabilities is None:
+            return None
+        return self.capabilities.generation_policy
+
+    def _policy_paths(
+        self,
+        policy: GenerationPolicy,
+    ) -> Dict[str, WirePath]:
+        paths: Dict[str, WirePath] = {
+            "sampling.temperature": ("temperature",),
+            "sampling.top_p": ("top_p",),
+        }
+        reasoning = policy.reasoning
+        if reasoning.mode is not None:
+            paths["reasoning.mode"] = reasoning.mode.path
+        if reasoning.effort is not None:
+            paths["reasoning.effort"] = reasoning.effort.path
+        if reasoning.budget_tokens is not None:
+            paths["reasoning.budget_tokens"] = reasoning.budget_tokens.path
+        return paths
+
+    def _path_label(self, path: WirePath) -> str:
+        return ".".join(path)
+
+    def _read_declared_path(
+        self,
+        options: Mapping[str, Any],
+        path: WirePath,
+        semantic_name: str,
+    ) -> Tuple[bool, Any]:
+        current: Any = options
+        for segment in path[:-1]:
+            if not isinstance(current, Mapping):
+                raise ValueError(
+                    f"{semantic_name} path {self._path_label(path)} "
+                    "requires mapping containers."
+                )
+            if segment not in current:
+                return False, _MISSING
+            current = current[segment]
+        if not isinstance(current, Mapping):
+            raise ValueError(
+                f"{semantic_name} path {self._path_label(path)} requires "
+                "mapping containers."
+            )
+        leaf = path[-1]
+        if leaf not in current:
+            return False, _MISSING
+        return True, current[leaf]
+
+    def _mutable_path_child(
+        self,
+        current: Dict[str, Any],
+        segment: str,
+        path: WirePath,
+        semantic_name: str,
+    ) -> Dict[str, Any]:
+        child = current[segment]
+        if not isinstance(child, Mapping):
+            raise ValueError(
+                f"{semantic_name} path {self._path_label(path)} requires "
+                "mapping containers."
+            )
+        if not isinstance(child, dict):
+            child = deepcopy(dict(child))
+            current[segment] = child
+        return child
+
+    def _remove_declared_path(
+        self,
+        data: Dict[str, Any],
+        path: WirePath,
+        semantic_name: str,
+    ) -> None:
+        current = data
+        parents: list[Tuple[Dict[str, Any], str]] = []
+        for segment in path[:-1]:
+            if segment not in current:
+                return
+            parents.append((current, segment))
+            current = self._mutable_path_child(
+                current, segment, path, semantic_name
+            )
+        current.pop(path[-1], None)
+        for parent, segment in reversed(parents):
+            child = parent.get(segment)
+            if isinstance(child, Mapping) and not child:
+                parent.pop(segment, None)
+            else:
+                break
+
+    def _write_declared_path(
+        self,
+        data: Dict[str, Any],
+        path: WirePath,
+        value: Any,
+        semantic_name: str,
+    ) -> None:
+        current = data
+        for segment in path[:-1]:
+            if segment not in current:
+                current[segment] = {}
+            current = self._mutable_path_child(
+                current, segment, path, semantic_name
+            )
+        current[path[-1]] = deepcopy(value)
+
+    def _decode_reasoning_mode(
+        self,
+        policy: GenerationPolicy,
+        value: Any,
+    ) -> SelectableReasoningMode:
+        mode_wire = policy.reasoning.mode
+        if mode_wire is None:
+            raise ValueError(
+                f"{self.model_name} generation policy has no selectable "
+                "reasoning mode."
+            )
+        for mode, wire_value in mode_wire.values.items():
+            if type(value) is type(wire_value) and value == wire_value:
+                return mode
+        raise ValueError(
+            f"{self.model_name} reasoning mode at "
+            f"{self._path_label(mode_wire.path)} is not declared."
+        )
+
+    def _normalize_semantic_mode(
+        self,
+        policy: GenerationPolicy,
+        value: Any,
+    ) -> SelectableReasoningMode:
+        if policy.reasoning.availability == "always-on":
+            raise ValueError(
+                f"{self.model_name} always-on reasoning does not accept a "
+                "caller-selected mode."
+            )
+        if (
+            type(value) is not str
+            or value not in policy.reasoning.allowed_modes
+        ):
+            raise ValueError(
+                f"{self.model_name} reasoning mode is not allowed by the "
+                "generation policy."
+            )
+        if value == "always-on":
+            raise ValueError(
+                f"{self.model_name} always-on is not a caller-selectable "
+                "reasoning mode."
+            )
+        return cast(SelectableReasoningMode, value)
+
+    def _normalize_effort_value(
+        self,
+        policy: ReasoningEffortPolicy,
+        value: Any,
+    ) -> str:
+        if type(value) is not str:
+            raise ValueError(
+                f"{self.model_name} reasoning effort must be a string."
+            )
+        if value in policy.allowed_values:
+            return value
+        if value in policy.aliases:
+            return policy.aliases[value]
+        raise ValueError(
+            f"{self.model_name} reasoning effort is not in the allowed "
+            "generation-policy values."
+        )
+
+    def _normalize_budget_value(
+        self,
+        policy: GenerationPolicy,
+        value: Any,
+    ) -> int:
+        budget_policy = policy.reasoning.budget_tokens
+        assert budget_policy is not None
+        if type(value) is not int:
+            raise ValueError(
+                f"{self.model_name} reasoning budget must be a plain integer."
+            )
+        if value < budget_policy.minimum:
+            raise ValueError(
+                f"{self.model_name} reasoning budget is below its minimum."
+            )
+        if budget_policy.maximum is not None and value > budget_policy.maximum:
+            raise ValueError(
+                f"{self.model_name} reasoning budget exceeds its maximum."
+            )
+        return value
+
+    def _range_contains(
+        self,
+        numeric_range: NumericRange,
+        value: float,
+    ) -> bool:
+        above_minimum = (
+            value >= numeric_range.minimum
+            if numeric_range.minimum_inclusive
+            else value > numeric_range.minimum
+        )
+        below_maximum = (
+            value <= numeric_range.maximum
+            if numeric_range.maximum_inclusive
+            else value < numeric_range.maximum
+        )
+        return above_minimum and below_maximum
+
+    def _normalize_sampling_value(
+        self,
+        semantic_name: str,
+        value: Any,
+        numeric_range: NumericRange | None = None,
+    ) -> float:
+        if type(value) not in {int, float}:
+            raise ValueError(
+                f"{self.model_name} {semantic_name} must be a number."
+            )
+        if not math.isfinite(value):
+            raise ValueError(
+                f"{self.model_name} {semantic_name} must be finite."
+            )
+        normalized = float(value)
+        if normalized == 0.0:
+            normalized = 0.0
+        if numeric_range is not None and not self._range_contains(
+            numeric_range, normalized
+        ):
+            raise ValueError(
+                f"{self.model_name} {semantic_name} is outside the declared "
+                "range."
+            )
+        return normalized
+
+    def _normalize_generation_controls(
+        self,
+        generation_controls: GenerationControls | Mapping[str, Any] | None,
+    ) -> Tuple[Dict[str, Tuple[bool, Any]], bool]:
+        if generation_controls is None:
+            return {}, False
+        if isinstance(generation_controls, GenerationControls):
+            controls = generation_controls.model_copy(deep=True)
+        elif isinstance(generation_controls, Mapping):
+            try:
+                controls = GenerationControls.model_validate(
+                    deepcopy(dict(generation_controls))
+                )
+            except ValidationError:
+                raise ValueError(
+                    "generation_controls contains an invalid typed control."
+                ) from None
+        else:
+            raise ValueError(
+                "generation_controls must be GenerationControls, a mapping, "
+                "or None."
+            )
+
+        values: Dict[str, Tuple[bool, Any]] = {}
+        group_fields = {
+            "reasoning": ("mode", "effort", "budget_tokens"),
+            "sampling": ("temperature", "top_p"),
+        }
+        for group_name, fields in group_fields.items():
+            if group_name not in controls.model_fields_set:
+                continue
+            group = getattr(controls, group_name)
+            if group is None:
+                for field in fields:
+                    values[f"{group_name}.{field}"] = (True, None)
+                continue
+            for field in fields:
+                if field in group.model_fields_set:
+                    values[f"{group_name}.{field}"] = (
+                        True,
+                        deepcopy(getattr(group, field)),
+                    )
+        return values, bool(controls.model_fields_set)
+
+    def _layer_value(
+        self,
+        options: Mapping[str, Any],
+        path: WirePath,
+        semantic_name: str,
+        source: str,
+        rank: int,
+    ) -> Tuple[str, int, Any] | None:
+        present, value = self._read_declared_path(options, path, semantic_name)
+        if not present:
+            return None
+        return source, rank, deepcopy(value)
+
+    def _resolve_layered_value(
+        self,
+        entries: list[Tuple[str, int, Any] | None],
+    ) -> Tuple[str, int, Any] | None:
+        present = [entry for entry in entries if entry is not None]
+        return present[-1] if present else None
+
+    def _sampling_rule(
+        self,
+        policy: GenerationPolicy,
+        semantic_name: str,
+        reasoning_mode: str,
+    ) -> SamplingRule:
+        control = getattr(policy.sampling, semantic_name)
+        return control.by_reasoning_mode.get(reasoning_mode, control.base)
+
+    def _plan_sampling_control(
+        self,
+        data: Dict[str, Any],
+        policy: GenerationPolicy,
+        semantic_name: str,
+        reasoning_mode: str,
+        resolved: Tuple[str, int, Any] | None,
+    ) -> None:
+        path = (semantic_name,)
+        self._remove_declared_path(data, path, f"sampling {semantic_name}")
+        if resolved is None:
+            return
+        source, _, value = resolved
+        if value is None:
+            return
+        rule = self._sampling_rule(policy, semantic_name, reasoning_mode)
+        per_call = source.startswith("per-call")
+        if not per_call and rule.state != "supported":
+            return
+        if rule.state == "supported":
+            assert rule.range is not None
+            normalized = self._normalize_sampling_value(
+                semantic_name, value, rule.range
+            )
+            self._write_declared_path(
+                data, path, normalized, f"sampling {semantic_name}"
+            )
+            return
+        if rule.state == "fixed":
+            assert rule.fixed_value is not None
+            normalized = self._normalize_sampling_value(semantic_name, value)
+            if normalized != rule.fixed_value:
+                raise ValueError(
+                    f"{self.model_name} {semantic_name} must equal its fixed "
+                    "generation-policy value."
+                )
+            return
+        if rule.state == "ignored":
+            self._normalize_sampling_value(semantic_name, value)
+            return
+        raise ValueError(
+            f"{self.model_name} {semantic_name} is {rule.state} by the "
+            "generation policy."
+        )
+
+    def _plan_generation_policy(
+        self,
+        data: Dict[str, Any],
+        core_default_fields: set[str],
+        per_call_options: Mapping[str, Any],
+        generation_controls: GenerationControls | Mapping[str, Any] | None,
+    ) -> None:
+        typed_values, controls_nonempty = self._normalize_generation_controls(
+            generation_controls
+        )
+        policy = self._generation_policy()
+        if policy is None:
+            if controls_nonempty:
+                raise ValueError(
+                    f"{self.model_name} has no generation_policy for "
+                    "generation_controls."
+                )
+            return
+
+        paths = self._policy_paths(policy)
+        for semantic_name, path in paths.items():
+            raw_present, _ = self._read_declared_path(
+                per_call_options, path, semantic_name
+            )
+            typed_present = typed_values.get(semantic_name, (False, _MISSING))[
+                0
+            ]
+            if raw_present and typed_present:
+                control_name = semantic_name.rsplit(".", 1)[-1]
+                raise ValueError(
+                    f"{control_name} cannot be declared through both raw "
+                    "request_options and typed generation_controls."
+                )
+
+        mode_path = paths.get("reasoning.mode")
+        mode_entries: list[Tuple[str, int, Any] | None] = []
+        if mode_path is not None:
+            mode_entries.extend(
+                [
+                    self._layer_value(
+                        self._provider_request_overrides,
+                        mode_path,
+                        "reasoning mode",
+                        "provider",
+                        0,
+                    ),
+                    self._layer_value(
+                        self._model_request_overrides,
+                        mode_path,
+                        "reasoning mode",
+                        "model",
+                        1,
+                    ),
+                    self._layer_value(
+                        per_call_options,
+                        mode_path,
+                        "reasoning mode",
+                        "per-call-raw",
+                        3,
+                    ),
+                ]
+            )
+        typed_mode = typed_values.get("reasoning.mode")
+        if typed_mode is not None and typed_mode[0]:
+            mode_entries.append(("per-call-typed", 3, typed_mode[1]))
+        resolved_mode = self._resolve_layered_value(mode_entries)
+        mode_source: str | None = None
+        mode_rank = -1
+        mode_value: Any = _MISSING
+        if resolved_mode is not None:
+            mode_source, mode_rank, mode_value = resolved_mode
+        if mode_value is _MISSING or mode_value is None:
+            effective_mode = policy.reasoning.default_mode
+        elif mode_source == "per-call-typed":
+            effective_mode = self._normalize_semantic_mode(policy, mode_value)
+        else:
+            effective_mode = self._decode_reasoning_mode(policy, mode_value)
+            if effective_mode not in policy.reasoning.allowed_modes:
+                raise ValueError(
+                    f"{self.model_name} decoded reasoning mode is not "
+                    "allowed by the generation policy."
+                )
+
+        effort_entries: list[Tuple[str, int, Any] | None] = []
+        effort_path = paths.get("reasoning.effort")
+        if effort_path is not None:
+            effort_entries.extend(
+                [
+                    self._layer_value(
+                        self._provider_request_overrides,
+                        effort_path,
+                        "reasoning effort",
+                        "provider",
+                        0,
+                    ),
+                    self._layer_value(
+                        self._model_request_overrides,
+                        effort_path,
+                        "reasoning effort",
+                        "model",
+                        1,
+                    ),
+                ]
+            )
+        if self._thinking_level:
+            effort_entries.append(("thinking_level", 2, self._thinking_level))
+        if effort_path is not None:
+            effort_entries.append(
+                self._layer_value(
+                    per_call_options,
+                    effort_path,
+                    "reasoning effort",
+                    "per-call-raw",
+                    3,
+                )
+            )
+        typed_effort = typed_values.get("reasoning.effort")
+        if typed_effort is not None and typed_effort[0]:
+            effort_entries.append(("per-call-typed", 3, typed_effort[1]))
+        resolved_effort = self._resolve_layered_value(effort_entries)
+
+        budget_entries: list[Tuple[str, int, Any] | None] = []
+        budget_path = paths.get("reasoning.budget_tokens")
+        if budget_path is not None:
+            budget_entries.extend(
+                [
+                    self._layer_value(
+                        self._provider_request_overrides,
+                        budget_path,
+                        "reasoning budget",
+                        "provider",
+                        0,
+                    ),
+                    self._layer_value(
+                        self._model_request_overrides,
+                        budget_path,
+                        "reasoning budget",
+                        "model",
+                        1,
+                    ),
+                    self._layer_value(
+                        per_call_options,
+                        budget_path,
+                        "reasoning budget",
+                        "per-call-raw",
+                        3,
+                    ),
+                ]
+            )
+        typed_budget = typed_values.get("reasoning.budget_tokens")
+        if typed_budget is not None and typed_budget[0]:
+            budget_entries.append(("per-call-typed", 3, typed_budget[1]))
+        resolved_budget = self._resolve_layered_value(budget_entries)
+
+        if (
+            effective_mode == "disabled"
+            and mode_source is not None
+            and mode_source.startswith("per-call")
+        ):
+            for control_name, resolved_control in (
+                ("effort", resolved_effort),
+                ("budget_tokens", resolved_budget),
+            ):
+                if (
+                    resolved_control is not None
+                    and resolved_control[0].startswith("per-call")
+                    and resolved_control[2] is not None
+                ):
+                    raise ValueError(
+                        f"{control_name} cannot be declared in the same "
+                        "per-call layer as disabled reasoning."
+                    )
+
+        for semantic_name, path in paths.items():
+            self._remove_declared_path(data, path, semantic_name)
+        core_default_fields.discard("temperature")
+
+        if mode_value is not _MISSING and mode_value is not None:
+            assert policy.reasoning.mode is not None
+            selectable_mode = cast(SelectableReasoningMode, effective_mode)
+            self._write_declared_path(
+                data,
+                policy.reasoning.mode.path,
+                policy.reasoning.mode.values[selectable_mode],
+                "reasoning mode",
+            )
+
+        effort_value: str | None = None
+        effort_source: str | None = None
+        effort_rank = -1
+        if resolved_effort is not None:
+            effort_source, effort_rank, raw_effort = resolved_effort
+            if raw_effort is not None:
+                if policy.reasoning.effort is None:
+                    label = (
+                        "unavailable"
+                        if policy.reasoning.availability == "unavailable"
+                        else "does not declare effort"
+                    )
+                    raise ValueError(
+                        f"{self.model_name} reasoning is {label} in the "
+                        "generation policy."
+                    )
+                effort_value = self._normalize_effort_value(
+                    policy.reasoning.effort, raw_effort
+                )
+
+        budget_value: int | None = None
+        budget_source: str | None = None
+        if resolved_budget is not None:
+            budget_source, _, raw_budget = resolved_budget
+            if raw_budget is not None:
+                if policy.reasoning.budget_tokens is None:
+                    label = (
+                        "unavailable"
+                        if policy.reasoning.availability == "unavailable"
+                        else "does not declare budget_tokens"
+                    )
+                    raise ValueError(
+                        f"{self.model_name} reasoning is {label} in the "
+                        "generation policy."
+                    )
+                budget_value = self._normalize_budget_value(policy, raw_budget)
+
+        if effective_mode == "disabled":
+            if effort_value is not None and (
+                effort_source is not None
+                and (
+                    effort_source.startswith("per-call")
+                    or (
+                        effort_source == "thinking_level"
+                        and mode_rank <= effort_rank
+                    )
+                )
+            ):
+                raise ValueError(
+                    f"{self.model_name} reasoning effort is incompatible "
+                    "with disabled reasoning."
+                )
+            if budget_value is not None and (
+                budget_source is not None
+                and budget_source.startswith("per-call")
+            ):
+                raise ValueError(
+                    f"{self.model_name} reasoning budget is incompatible "
+                    "with disabled reasoning."
+                )
+            effort_value = None
+            budget_value = None
+        else:
+            effort_policy = policy.reasoning.effort
+            if effort_value is not None:
+                if (
+                    effort_policy is None
+                    or effective_mode not in effort_policy.modes
+                ):
+                    raise ValueError(
+                        f"{self.model_name} reasoning effort is not supported "
+                        f"in {effective_mode} mode."
+                    )
+            elif (
+                effort_policy is not None
+                and effective_mode in effort_policy.modes
+                and effort_policy.modes[effective_mode].omission == "required"
+            ):
+                raise ValueError(
+                    f"{self.model_name} reasoning effort is required in "
+                    f"{effective_mode} mode."
+                )
+
+            budget_policy = policy.reasoning.budget_tokens
+            if budget_value is not None:
+                if (
+                    budget_policy is None
+                    or effective_mode not in budget_policy.modes
+                ):
+                    raise ValueError(
+                        f"{self.model_name} reasoning budget is not supported "
+                        f"in {effective_mode} mode."
+                    )
+            elif (
+                budget_policy is not None
+                and effective_mode in budget_policy.modes
+                and budget_policy.modes[effective_mode].omission == "required"
+            ):
+                raise ValueError(
+                    f"{self.model_name} reasoning budget is required in "
+                    f"{effective_mode} mode."
+                )
+
+        if (
+            effort_value is not None
+            and budget_value is not None
+            and effective_mode
+            not in policy.reasoning.allow_effort_with_budget_in
+        ):
+            raise ValueError(
+                f"{self.model_name} reasoning effort and budget cannot be "
+                f"combined in {effective_mode} mode."
+            )
+        if effort_value is not None:
+            assert policy.reasoning.effort is not None
+            self._write_declared_path(
+                data,
+                policy.reasoning.effort.path,
+                effort_value,
+                "reasoning effort",
+            )
+        if budget_value is not None:
+            assert policy.reasoning.budget_tokens is not None
+            self._write_declared_path(
+                data,
+                policy.reasoning.budget_tokens.path,
+                budget_value,
+                "reasoning budget",
+            )
+
+        for semantic_name, scalar, path in (
+            ("temperature", self._provider_temperature, ("temperature",)),
+            ("top_p", _MISSING, ("top_p",)),
+        ):
+            entries: list[Tuple[str, int, Any] | None] = []
+            if scalar is not _MISSING and scalar is not None:
+                entries.append(("provider", 0, scalar))
+            entries.append(
+                self._layer_value(
+                    self._provider_request_overrides,
+                    path,
+                    f"sampling {semantic_name}",
+                    "provider",
+                    0,
+                )
+            )
+            if semantic_name == "temperature" and (
+                self._model_temperature is not None
+            ):
+                entries.append(("model", 1, self._model_temperature))
+            entries.append(
+                self._layer_value(
+                    self._model_request_overrides,
+                    path,
+                    f"sampling {semantic_name}",
+                    "model",
+                    1,
+                )
+            )
+            entries.append(
+                self._layer_value(
+                    per_call_options,
+                    path,
+                    f"sampling {semantic_name}",
+                    "per-call-raw",
+                    3,
+                )
+            )
+            typed = typed_values.get(f"sampling.{semantic_name}")
+            if typed is not None and typed[0]:
+                entries.append(("per-call-typed", 3, typed[1]))
+            self._plan_sampling_control(
+                data,
+                policy,
+                semantic_name,
+                effective_mode,
+                self._resolve_layered_value(entries),
+            )
+
+    def _validate_budget_output_relation(
+        self,
+        data: Mapping[str, Any],
+        budget: int,
+        relation: str,
+    ) -> None:
+        if relation == "none":
+            return
+        token_fields = [
+            field
+            for field in ("max_tokens", "max_completion_tokens")
+            if field in data
+        ]
+        if len(token_fields) != 1:
+            raise ValueError(
+                "A reasoning budget relation requires exactly one final "
+                "token-limit field."
+            )
+        output_limit = data[token_fields[0]]
+        if type(output_limit) is not int:
+            raise ValueError(
+                "The final token-limit field must be a plain integer for a "
+                "reasoning budget relation."
+            )
+        if relation == "less-than" and budget >= output_limit:
+            raise ValueError(
+                "The reasoning budget must be less than the final output "
+                "token limit."
+            )
+        if relation == "less-than-or-equal" and budget > output_limit:
+            raise ValueError(
+                "The reasoning budget must be less than or equal to the "
+                "final output token limit."
+            )
+
+    def _validate_generation_policy_payload(
+        self,
+        data: Mapping[str, Any],
+    ) -> None:
+        policy = self._generation_policy()
+        if policy is None:
+            return
+        paths = self._policy_paths(policy)
+
+        mode_path = paths.get("reasoning.mode")
+        if mode_path is None:
+            effective_mode = policy.reasoning.default_mode
+        else:
+            present, value = self._read_declared_path(
+                data, mode_path, "reasoning mode"
+            )
+            if not present:
+                effective_mode = policy.reasoning.default_mode
+            else:
+                if value is None:
+                    raise ValueError(
+                        "The final reasoning mode path cannot contain JSON "
+                        "null."
+                    )
+                effective_mode = self._decode_reasoning_mode(policy, value)
+                if effective_mode not in policy.reasoning.allowed_modes:
+                    raise ValueError(
+                        "The final reasoning mode is not allowed."
+                    )
+
+        effort_present = False
+        effort_path = paths.get("reasoning.effort")
+        if effort_path is not None:
+            effort_policy = policy.reasoning.effort
+            assert effort_policy is not None
+            effort_present, effort_value = self._read_declared_path(
+                data, effort_path, "reasoning effort"
+            )
+            if effort_present:
+                if effort_value is None:
+                    raise ValueError(
+                        "The final reasoning effort path cannot contain JSON "
+                        "null."
+                    )
+                canonical = self._normalize_effort_value(
+                    effort_policy, effort_value
+                )
+                if canonical != effort_value:
+                    raise ValueError(
+                        "The final reasoning effort must be canonical."
+                    )
+                if effective_mode not in effort_policy.modes:
+                    raise ValueError(
+                        "The final reasoning effort is not supported in the "
+                        "effective mode."
+                    )
+            elif (
+                effective_mode in effort_policy.modes
+                and effort_policy.modes[
+                    cast(ActiveReasoningMode, effective_mode)
+                ].omission
+                == "required"
+            ):
+                raise ValueError(
+                    "The final reasoning effort is required in the effective "
+                    "mode."
+                )
+
+        budget_present = False
+        budget_path = paths.get("reasoning.budget_tokens")
+        if budget_path is not None:
+            budget_policy = policy.reasoning.budget_tokens
+            assert budget_policy is not None
+            budget_present, budget_value = self._read_declared_path(
+                data, budget_path, "reasoning budget"
+            )
+            if budget_present:
+                if budget_value is None:
+                    raise ValueError(
+                        "The final reasoning budget path cannot contain JSON "
+                        "null."
+                    )
+                normalized_budget = self._normalize_budget_value(
+                    policy, budget_value
+                )
+                if effective_mode not in budget_policy.modes:
+                    raise ValueError(
+                        "The final reasoning budget is not supported in the "
+                        "effective mode."
+                    )
+                relation = budget_policy.modes[
+                    cast(ActiveReasoningMode, effective_mode)
+                ].output_limit_relation
+                self._validate_budget_output_relation(
+                    data, normalized_budget, relation
+                )
+            elif (
+                effective_mode in budget_policy.modes
+                and budget_policy.modes[
+                    cast(ActiveReasoningMode, effective_mode)
+                ].omission
+                == "required"
+            ):
+                raise ValueError(
+                    "The final reasoning budget is required in the effective "
+                    "mode."
+                )
+
+        if effective_mode == "disabled" and (effort_present or budget_present):
+            raise ValueError(
+                "The final payload cannot contain reasoning controls while "
+                "reasoning is disabled."
+            )
+        if (
+            effort_present
+            and budget_present
+            and effective_mode
+            not in policy.reasoning.allow_effort_with_budget_in
+        ):
+            raise ValueError(
+                "The final reasoning effort and budget cannot be combined."
+            )
+
+        for semantic_name in ("temperature", "top_p"):
+            present, value = self._read_declared_path(
+                data,
+                (semantic_name,),
+                f"sampling {semantic_name}",
+            )
+            if present and value is None:
+                raise ValueError(
+                    f"The final {semantic_name} path cannot contain JSON "
+                    "null."
+                )
+            rule = self._sampling_rule(policy, semantic_name, effective_mode)
+            if not present:
+                continue
+            if rule.state != "supported":
+                raise ValueError(
+                    f"The final {semantic_name} must be omitted for "
+                    f"{rule.state} sampling."
+                )
+            assert rule.range is not None
+            normalized = self._normalize_sampling_value(
+                semantic_name, value, rule.range
+            )
+            if (
+                type(value) is not float
+                or value != normalized
+                or (value == 0.0 and math.copysign(1.0, value) < 0)
+            ):
+                raise ValueError(
+                    f"The final {semantic_name} must use canonical float "
+                    "form."
+                )
 
     def _validate_structured_output_planner(
         self,
@@ -949,6 +1892,8 @@ class LLMClient:
         self,
         data: Dict[str, Any],
         core_default_fields: set[str],
+        *,
+        generation_policy_authoritative: bool = False,
     ) -> None:
         capabilities = self.capabilities
         if capabilities is None or not self._is_openrouter_route():
@@ -960,6 +1905,8 @@ class LLMClient:
             "max_tokens",
             "max_completion_tokens",
         ):
+            if generation_policy_authoritative and parameter == "temperature":
+                continue
             if parameter not in data or parameter in supported:
                 continue
             if parameter not in core_default_fields:
@@ -1040,8 +1987,24 @@ class LLMClient:
                 f"{self.model_name} does not support parallel_tool_calls."
             )
 
+        policy = self._generation_policy()
+        policy_roots = (
+            {path[0] for path in self._policy_paths(policy).values()}
+            if policy is not None
+            else set()
+        )
         for field in _KNOWN_CAPABILITY_CONTROL_FIELDS:
+            if field in policy_roots:
+                continue
             if field in data and field not in capabilities.reasoning_controls:
+                if (
+                    policy is not None
+                    and policy.reasoning.availability == "unavailable"
+                ):
+                    raise ValueError(
+                        f"{self.model_name} reasoning is unavailable; "
+                        f"{field} is not supported."
+                    )
                 raise ValueError(
                     f"{self.model_name} does not support {field}."
                 )
@@ -1188,19 +2151,39 @@ class LLMClient:
         stream: bool,
         request_options: Mapping[str, Any] | None,
         structured_output: Mapping[str, Any] | None,
+        generation_controls: (
+            GenerationControls | Mapping[str, Any] | None
+        ) = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        data, core_default_fields = self._build_request_payload(
+        (
+            data,
+            core_default_fields,
+            per_call_options,
+        ) = self._build_request_payload(
             prompt,
             stream,
             request_options,
+        )
+        self._plan_generation_policy(
+            data,
+            core_default_fields,
+            per_call_options,
+            generation_controls,
         )
         planning_metadata = self._plan_structured_output(
             data,
             structured_output,
         )
-        self._plan_openrouter_core_parameters(data, core_default_fields)
+        self._plan_openrouter_core_parameters(
+            data,
+            core_default_fields,
+            generation_policy_authoritative=(
+                self._generation_policy() is not None
+            ),
+        )
         self._validate_gemini_thinking_controls(data)
         self._validate_capability_aware_request(data, stream=stream)
+        self._validate_generation_policy_payload(data)
         return data, planning_metadata
 
     async def generate(
@@ -1216,6 +2199,9 @@ class LLMClient:
         *,
         request_options: Mapping[str, Any] | None = None,
         structured_output: Mapping[str, Any] | None = None,
+        generation_controls: (
+            GenerationControls | Mapping[str, Any] | None
+        ) = None,
     ) -> LLMResult:
         """Generate a structured LLM result."""
         request_pricing_context = (
@@ -1238,6 +2224,7 @@ class LLMClient:
             stream,
             request_options,
             structured_output,
+            generation_controls,
         )
 
         if self._cache_enabled and not stream:
@@ -1394,6 +2381,7 @@ class LLMClient:
                         retry_policy.max_tokens_limit,
                         max(1, old_limit // 2),
                     )
+                    self._validate_generation_policy_payload(data)
                     logger.warning(
                         "HTTP error %s; lowering %s %s -> %s "
                         "and retrying...",
@@ -1428,6 +2416,9 @@ class LLMClient:
         *,
         request_options: Mapping[str, Any] | None = None,
         structured_output: Mapping[str, Any] | None = None,
+        generation_controls: (
+            GenerationControls | Mapping[str, Any] | None
+        ) = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Generate a response using the LLM API (Async).
@@ -1440,6 +2431,8 @@ class LLMClient:
             request_options: Per-call Chat Completions request payload fields.
             structured_output: Explicit semantic structured-output planner
                 request with require/prefer/off modes.
+            generation_controls: Typed or mapping-based per-call reasoning
+                and sampling controls.
 
         Returns:
             Tuple containing:
@@ -1453,6 +2446,7 @@ class LLMClient:
             stream_callback=stream_callback,
             request_options=request_options,
             structured_output=structured_output,
+            generation_controls=generation_controls,
         )
         return result.to_legacy_tuple()
 

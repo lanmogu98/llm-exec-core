@@ -373,6 +373,532 @@ class PricingCost(BaseModel):
     currency: str
 
 
+WirePath = Tuple[str, ...]
+ReasoningAvailability = Literal[
+    "unavailable", "optional", "adaptive", "always-on"
+]
+ReasoningMode = Literal["disabled", "enabled", "adaptive", "always-on"]
+SelectableReasoningMode = Literal["disabled", "enabled", "adaptive"]
+ActiveReasoningMode = Literal["enabled", "adaptive", "always-on"]
+OmissionMode = Literal["provider-default", "provider-selected", "required"]
+
+
+def _validate_wire_path(value: Any, field_name: str) -> WirePath:
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"{field_name} path must be a nonempty array.")
+    if any(type(segment) is not str or not segment for segment in value):
+        raise ValueError(
+            f"{field_name} path segments must be nonempty strings."
+        )
+    return tuple(value)
+
+
+def _path_is_prefix(left: WirePath, right: WirePath) -> bool:
+    return len(left) < len(right) and right[: len(left)] == left
+
+
+class NumericRange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    minimum: float
+    maximum: float
+    minimum_inclusive: bool = True
+    maximum_inclusive: bool = True
+
+    @field_validator("minimum", "maximum", mode="before")
+    @classmethod
+    def _validate_endpoint(cls, value: Any, info: ValidationInfo) -> float:
+        if type(value) not in {int, float}:
+            raise ValueError(f"{info.field_name} must be a number.")
+        if not math.isfinite(value):
+            raise ValueError(f"{info.field_name} must be finite.")
+        return float(value)
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> "NumericRange":
+        if self.minimum > self.maximum:
+            raise ValueError("Sampling range must be ordered.")
+        if self.minimum == self.maximum and not (
+            self.minimum_inclusive and self.maximum_inclusive
+        ):
+            raise ValueError("Sampling range cannot be empty.")
+        return self
+
+
+class SamplingRule(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    state: Literal["supported", "fixed", "ignored", "deprecated", "forbidden"]
+    range: Optional[NumericRange] = None
+    fixed_value: Optional[float] = None
+
+    @field_validator("fixed_value", mode="before")
+    @classmethod
+    def _validate_fixed_value(cls, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if type(value) not in {int, float}:
+            raise ValueError("fixed_value must be a number.")
+        if not math.isfinite(value):
+            raise ValueError("fixed_value must be finite.")
+        return float(value)
+
+    @model_validator(mode="after")
+    def _validate_state(self) -> "SamplingRule":
+        if self.state == "supported":
+            if self.range is None:
+                raise ValueError("supported sampling requires a range.")
+            if self.fixed_value is not None:
+                raise ValueError(
+                    "supported sampling cannot declare a fixed value."
+                )
+        elif self.state == "fixed":
+            if self.fixed_value is None:
+                raise ValueError("fixed sampling requires fixed_value.")
+            if self.range is not None:
+                raise ValueError("fixed sampling cannot declare a range.")
+        elif self.range is not None or self.fixed_value is not None:
+            raise ValueError(
+                "ignored, deprecated, and forbidden sampling permit neither "
+                "a range nor fixed_value."
+            )
+        return self
+
+
+class SamplingControlPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base: SamplingRule
+    by_reasoning_mode: Dict[ReasoningMode, SamplingRule] = Field(
+        default_factory=dict
+    )
+
+
+class SamplingPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    temperature: SamplingControlPolicy
+    top_p: SamplingControlPolicy
+
+
+class ReasoningModeWire(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: WirePath
+    values: Dict[SelectableReasoningMode, str | bool]
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def _validate_path(cls, value: Any) -> WirePath:
+        return _validate_wire_path(value, "reasoning mode")
+
+    @field_validator("values", mode="before")
+    @classmethod
+    def _validate_value_types(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            raise ValueError("Reasoning mode values must be a mapping.")
+        if any(type(item) not in {str, bool} for item in value.values()):
+            raise ValueError(
+                "Reasoning mode wire values must be a string or boolean."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_unique_values(self) -> "ReasoningModeWire":
+        typed_values = [(type(value), value) for value in self.values.values()]
+        if len(typed_values) != len(set(typed_values)):
+            raise ValueError("Reasoning mode wire values must be unique.")
+        return self
+
+
+class EffortModeRule(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    omission: OmissionMode
+    default: Optional[str] = None
+
+    @field_validator("default")
+    @classmethod
+    def _validate_default_string(cls, value: Optional[str]) -> Optional[str]:
+        if value == "":
+            raise ValueError("Effort defaults must be nonempty.")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_omission(self) -> "EffortModeRule":
+        if self.omission == "provider-default" and self.default is None:
+            raise ValueError(
+                "provider-default effort omission requires a default."
+            )
+        if self.omission != "provider-default" and self.default is not None:
+            raise ValueError(
+                "provider-selected and required effort omission forbid a "
+                "default."
+            )
+        return self
+
+
+class ReasoningEffortPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: WirePath
+    allowed_values: Tuple[str, ...] = Field(min_length=1)
+    aliases: Dict[str, str] = Field(default_factory=dict)
+    modes: Dict[ActiveReasoningMode, EffortModeRule] = Field(min_length=1)
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def _validate_path(cls, value: Any) -> WirePath:
+        return _validate_wire_path(value, "reasoning effort")
+
+    @field_validator("allowed_values", mode="before")
+    @classmethod
+    def _validate_allowed_values(cls, value: Any) -> Any:
+        if not isinstance(value, (list, tuple)) or not value:
+            raise ValueError("Effort allowed values must be nonempty.")
+        if any(type(item) is not str or not item for item in value):
+            raise ValueError("Effort allowed values must be nonempty strings.")
+        return value
+
+    @field_validator("aliases", mode="before")
+    @classmethod
+    def _validate_alias_strings(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            raise ValueError("Effort aliases must be a mapping.")
+        if any(
+            type(alias) is not str
+            or not alias
+            or type(target) is not str
+            or not target
+            for alias, target in value.items()
+        ):
+            raise ValueError(
+                "Effort aliases and targets must be nonempty strings."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_values(self) -> "ReasoningEffortPolicy":
+        canonical = set(self.allowed_values)
+        if len(canonical) != len(self.allowed_values):
+            raise ValueError("Effort allowed values must be unique.")
+        if canonical.intersection(self.aliases):
+            raise ValueError(
+                "Effort alias keys cannot collide with canonical values."
+            )
+        if any(target not in canonical for target in self.aliases.values()):
+            raise ValueError("Every effort alias target must be canonical.")
+        for rule in self.modes.values():
+            if rule.default is not None and rule.default not in canonical:
+                raise ValueError("Every effort default must be canonical.")
+        return self
+
+
+class BudgetModeRule(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    omission: OmissionMode
+    default: Optional[int] = None
+    output_limit_relation: Literal["none", "less-than", "less-than-or-equal"]
+
+    @field_validator("default", mode="before")
+    @classmethod
+    def _validate_default_integer(cls, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if type(value) is not int:
+            raise ValueError("Budget default must be a plain integer.")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_omission(self) -> "BudgetModeRule":
+        if self.omission == "provider-default" and self.default is None:
+            raise ValueError(
+                "provider-default budget omission requires a default."
+            )
+        if self.omission != "provider-default" and self.default is not None:
+            raise ValueError(
+                "provider-selected and required budget omission forbid a "
+                "default."
+            )
+        return self
+
+
+class ReasoningBudgetPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: WirePath
+    minimum: int
+    maximum: Optional[int] = None
+    modes: Dict[ActiveReasoningMode, BudgetModeRule] = Field(min_length=1)
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def _validate_path(cls, value: Any) -> WirePath:
+        return _validate_wire_path(value, "reasoning budget")
+
+    @field_validator("minimum", "maximum", mode="before")
+    @classmethod
+    def _validate_integer(cls, value: Any, info: ValidationInfo) -> Any:
+        if value is None and info.field_name == "maximum":
+            return None
+        if type(value) is not int:
+            raise ValueError(f"{info.field_name} must be a plain integer.")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_bounds(self) -> "ReasoningBudgetPolicy":
+        if self.minimum < 0:
+            raise ValueError("Budget minimum must be nonnegative.")
+        if self.maximum is not None and self.maximum < self.minimum:
+            raise ValueError(
+                "Budget maximum must be greater than or equal to minimum."
+            )
+        for rule in self.modes.values():
+            if rule.default is None:
+                continue
+            if rule.default < self.minimum or (
+                self.maximum is not None and rule.default > self.maximum
+            ):
+                raise ValueError("Budget default must be within bounds.")
+        return self
+
+
+class ReasoningPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    availability: ReasoningAvailability
+    allowed_modes: Tuple[ReasoningMode, ...] = Field(min_length=1)
+    default_mode: ReasoningMode
+    can_disable: bool
+    mode: Optional[ReasoningModeWire] = None
+    effort: Optional[ReasoningEffortPolicy] = None
+    budget_tokens: Optional[ReasoningBudgetPolicy] = None
+    allow_effort_with_budget_in: Tuple[ActiveReasoningMode, ...] = ()
+
+    @field_validator(
+        "allowed_modes", "allow_effort_with_budget_in", mode="before"
+    )
+    @classmethod
+    def _validate_mode_sequence(cls, value: Any, info: ValidationInfo) -> Any:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(f"{info.field_name} must be an array.")
+        if info.field_name == "allowed_modes" and not value:
+            raise ValueError("allowed_modes must be nonempty.")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_reasoning_policy(self) -> "ReasoningPolicy":
+        allowed = tuple(self.allowed_modes)
+        allowed_set = set(allowed)
+        if len(allowed) != len(allowed_set):
+            raise ValueError("Reasoning allowed modes must be unique.")
+        coexist = tuple(self.allow_effort_with_budget_in)
+        if len(coexist) != len(set(coexist)):
+            raise ValueError("Effort/budget coexistence modes must be unique.")
+        if self.default_mode not in allowed_set:
+            raise ValueError("default_mode must be an allowed mode.")
+
+        if self.availability == "unavailable":
+            if (
+                allowed != ("disabled",)
+                or self.default_mode != "disabled"
+                or self.can_disable
+                or self.mode is not None
+                or self.effort is not None
+                or self.budget_tokens is not None
+                or coexist
+            ):
+                raise ValueError(
+                    "unavailable reasoning permits only disabled without "
+                    "controls."
+                )
+        elif self.availability == "optional":
+            if allowed_set != {"disabled", "enabled"} or len(allowed) != 2:
+                raise ValueError(
+                    "optional reasoning requires exactly disabled and "
+                    "enabled modes."
+                )
+            if not self.can_disable or self.mode is None:
+                raise ValueError(
+                    "optional reasoning requires disable support and a mode "
+                    "wire declaration."
+                )
+        elif self.availability == "adaptive":
+            if (
+                "adaptive" not in allowed_set
+                or "always-on" in allowed_set
+                or not allowed_set.issubset(
+                    {"disabled", "enabled", "adaptive"}
+                )
+            ):
+                raise ValueError(
+                    "adaptive reasoning requires adaptive and permits only "
+                    "disabled, enabled, and adaptive modes."
+                )
+            if self.default_mode not in {"disabled", "adaptive"}:
+                raise ValueError(
+                    "adaptive reasoning default must be adaptive or "
+                    "disabled."
+                )
+            if self.can_disable != ("disabled" in allowed_set):
+                raise ValueError(
+                    "adaptive can_disable must match disabled availability."
+                )
+            if self.mode is None:
+                raise ValueError(
+                    "adaptive reasoning requires a mode wire declaration."
+                )
+        elif (
+            allowed != ("always-on",)
+            or self.default_mode != "always-on"
+            or self.can_disable
+            or self.mode is not None
+        ):
+            raise ValueError(
+                "always-on reasoning requires only always-on without a mode "
+                "wire field."
+            )
+
+        if self.mode is not None:
+            selectable = {mode for mode in allowed_set if mode != "always-on"}
+            if set(self.mode.values) != selectable:
+                raise ValueError(
+                    "Reasoning mode wire values must map every selectable "
+                    "mode exactly."
+                )
+
+        active = {mode for mode in allowed_set if mode != "disabled"}
+        effort_modes = set() if self.effort is None else set(self.effort.modes)
+        budget_modes = (
+            set()
+            if self.budget_tokens is None
+            else set(self.budget_tokens.modes)
+        )
+        if not effort_modes.issubset(active):
+            raise ValueError(
+                "Effort mode keys must be active reasoning modes."
+            )
+        if not budget_modes.issubset(active):
+            raise ValueError(
+                "Budget mode keys must be active reasoning modes."
+            )
+        coexist_set = set(coexist)
+        if not coexist_set.issubset(active):
+            raise ValueError("Effort/budget coexistence modes must be active.")
+        if coexist_set and (self.effort is None or self.budget_tokens is None):
+            raise ValueError(
+                "Effort/budget coexistence requires both policies."
+            )
+        if not coexist_set.issubset(effort_modes.intersection(budget_modes)):
+            raise ValueError(
+                "Effort/budget coexistence modes must exist in both "
+                "policies."
+            )
+
+        paths = []
+        if self.mode is not None:
+            paths.append(("mode", self.mode.path))
+        if self.effort is not None:
+            paths.append(("effort", self.effort.path))
+        if self.budget_tokens is not None:
+            paths.append(("budget", self.budget_tokens.path))
+        protected_roots = {"model", "messages", "stream"}
+        sampling_roots = {"temperature", "top_p"}
+        for name, path in paths:
+            if path[0] in sampling_roots:
+                raise ValueError(
+                    f"{name} path cannot root at a sampling-owned field."
+                )
+            if path[0] in protected_roots:
+                raise ValueError(
+                    f"{name} path cannot root at a protected field."
+                )
+        for index, (left_name, left) in enumerate(paths):
+            for right_index, (right_name, right) in enumerate(paths):
+                if right_index <= index:
+                    continue
+                if left == right:
+                    raise ValueError(
+                        f"{left_name} and {right_name} paths must be "
+                        "distinct."
+                    )
+                if _path_is_prefix(left, right) or _path_is_prefix(
+                    right, left
+                ):
+                    raise ValueError(
+                        f"{left_name} and {right_name} paths cannot have a "
+                        "prefix relationship."
+                    )
+        return self
+
+
+class GenerationPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reasoning: ReasoningPolicy
+    sampling: SamplingPolicy
+
+    @model_validator(mode="after")
+    def _validate_sampling_modes(self) -> "GenerationPolicy":
+        reachable = set(self.reasoning.allowed_modes)
+        for name, control in (
+            ("temperature", self.sampling.temperature),
+            ("top_p", self.sampling.top_p),
+        ):
+            if not set(control.by_reasoning_mode).issubset(reachable):
+                raise ValueError(
+                    f"{name} sampling overrides must use reachable "
+                    "reasoning modes."
+                )
+        return self
+
+
+class ReasoningRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Optional[SelectableReasoningMode] = None
+    effort: Optional[str] = None
+    budget_tokens: Optional[int] = None
+
+    @field_validator("budget_tokens", mode="before")
+    @classmethod
+    def _validate_budget(cls, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if type(value) is not int:
+            raise ValueError("budget_tokens must be a plain integer.")
+        return value
+
+
+class SamplingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+
+    @field_validator("temperature", "top_p", mode="before")
+    @classmethod
+    def _validate_sampling_value(
+        cls, value: Any, info: ValidationInfo
+    ) -> Optional[float]:
+        if value is None:
+            return None
+        if type(value) not in {int, float}:
+            raise ValueError(f"{info.field_name} must be a number.")
+        if not math.isfinite(value):
+            raise ValueError(f"{info.field_name} must be finite.")
+        value = float(value)
+        return 0.0 if value == 0.0 else value
+
+
+class GenerationControls(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reasoning: Optional[ReasoningRequest] = None
+    sampling: Optional[SamplingRequest] = None
+
+
 class ModelCapabilities(BaseModel):
     version: str
     source: str
@@ -385,6 +911,16 @@ class ModelCapabilities(BaseModel):
     parallel_tool_calls: bool = False
     reasoning_controls: List[str] = Field(default_factory=list)
     openrouter_supported_parameters: List[str] = Field(default_factory=list)
+    generation_policy: Optional[GenerationPolicy] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize_capabilities(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> Dict[str, Any]:
+        serialized: Dict[str, Any] = handler(self)
+        if self.generation_policy is None:
+            serialized.pop("generation_policy", None)
+        return serialized
 
 
 class ModelDetails(BaseModel):
