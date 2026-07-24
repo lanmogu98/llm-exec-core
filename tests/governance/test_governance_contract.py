@@ -582,6 +582,7 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
 @pytest.mark.parametrize(
     (
         "simple_count",
+        "simple_available",
         "json_count",
         "expected_public_count",
         "publish_result",
@@ -591,6 +592,7 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
     [
         pytest.param(
             0,
+            True,
             None,
             0,
             "failure",
@@ -599,7 +601,28 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
             id="failed-absent",
         ),
         pytest.param(
+            0,
+            False,
+            None,
+            0,
+            "failure",
+            "absent",
+            "consistent",
+            id="failed-absent-both-endpoints-404",
+        ),
+        pytest.param(
+            0,
+            False,
             1,
+            1,
+            "failure",
+            "partial",
+            "index-fallback",
+            id="simple-404-json-partial",
+        ),
+        pytest.param(
+            1,
+            True,
             1,
             1,
             "failure",
@@ -609,6 +632,7 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
         ),
         pytest.param(
             1,
+            True,
             1,
             1,
             "cancelled",
@@ -618,6 +642,7 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
         ),
         pytest.param(
             1,
+            True,
             1,
             1,
             "success",
@@ -627,6 +652,7 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
         ),
         pytest.param(
             1,
+            True,
             None,
             1,
             "failure",
@@ -636,6 +662,7 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
         ),
         pytest.param(
             1,
+            True,
             0,
             1,
             "failure",
@@ -645,6 +672,7 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
         ),
         pytest.param(
             1,
+            True,
             2,
             2,
             "failure",
@@ -654,6 +682,7 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
         ),
         pytest.param(
             2,
+            True,
             2,
             2,
             "success",
@@ -663,6 +692,7 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
         ),
         pytest.param(
             2,
+            True,
             2,
             2,
             "failure",
@@ -676,6 +706,7 @@ def test_publication_audit_handles_absent_partial_and_success_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     simple_count: int,
+    simple_available: bool,
     json_count: int | None,
     expected_public_count: int,
     publish_result: str,
@@ -817,6 +848,14 @@ def test_publication_audit_handles_absent_partial_and_success_contract(
         def open(self, request, *, timeout: int) -> FakeResponse:
             assert timeout == 20
             url = request.full_url
+            if not simple_available and url == simple_url:
+                raise urllib.error.HTTPError(
+                    url,
+                    404,
+                    "Not Found",
+                    {},
+                    None,
+                )
             if json_count is None and url == release_url:
                 raise urllib.error.HTTPError(
                     url,
@@ -1262,6 +1301,7 @@ def test_release_runbook_records_owner_gates_and_safe_recovery() -> None:
     assert "A skipped\n`publish` job" in runbook
     assert "`index-fallback`" in runbook
     assert "their union as public" in runbook
+    assert "consistent\nabsent state" in runbook
     assert "dependency-free schema step" in runbook
     assert "including an\nabsent result" in runbook
     assert "Core #41" in runbook

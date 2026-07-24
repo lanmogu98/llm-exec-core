@@ -68,6 +68,9 @@ merely because the version JSON and Simple APIs still disagree. The audit
 records each API's file set, marks `index-fallback`, and conservatively treats
 their union as public. This fallback is forbidden after a successful publish,
 which must end with a complete and consistent two-file set.
+If both the project Simple endpoint and version JSON remain unavailable with no
+observed files, the failed or cancelled attempt is recorded as a consistent
+absent state rather than a divergent fallback.
 
 An independent, dependency-free schema step validates every audit, including an
 absent result, before any conditional cryptographic work. It re-derives the

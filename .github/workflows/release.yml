@@ -742,6 +742,8 @@ jobs:
                               f"exist: {sorted(simple_names)}"
                           ) from error
                       raise ReleaseUnavailable(release_url) from error
+                  if simple is None:
+                      raise ReleaseUnavailable(release_url) from error
                   release = None
                   json_rows = {}
               else:
