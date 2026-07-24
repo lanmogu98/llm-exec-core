@@ -351,9 +351,7 @@ jobs:
                   raise SystemExit(f"{kind} has the wrong version")
 
           hashes = {
-              path.name: hashlib.file_digest(
-                  path.open("rb"), "sha256"
-              ).hexdigest()
+              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
               for path in files
           }
           sums = Path("release-artifact/SHA256SUMS")
@@ -709,7 +707,11 @@ jobs:
               raise SystemExit("release evidence does not match the dispatch")
 
 
-          def verify_registry(*, require_complete: bool) -> set[str]:
+          def verify_registry(
+              *,
+              require_complete: bool,
+              allow_index_fallback: bool,
+          ) -> tuple[set[str], set[str], set[str], str]:
               encoded_version = urllib.parse.quote(VERSION, safe="")
               release_url = f"{PYPI_JSON_PREFIX}{encoded_version}/json"
               try:
@@ -725,6 +727,7 @@ jobs:
                   for row in (simple or {}).get("files", [])
                   if row["filename"] in expected_names
               }
+              simple_names = set(simple_rows)
               try:
                   release = fetch_json(
                       release_url,
@@ -732,60 +735,100 @@ jobs:
                       pending_404=True,
                   )
               except PendingPublication as error:
-                  if simple_rows:
+                  if not allow_index_fallback:
+                      if simple_names:
+                          raise PendingPublication(
+                              "PyPI JSON is unavailable while Simple files "
+                              f"exist: {sorted(simple_names)}"
+                          ) from error
+                      raise ReleaseUnavailable(release_url) from error
+                  release = None
+                  json_rows = {}
+              else:
+                  if release["info"]["name"] != PROJECT:
+                      raise SystemExit("PyPI JSON project name mismatch")
+                  if release["info"]["version"] != VERSION:
+                      raise SystemExit("PyPI JSON version mismatch")
+                  json_rows = {
+                      row["filename"]: row
+                      for row in release.get("urls", [])
+                  }
+              json_names = set(json_rows)
+              if not json_names.issubset(expected_names):
+                  raise SystemExit("PyPI JSON contains unexpected files")
+              if require_complete and json_names != expected_names:
+                  raise PendingPublication(
+                      f"PyPI JSON files incomplete: {sorted(json_names)}"
+                  )
+              indexes_agree = (
+                  simple is not None and json_names == simple_names
+              )
+              if not indexes_agree and not allow_index_fallback:
+                  if release is None:
                       raise PendingPublication(
                           "PyPI JSON is unavailable while Simple files exist: "
-                          f"{sorted(simple_rows)}"
-                      ) from error
-                  raise ReleaseUnavailable(release_url) from error
-              if release["info"]["name"] != PROJECT:
-                  raise SystemExit("PyPI JSON project name mismatch")
-              if release["info"]["version"] != VERSION:
-                  raise SystemExit("PyPI JSON version mismatch")
-              json_rows = {
-                  row["filename"]: row for row in release.get("urls", [])
-              }
-              public_names = set(json_rows)
-              if not public_names.issubset(expected_names):
-                  raise SystemExit("PyPI JSON contains unexpected files")
-              if require_complete and public_names != expected_names:
-                  raise PendingPublication(
-                      f"PyPI JSON files incomplete: {sorted(public_names)}"
-                  )
-              if simple is None:
-                  raise PendingPublication("PyPI Simple API is unavailable")
-              if set(simple_rows) != public_names:
+                          f"{sorted(simple_names)}"
+                      )
                   raise PendingPublication(
                       "PyPI JSON and Simple file sets disagree: "
-                      f"JSON={sorted(public_names)}, "
-                      f"Simple={sorted(simple_rows)}"
+                      f"JSON={sorted(json_names)}, "
+                      f"Simple={sorted(simple_names)}"
                   )
+              registry_mode = (
+                  "consistent" if indexes_agree else "index-fallback"
+              )
+              public_names = json_names | simple_names
 
               for name in sorted(public_names):
-                  json_row = json_rows[name]
-                  simple_row = simple_rows[name]
-                  if json_row.get("yanked") is not False:
+                  json_row = json_rows.get(name)
+                  simple_row = simple_rows.get(name)
+                  if (
+                      json_row is not None
+                      and json_row.get("yanked") is not False
+                  ):
                       raise SystemExit(f"{name} is yanked in PyPI JSON")
-                  if simple_row.get("yanked") is not False:
+                  if (
+                      simple_row is not None
+                      and simple_row.get("yanked") is not False
+                  ):
                       raise SystemExit(f"{name} is yanked in PyPI Simple")
-                  if json_row.get("size") != expected_sizes[name]:
+                  if (
+                      json_row is not None
+                      and json_row.get("size") != expected_sizes[name]
+                  ):
                       raise SystemExit(f"{name} JSON size mismatch")
-                  if simple_row.get("size") != expected_sizes[name]:
+                  if (
+                      simple_row is not None
+                      and simple_row.get("size") != expected_sizes[name]
+                  ):
                       raise SystemExit(f"{name} Simple size mismatch")
                   if (
-                      json_row.get("digests", {}).get("sha256")
-                      != expected_hashes[name]
+                      json_row is not None
+                      and (
+                          json_row.get("digests", {}).get("sha256")
+                          != expected_hashes[name]
+                      )
                   ):
                       raise SystemExit(f"{name} JSON hash mismatch")
                   if (
-                      simple_row.get("hashes", {}).get("sha256")
-                      != expected_hashes[name]
+                      simple_row is not None
+                      and (
+                          simple_row.get("hashes", {}).get("sha256")
+                          != expected_hashes[name]
+                      )
                   ):
                       raise SystemExit(f"{name} Simple hash mismatch")
-                  if json_row.get("url") != simple_row.get("url"):
+                  if (
+                      json_row is not None
+                      and simple_row is not None
+                      and json_row.get("url") != simple_row.get("url")
+                  ):
                       raise SystemExit(f"{name} API URL mismatch")
 
-                  file_url = json_row["url"]
+                  observed_row = simple_row or json_row
+                  if observed_row is None:
+                      raise SystemExit(f"{name} has no public metadata")
+                  file_url = observed_row["url"]
                   file_bytes = fetch(
                       file_url,
                       allowed_hosts={"files.pythonhosted.org"},
@@ -805,7 +848,10 @@ jobs:
                       f"{PYPI_INTEGRITY_PREFIX}{encoded_version}/"
                       f"{encoded_name}/provenance"
                   )
-                  if simple_row.get("provenance") != provenance_url:
+                  if (
+                      simple_row is not None
+                      and simple_row.get("provenance") != provenance_url
+                  ):
                       raise PendingPublication(
                           f"{name} provenance URL is not visible"
                       )
@@ -849,15 +895,32 @@ jobs:
                       json.dumps(provenance, sort_keys=True),
                       encoding="utf-8",
                   )
-              return public_names
+              return (
+                  public_names,
+                  json_names,
+                  simple_names,
+                  registry_mode,
+              )
 
 
           require_complete = PUBLISH_RESULT == "success"
           public_names = None
+          json_names = None
+          simple_names = None
+          registry_mode = None
           for attempt in range(1, MAX_ATTEMPTS + 1):
               try:
-                  public_names = verify_registry(
-                      require_complete=require_complete
+                  (
+                      public_names,
+                      json_names,
+                      simple_names,
+                      registry_mode,
+                  ) = verify_registry(
+                      require_complete=require_complete,
+                      allow_index_fallback=(
+                          not require_complete
+                          and attempt == MAX_ATTEMPTS
+                      ),
                   )
                   if (
                       not require_complete
@@ -871,6 +934,9 @@ jobs:
               except ReleaseUnavailable as error:
                   if not require_complete and attempt == MAX_ATTEMPTS:
                       public_names = set()
+                      json_names = set()
+                      simple_names = set()
+                      registry_mode = "consistent"
                       break
                   pending_error = error
               except PendingPublication as error:
@@ -885,8 +951,13 @@ jobs:
               time.sleep(RETRY_SECONDS)
           else:
               raise SystemExit("bounded publication verification failed")
-          if public_names is None:
-              raise SystemExit("public file set was not determined")
+          if (
+              public_names is None
+              or json_names is None
+              or simple_names is None
+              or registry_mode is None
+          ):
+              raise SystemExit("registry state was not determined")
 
           if public_names == expected_names:
               publication_state = "complete"
@@ -896,9 +967,12 @@ jobs:
               publication_state = "absent"
           audit = {
               "expected_files": sorted(expected_names),
+              "json_files": sorted(json_names),
               "public_files": sorted(public_names),
               "publication_state": publication_state,
               "publish_result": PUBLISH_RESULT,
+              "registry_mode": registry_mode,
+              "simple_files": sorted(simple_names),
           }
           (VERIFICATION_DIR / "publication-audit.json").write_text(
               json.dumps(audit, indent=2, sort_keys=True) + "\n",
@@ -912,6 +986,8 @@ jobs:
                   f"publication_state={publication_state}\n"
               )
           public_display = ", ".join(sorted(public_names)) or "none"
+          json_display = ", ".join(sorted(json_names)) or "none"
+          simple_display = ", ".join(sorted(simple_names)) or "none"
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open(
               "a", encoding="utf-8"
           ) as summary:
@@ -919,7 +995,10 @@ jobs:
                   "## PyPI publication audit\n\n"
                   f"- Publish job result: `{PUBLISH_RESULT}`\n"
                   f"- Public state: `{publication_state}`\n"
-                  f"- Verified public files: {public_display}\n"
+                  f"- Registry mode: `{registry_mode}`\n"
+                  f"- Version JSON files: {json_display}\n"
+                  f"- Simple API files: {simple_display}\n"
+                  f"- Verified public union: {public_display}\n"
               )
           PY
       - name: Cryptographically verify saved provenance and signed claims
@@ -1019,28 +1098,55 @@ jobs:
               )
           )
           public_files = audit.get("public_files")
+          json_files = audit.get("json_files")
+          simple_files = audit.get("simple_files")
           if (
               not isinstance(public_files, list)
               or not public_files
               or not all(isinstance(name, str) for name in public_files)
+              or not isinstance(json_files, list)
+              or not all(isinstance(name, str) for name in json_files)
+              or not isinstance(simple_files, list)
+              or not all(isinstance(name, str) for name in simple_files)
           ):
-              raise SystemExit("audit must name public files")
+              raise SystemExit("audit file sets are invalid")
           public_names = set(public_files)
+          json_names = set(json_files)
+          simple_names = set(simple_files)
           expected_names = set(expected_hashes)
           if (
               len(public_names) != len(public_files)
+              or len(json_names) != len(json_files)
+              or len(simple_names) != len(simple_files)
               or not public_names.issubset(expected_names)
+              or not json_names.issubset(expected_names)
+              or not simple_names.issubset(expected_names)
           ):
-              raise SystemExit("audit public file set is invalid")
+              raise SystemExit("audit file set is invalid")
+          registry_mode = audit.get("registry_mode")
+          if registry_mode == "consistent":
+              if not (public_names == json_names == simple_names):
+                  raise SystemExit("consistent registry sets disagree")
+          elif registry_mode == "index-fallback":
+              if (
+                  json_names == simple_names
+                  or public_names != json_names | simple_names
+              ):
+                  raise SystemExit("fallback registry sets are invalid")
+          else:
+              raise SystemExit("audit registry mode is invalid")
           if public_names == expected_names:
               publication_state = "complete"
           else:
               publication_state = "partial"
           if audit != {
               "expected_files": sorted(expected_names),
+              "json_files": sorted(json_names),
               "public_files": sorted(public_names),
               "publication_state": publication_state,
               "publish_result": os.environ["PUBLISH_RESULT"],
+              "registry_mode": registry_mode,
+              "simple_files": sorted(simple_names),
           }:
               raise SystemExit("publication audit does not match evidence")
 

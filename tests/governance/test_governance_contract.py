@@ -370,34 +370,16 @@ def test_release_preflight_rejects_nonzero_pep440_epoch_before_io(
         "Verify normalized source version and unused PyPI version"
     )
     version = "1!2.0"
-    (tmp_path / "pyproject.toml").write_text(
-        ("[project]\n" 'name = "llm-exec-core"\n' f'version = "{version}"\n'),
-        encoding="utf-8",
-    )
-    package_dir = tmp_path / "src" / "llm_exec_core"
-    package_dir.mkdir(parents=True)
-    (package_dir / "__init__.py").write_text(
-        f'__version__ = "{version}"\n',
-        encoding="utf-8",
-    )
-    (tmp_path / "uv.lock").write_text(
-        (
-            "version = 1\n"
-            "revision = 3\n"
-            'requires-python = ">=3.10"\n\n'
-            "[[package]]\n"
-            'name = "llm-exec-core"\n'
-            f'version = "{version}"\n'
-            'source = { editable = "." }\n'
-        ),
-        encoding="utf-8",
-    )
+
+    def reject_file_io(*_args, **_kwargs) -> None:
+        raise AssertionError("epoch rejection must happen before file I/O")
 
     def reject_network(*_args, **_kwargs) -> None:
         raise AssertionError("epoch rejection must happen before network I/O")
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("RELEASE_VERSION", version)
+    monkeypatch.setattr(Path, "read_text", reject_file_io)
     monkeypatch.setattr("urllib.request.build_opener", reject_network)
 
     with pytest.raises(SystemExit, match="epoch 0"):
@@ -471,7 +453,8 @@ def test_release_validates_two_distributions_and_clean_installs_each() -> None:
     assert "METADATA" in build_runs
     assert "PKG-INFO" in build_runs
     assert "SHA256SUMS" in build_runs
-    assert "hashlib.file_digest" in build_runs
+    assert "hashlib.file_digest" not in build_runs
+    assert "hashlib.sha256" in build_runs
     assert upload["with"]["name"] == "validated-distributions"
     assert upload["with"]["path"] == "release-artifact"
     assert upload["with"]["if-no-files-found"] == "error"
@@ -586,46 +569,106 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
 
 @pytest.mark.parametrize(
     (
-        "public_count",
+        "simple_count",
+        "json_count",
+        "expected_public_count",
         "publish_result",
-        "release_visible",
         "expected_state",
+        "expected_registry_mode",
     ),
     [
-        pytest.param(0, "failure", False, "absent", id="failed-absent"),
-        pytest.param(1, "failure", True, "partial", id="failed-partial"),
+        pytest.param(
+            0,
+            None,
+            0,
+            "failure",
+            "absent",
+            "consistent",
+            id="failed-absent",
+        ),
         pytest.param(
             1,
-            "cancelled",
-            True,
+            1,
+            1,
+            "failure",
             "partial",
+            "consistent",
+            id="failed-partial",
+        ),
+        pytest.param(
+            1,
+            1,
+            1,
+            "cancelled",
+            "partial",
+            "consistent",
             id="cancelled-partial",
         ),
         pytest.param(
             1,
+            1,
+            1,
             "success",
-            True,
+            None,
             None,
             id="successful-incomplete",
         ),
         pytest.param(
             1,
-            "failure",
-            False,
             None,
+            1,
+            "failure",
+            "partial",
+            "index-fallback",
             id="json-missing-simple-partial",
         ),
-        pytest.param(2, "success", True, "complete", id="successful-complete"),
-        pytest.param(2, "failure", True, "complete", id="failed-complete"),
+        pytest.param(
+            1,
+            0,
+            1,
+            "failure",
+            "partial",
+            "index-fallback",
+            id="json-simple-divergent-partial",
+        ),
+        pytest.param(
+            1,
+            2,
+            2,
+            "failure",
+            "complete",
+            "index-fallback",
+            id="simple-json-divergent-complete",
+        ),
+        pytest.param(
+            2,
+            2,
+            2,
+            "success",
+            "complete",
+            "consistent",
+            id="successful-complete",
+        ),
+        pytest.param(
+            2,
+            2,
+            2,
+            "failure",
+            "complete",
+            "consistent",
+            id="failed-complete",
+        ),
     ],
 )
 def test_publication_audit_handles_absent_partial_and_success_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    public_count: int,
+    simple_count: int,
+    json_count: int | None,
+    expected_public_count: int,
     publish_result: str,
-    release_visible: bool,
     expected_state: str | None,
+    expected_registry_mode: str | None,
 ) -> None:
     script = _embedded_python(
         "Verify PyPI JSON, Simple API, files, and Integrity subjects"
@@ -669,17 +712,19 @@ def test_publication_audit_handles_absent_partial_and_success_contract(
         encoding="utf-8",
     )
 
-    public_names = names[:public_count]
+    simple_names = names[:simple_count]
+    json_names = names[:json_count] if json_count is not None else ()
+    public_names = names[:expected_public_count]
     file_urls = {
         name: f"https://files.pythonhosted.org/packages/aa/bb/{name}"
-        for name in public_names
+        for name in names
     }
     provenance_urls = {
         name: (
             f"https://pypi.org/integrity/llm-exec-core/{version}/"
             f"{name}/provenance"
         )
-        for name in public_names
+        for name in names
     }
     release_url = f"https://pypi.org/pypi/llm-exec-core/{version}/json"
     simple_url = "https://pypi.org/simple/llm-exec-core/"
@@ -698,12 +743,12 @@ def test_publication_audit_handles_absent_partial_and_success_contract(
             "url": file_urls[name],
             "yanked": False,
         }
-        for name in public_names
+        for name in simple_names
     ]
     responses = {
         simple_url: json.dumps({"files": simple_files}).encode("utf-8"),
     }
-    if release_visible:
+    if json_count is not None:
         responses.update(
             {
                 release_url: json.dumps(
@@ -717,25 +762,25 @@ def test_publication_audit_handles_absent_partial_and_success_contract(
                                 "url": file_urls[name],
                                 "yanked": False,
                             }
-                            for name in public_names
+                            for name in json_names
                         ],
                     }
                 ).encode("utf-8"),
             }
         )
-        for name in public_names:
-            responses[file_urls[name]] = payloads[name]
-            responses[provenance_urls[name]] = json.dumps(
-                {
-                    "attestation_bundles": [
-                        {
-                            "attestations": [],
-                            "publisher": publisher,
-                        }
-                    ],
-                    "version": 1,
-                }
-            ).encode("utf-8")
+    for name in public_names:
+        responses[file_urls[name]] = payloads[name]
+        responses[provenance_urls[name]] = json.dumps(
+            {
+                "attestation_bundles": [
+                    {
+                        "attestations": [],
+                        "publisher": publisher,
+                    }
+                ],
+                "version": 1,
+            }
+        ).encode("utf-8")
 
     class FakeResponse:
         def __init__(self, url: str, body: bytes) -> None:
@@ -759,7 +804,7 @@ def test_publication_audit_handles_absent_partial_and_success_contract(
         def open(self, request, *, timeout: int) -> FakeResponse:
             assert timeout == 20
             url = request.full_url
-            if not release_visible and url == release_url:
+            if json_count is None and url == release_url:
                 raise urllib.error.HTTPError(
                     url,
                     404,
@@ -795,8 +840,9 @@ def test_publication_audit_handles_absent_partial_and_success_contract(
 
     exec(compile(script, "<release-registry-audit>", "exec"), {})
 
-    assert f"public_count={public_count}\n" in github_output.read_text(
-        encoding="utf-8"
+    assert (
+        f"public_count={expected_public_count}\n"
+        in github_output.read_text(encoding="utf-8")
     )
     assert f"publication_state={expected_state}\n" in github_output.read_text(
         encoding="utf-8"
@@ -808,11 +854,16 @@ def test_publication_audit_handles_absent_partial_and_success_contract(
     )
     assert audit == {
         "expected_files": sorted(names),
+        "json_files": sorted(json_names),
         "public_files": sorted(public_names),
         "publication_state": expected_state,
         "publish_result": publish_result,
+        "registry_mode": expected_registry_mode,
+        "simple_files": sorted(simple_names),
     }
-    assert expected_state in github_summary.read_text(encoding="utf-8")
+    summary = github_summary.read_text(encoding="utf-8")
+    assert expected_state in summary
+    assert expected_registry_mode in summary
     for name in public_names:
         assert (
             runner_temp / "public-verification" / name
@@ -822,7 +873,14 @@ def test_publication_audit_handles_absent_partial_and_success_contract(
         ).is_file()
 
 
-@pytest.mark.parametrize("public_count", [1, 2])
+@pytest.mark.parametrize(
+    ("public_count", "json_count", "registry_mode"),
+    [
+        pytest.param(1, 1, "consistent", id="consistent-partial"),
+        pytest.param(1, 0, "index-fallback", id="index-fallback-partial"),
+        pytest.param(2, 2, "consistent", id="consistent-complete"),
+    ],
+)
 @pytest.mark.parametrize(
     "publisher_extra",
     [
@@ -838,6 +896,8 @@ def test_saved_provenance_is_verified_before_its_claims_are_inspected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     public_count: int,
+    json_count: int,
+    registry_mode: str,
     publisher_extra: dict,
 ) -> None:
     script = _embedded_python(
@@ -1039,9 +1099,12 @@ def test_saved_provenance_is_verified_before_its_claims_are_inspected(
         json.dumps(
             {
                 "expected_files": sorted(names),
+                "json_files": sorted(names[:json_count]),
                 "public_files": sorted(names[:public_count]),
                 "publication_state": publication_state,
                 "publish_result": publish_result,
+                "registry_mode": registry_mode,
+                "simple_files": sorted(names[:public_count]),
             }
         ),
         encoding="utf-8",
@@ -1081,6 +1144,8 @@ def test_release_runbook_records_owner_gates_and_safe_recovery() -> None:
     assert "absent, partial, or complete" in runbook
     assert "fails, or is cancelled" in runbook
     assert "A skipped\n`publish` job" in runbook
+    assert "`index-fallback`" in runbook
+    assert "their union as public" in runbook
     assert "Core #41" in runbook
     assert "Core #42" in runbook
     assert "Core #43" in runbook

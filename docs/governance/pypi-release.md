@@ -63,15 +63,22 @@ as absent, partial, or complete, and records that state in the workflow summary.
 A successful `publish` result requires the complete expected set; a failed or
 cancelled result may expose zero, one, or both files.
 
-For every file that is public, the auditor compares the local validated file
-against PyPI's version JSON API and Simple JSON API, downloads only bounded
-HTTPS responses from `pypi.org` and `files.pythonhosted.org`, and verifies its
+After the bounded wait, a failed or cancelled publish does not discard evidence
+merely because the version JSON and Simple APIs still disagree. The audit
+records each API's file set, marks `index-fallback`, and conservatively treats
+their union as public. This fallback is forbidden after a successful publish,
+which must end with a complete and consistent two-file set.
+
+For every file observed as public, the auditor validates every available claim
+from the version JSON and Simple JSON APIs, downloads only bounded HTTPS
+responses from `pypi.org` and `files.pythonhosted.org`, and verifies its
 filename, size, non-yanked state, SHA-256 digest, Integrity subject, and
-publisher identity. A 120-second-bounded verifier then parses each saved
-provenance document with `pypi-attestations` 0.0.29, cryptographically verifies
-its attestations against that exact downloaded distribution, and inspects the
-certificate on that same verified publish-attestation object. It requires the
-exact repository, workflow, `main` ref, protected environment, and source SHA.
+publisher identity. When both APIs expose a file, their URLs must agree. A
+120-second-bounded verifier then parses each saved provenance document with
+`pypi-attestations` 0.0.29, cryptographically verifies its attestations against
+that exact downloaded distribution, and inspects the certificate on that same
+verified publish-attestation object. It requires the exact repository,
+workflow, `main` ref, protected environment, and source SHA.
 
 The Integrity publisher object is open-ended. Its index-retained `claims`
 member may be omitted, null, or an object and is never treated as authenticated
