@@ -117,12 +117,16 @@ jobs:
           import os
           from pathlib import Path
           import re
-          import tomllib
           import urllib.error
           import urllib.parse
           import urllib.request
 
           from packaging.version import Version
+
+          try:
+              import tomllib
+          except ModuleNotFoundError:
+              import tomli as tomllib
 
           MAX_BYTES = 2_000_000
           TIMEOUT_SECONDS = 20
@@ -683,9 +687,7 @@ jobs:
 
           expected_sizes = {}
           for path in local_files:
-              digest = hashlib.file_digest(
-                  path.open("rb"), "sha256"
-              ).hexdigest()
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
               if digest != expected_hashes[path.name]:
                   raise SystemExit("local validated distribution hash mismatch")
               expected_sizes[path.name] = path.stat().st_size
