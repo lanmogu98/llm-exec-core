@@ -523,6 +523,11 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
     verify_runs = "\n".join(
         step["run"] for step in verify["steps"] if "run" in step
     )
+    audit_validator = next(
+        step
+        for step in verify["steps"]
+        if step["name"] == "Validate publication audit schema"
+    )
     cryptographic = next(
         step
         for step in verify["steps"]
@@ -537,8 +542,10 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
     )
     assert verify["permissions"] == {"contents": "read"}
     assert verify["env"]["PUBLISH_RESULT"] == "${{ needs.publish.result }}"
+    assert audit_validator["id"] == "audit"
+    assert "if" not in audit_validator
     assert cryptographic["if"] == (
-        "${{ steps.registry.outputs.public_count != '0' }}"
+        "${{ steps.audit.outputs.public_count != '0' }}"
     )
     assert "https://pypi.org/pypi/llm-exec-core/" in verify_runs
     assert "https://pypi.org/simple/llm-exec-core/" in verify_runs
@@ -564,6 +571,11 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
     assert "Provenance.model_validate" in verify_runs
     assert "attestation.verify(" in verify_runs
     assert "verification_material.certificate" in verify_runs
+    success_invariant = (
+        "successful publish audit must be complete and consistent"
+    )
+    assert success_invariant in audit_validator["run"]
+    assert success_invariant in cryptographic["run"]
     assert "timeout 120s" in verify_runs
 
 
@@ -673,6 +685,7 @@ def test_publication_audit_handles_absent_partial_and_success_contract(
     script = _embedded_python(
         "Verify PyPI JSON, Simple API, files, and Integrity subjects"
     )
+    validator_script = _embedded_python("Validate publication audit schema")
     version = "0.4.2"
     expected_sha = "a" * 40
     names = (
@@ -871,6 +884,109 @@ def test_publication_audit_handles_absent_partial_and_success_contract(
         assert (
             runner_temp / "public-verification" / f"{name}.provenance.json"
         ).is_file()
+    github_output.write_text("", encoding="utf-8")
+    exec(
+        compile(
+            validator_script,
+            "<release-audit-schema-validator>",
+            "exec",
+        ),
+        {},
+    )
+    assert github_output.read_text(encoding="utf-8") == (
+        f"public_count={expected_public_count}\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "publish_result", "expected_error"),
+    [
+        pytest.param(
+            "absent-wrong-state",
+            "failure",
+            "publication audit does not match evidence",
+            id="absent-wrong-state",
+        ),
+        pytest.param(
+            "success-partial",
+            "success",
+            "successful publish audit must be complete and consistent",
+            id="success-partial",
+        ),
+        pytest.param(
+            "success-fallback",
+            "success",
+            "successful publish audit must be complete and consistent",
+            id="success-fallback",
+        ),
+    ],
+)
+def test_publication_audit_validator_rejects_mutated_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    publish_result: str,
+    expected_error: str,
+) -> None:
+    script = _embedded_python("Validate publication audit schema")
+    names = (
+        "llm_exec_core-0.4.2-py3-none-any.whl",
+        "llm_exec_core-0.4.2.tar.gz",
+    )
+    evidence_dir = tmp_path / "release-artifact"
+    evidence_dir.mkdir()
+    (evidence_dir / "release-evidence.json").write_text(
+        json.dumps(
+            {
+                "files": {
+                    names[0]: "a" * 64,
+                    names[1]: "b" * 64,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    if case == "absent-wrong-state":
+        json_files = []
+        simple_files = []
+        public_files = []
+        publication_state = "partial"
+        registry_mode = "consistent"
+    elif case == "success-partial":
+        json_files = [names[0]]
+        simple_files = [names[0]]
+        public_files = [names[0]]
+        publication_state = "partial"
+        registry_mode = "consistent"
+    else:
+        json_files = [names[0]]
+        simple_files = list(names)
+        public_files = list(names)
+        publication_state = "complete"
+        registry_mode = "index-fallback"
+    verification_dir = tmp_path / "runner" / "public-verification"
+    verification_dir.mkdir(parents=True)
+    (verification_dir / "publication-audit.json").write_text(
+        json.dumps(
+            {
+                "expected_files": sorted(names),
+                "json_files": sorted(json_files),
+                "public_files": sorted(public_files),
+                "publication_state": publication_state,
+                "publish_result": publish_result,
+                "registry_mode": registry_mode,
+                "simple_files": sorted(simple_files),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "github-output"))
+    monkeypatch.setenv("PUBLISH_RESULT", publish_result)
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path / "runner"))
+
+    with pytest.raises(SystemExit, match=expected_error):
+        exec(compile(script, "<release-audit-validator>", "exec"), {})
 
 
 @pytest.mark.parametrize(
@@ -1146,6 +1262,8 @@ def test_release_runbook_records_owner_gates_and_safe_recovery() -> None:
     assert "A skipped\n`publish` job" in runbook
     assert "`index-fallback`" in runbook
     assert "their union as public" in runbook
+    assert "dependency-free schema step" in runbook
+    assert "including an\nabsent result" in runbook
     assert "Core #41" in runbook
     assert "Core #42" in runbook
     assert "Core #43" in runbook

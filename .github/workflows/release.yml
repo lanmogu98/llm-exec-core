@@ -1001,8 +1001,110 @@ jobs:
                   f"- Verified public union: {public_display}\n"
               )
           PY
+      - name: Validate publication audit schema
+        id: audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          PUBLISH_RESULT = os.environ["PUBLISH_RESULT"]
+          if PUBLISH_RESULT not in {"success", "failure", "cancelled"}:
+              raise SystemExit("unexpected publish job result")
+
+          evidence = json.loads(
+              Path("release-artifact/release-evidence.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          expected_hashes = evidence.get("files")
+          if not isinstance(expected_hashes, dict) or len(expected_hashes) != 2:
+              raise SystemExit("release evidence must name two files")
+          expected_names = set(expected_hashes)
+          for name, expected_hash in expected_hashes.items():
+              if Path(name).name != name:
+                  raise SystemExit("unsafe distribution filename")
+              if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+                  raise SystemExit("invalid expected distribution hash")
+
+          verification_dir = (
+              Path(os.environ["RUNNER_TEMP"]) / "public-verification"
+          )
+          audit = json.loads(
+              (verification_dir / "publication-audit.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+
+
+          def audit_file_set(field: str) -> set[str]:
+              value = audit.get(field)
+              if (
+                  not isinstance(value, list)
+                  or not all(isinstance(name, str) for name in value)
+              ):
+                  raise SystemExit(f"audit {field} is invalid")
+              names = set(value)
+              if (
+                  len(names) != len(value)
+                  or not names.issubset(expected_names)
+              ):
+                  raise SystemExit(f"audit {field} is invalid")
+              return names
+
+
+          public_names = audit_file_set("public_files")
+          json_names = audit_file_set("json_files")
+          simple_names = audit_file_set("simple_files")
+          registry_mode = audit.get("registry_mode")
+          if registry_mode == "consistent":
+              if not (public_names == json_names == simple_names):
+                  raise SystemExit("consistent registry sets disagree")
+          elif registry_mode == "index-fallback":
+              if (
+                  json_names == simple_names
+                  or public_names != json_names | simple_names
+              ):
+                  raise SystemExit("fallback registry sets are invalid")
+          else:
+              raise SystemExit("audit registry mode is invalid")
+
+          if public_names == expected_names:
+              publication_state = "complete"
+          elif public_names:
+              publication_state = "partial"
+          else:
+              publication_state = "absent"
+          if PUBLISH_RESULT == "success" and (
+              publication_state != "complete"
+              or registry_mode != "consistent"
+              or json_names != expected_names
+              or simple_names != expected_names
+          ):
+              raise SystemExit(
+                  "successful publish audit must be complete and consistent"
+              )
+          if audit != {
+              "expected_files": sorted(expected_names),
+              "json_files": sorted(json_names),
+              "public_files": sorted(public_names),
+              "publication_state": publication_state,
+              "publish_result": PUBLISH_RESULT,
+              "registry_mode": registry_mode,
+              "simple_files": sorted(simple_names),
+          }:
+              raise SystemExit("publication audit does not match evidence")
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open(
+              "a", encoding="utf-8"
+          ) as output:
+              output.write(f"public_count={len(public_names)}\n")
+          PY
       - name: Cryptographically verify saved provenance and signed claims
-        if: ${{ steps.registry.outputs.public_count != '0' }}
+        if: ${{ steps.audit.outputs.public_count != '0' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1139,12 +1241,22 @@ jobs:
               publication_state = "complete"
           else:
               publication_state = "partial"
+          publish_result = os.environ["PUBLISH_RESULT"]
+          if publish_result == "success" and (
+              publication_state != "complete"
+              or registry_mode != "consistent"
+              or json_names != expected_names
+              or simple_names != expected_names
+          ):
+              raise SystemExit(
+                  "successful publish audit must be complete and consistent"
+              )
           if audit != {
               "expected_files": sorted(expected_names),
               "json_files": sorted(json_names),
               "public_files": sorted(public_names),
               "publication_state": publication_state,
-              "publish_result": os.environ["PUBLISH_RESULT"],
+              "publish_result": publish_result,
               "registry_mode": registry_mode,
               "simple_files": sorted(simple_names),
           }:

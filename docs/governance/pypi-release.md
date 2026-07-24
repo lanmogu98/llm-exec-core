@@ -69,6 +69,13 @@ records each API's file set, marks `index-fallback`, and conservatively treats
 their union as public. This fallback is forbidden after a successful publish,
 which must end with a complete and consistent two-file set.
 
+An independent, dependency-free schema step validates every audit, including an
+absent result, before any conditional cryptographic work. It re-derives the
+public state and registry mode from the recorded file sets and independently
+enforces that a successful publish is complete and consistent. Only its
+validated nonzero public-file count can enable per-file cryptographic
+verification.
+
 For every file observed as public, the auditor validates every available claim
 from the version JSON and Simple JSON APIs, downloads only bounded HTTPS
 responses from `pypi.org` and `files.pythonhosted.org`, and verifies its
