@@ -1,7 +1,8 @@
 # OpenAI-Compatible Chat Completions Request Options
 
 This document is the design source of truth for `LLMClient.generate(...,
-request_options=...)` and `generate_response(..., request_options=...)`.
+request_options=..., generation_controls=...)` and
+`generate_response(..., request_options=..., generation_controls=...)`.
 
 ## Scope
 
@@ -67,7 +68,8 @@ passthrough routes and are outside the capability-aware guarantee.
 
 Both request methods accept keyword-only
 `request_options: Mapping[str, Any] | None = None` and
-`structured_output: Mapping[str, Any] | None = None`.
+`structured_output: Mapping[str, Any] | None = None`. They also accept
+`generation_controls: GenerationControls | Mapping[str, Any] | None = None`.
 
 `request_options` is for HTTP request payload fields only. Metadata such as
 `request_name`, callbacks, `trace_context`, `run_id`, `request_id`, and
@@ -87,6 +89,228 @@ semantic structured-output path it receives the raw response text only after
 schema validation and acts as a post-validation transform. A hook used without
 `structured_output` retains its legacy transform behavior but does not imply
 validation.
+
+## Generation Policy and Typed Controls
+
+`ModelCapabilities.generation_policy` is an optional, complete,
+provider-neutral declaration of the selected route's reasoning and sampling
+contract. The policy is authoritative when present. It contains no provider,
+model-name, or endpoint dispatch logic; two routes with the same upstream model
+ID may declare different policies, and unrelated routes may declare identical
+ones.
+
+The public types live in `llm_exec_core.config` and are not re-exported from
+the package root:
+
+```text
+GenerationPolicy
+  reasoning: ReasoningPolicy
+  sampling: SamplingPolicy
+
+ReasoningPolicy
+  availability: unavailable | optional | adaptive | always-on
+  allowed_modes: tuple[disabled | enabled | adaptive | always-on, ...]
+  default_mode: disabled | enabled | adaptive | always-on
+  can_disable: bool
+  mode: ReasoningModeWire | None
+  effort: ReasoningEffortPolicy | None
+  budget_tokens: ReasoningBudgetPolicy | None
+  allow_effort_with_budget_in:
+    tuple[enabled | adaptive | always-on, ...] = ()
+
+ReasoningModeWire
+  path: tuple[str, ...]
+  values: dict[disabled | enabled | adaptive, str | bool]
+
+ReasoningEffortPolicy
+  path: tuple[str, ...]
+  allowed_values: tuple[str, ...]
+  aliases: dict[str, str] = {}
+  modes: dict[enabled | adaptive | always-on, EffortModeRule]
+
+EffortModeRule
+  omission: provider-default | provider-selected | required
+  default: str | None
+
+ReasoningBudgetPolicy
+  path: tuple[str, ...]
+  minimum: int
+  maximum: int | None
+  modes: dict[enabled | adaptive | always-on, BudgetModeRule]
+
+BudgetModeRule
+  omission: provider-default | provider-selected | required
+  default: int | None
+  output_limit_relation: none | less-than | less-than-or-equal
+
+SamplingPolicy
+  temperature: SamplingControlPolicy
+  top_p: SamplingControlPolicy
+
+SamplingControlPolicy
+  base: SamplingRule
+  by_reasoning_mode:
+    dict[disabled | enabled | adaptive | always-on, SamplingRule] = {}
+
+SamplingRule
+  state: supported | fixed | ignored | deprecated | forbidden
+  range: NumericRange | None
+  fixed_value: float | None
+
+NumericRange
+  minimum: float
+  maximum: float
+  minimum_inclusive: bool = True
+  maximum_inclusive: bool = True
+```
+
+The reasoning declaration has four availability shapes:
+
+| Availability | Allowed shape |
+| --- | --- |
+| `unavailable` | Exactly `disabled`, with no mode wire field, effort, budget, or caller disable operation. |
+| `optional` | Exactly `disabled` and `enabled`, with a complete mode wire mapping and disable support. |
+| `adaptive` | Includes `adaptive`; may also include `disabled` and evidence-backed manual `enabled`, with a complete mode wire mapping. |
+| `always-on` | Exactly `always-on`, with no caller-selectable mode wire field or disable operation. |
+
+Every policy declares `allowed_modes`, `default_mode`, and `can_disable`.
+Selectable modes use a route-declared nested JSON path and an exact wire value
+for every selectable mode. Wire values are distinct strings or booleans and
+are decoded with exact type equality, so `true` is not interchangeable with
+`1`.
+
+Effort policy declares a nested wire path, canonical string values, optional
+alias-to-canonical mappings, and per-active-mode omission behavior. Budget
+policy declares a nested wire path, inclusive integer bounds, and
+per-active-mode omission behavior plus one final output-limit relation:
+`none`, `less-than`, or `less-than-or-equal`. A policy separately lists the
+active modes in which effort and budget may coexist.
+
+The three omission states are:
+
+- `provider-default`: omission has a declared canonical value for validation
+  and documentation, but the field remains absent on the wire.
+- `provider-selected`: omission delegates selection to the provider and has no
+  declared default.
+- `required`: callers must resolve a value for that active mode.
+
+Sampling policy is complete for both `temperature` and `top_p`. Each control
+has a base rule and optional overrides keyed by reachable reasoning mode.
+Supported rules declare an inclusive/exclusive finite numeric range; fixed
+rules declare one finite value.
+
+| Sampling state | Provider/model configured value | Per-call raw or typed value |
+| --- | --- | --- |
+| `supported` | Validate, canonicalize, and send. | Validate, canonicalize, and send. |
+| `fixed` | Omit. | Accept only the fixed value, then omit. |
+| `ignored` | Omit. | Require a finite number, then omit. |
+| `deprecated` | Omit. | Fail before execution. |
+| `forbidden` | Omit. | Fail before execution. |
+
+All new schema objects reject unknown fields. Wire paths are nonempty arrays of
+nonempty strings. Reasoning paths cannot root at core-owned `model`,
+`messages`, or `stream`, cannot root at sampling-owned `temperature` or
+`top_p`, and cannot be equal to or a prefix of another reasoning path. Effort,
+budget, coexistence, and sampling-mode keys must be reachable in the declared
+reasoning shape. Aliases, defaults, ranges, and bounds are validated when the
+catalog is loaded.
+
+`GenerationControls` has optional `reasoning` and `sampling` groups:
+
+```python
+generation_controls = {
+    "reasoning": {
+        "mode": "enabled",
+        "effort": "high",
+        "budget_tokens": None,
+    },
+    "sampling": {
+        "temperature": 0.2,
+        "top_p": None,
+    },
+}
+```
+
+Both mapping and Pydantic inputs preserve field presence. An absent field means
+"inherit"; an explicitly present `None` is a tombstone that clears all
+lower-precedence values for that semantic control. A present group set to
+`None` tombstones every control in that group. An empty top-level controls
+object is a no-op; any nonempty typed controls require a generation policy.
+
+Policy controls resolve independently, in this immutable order:
+
+1. provider scalar, then provider request override;
+2. model scalar, then model request override;
+3. constructor `thinking_level` for effort only;
+4. per-call raw `request_options` or typed `generation_controls`.
+
+A request cannot provide the same semantic control through both raw and typed
+per-call surfaces. Different controls may use the two surfaces together.
+Direct keys continue to win over promoted `extra_body` keys before semantic
+resolution. Canonical writing removes lower-precedence declarations at the
+route-declared path, preserves unknown siblings, and fails if a declared path
+would traverse a scalar.
+
+Effort aliases are converted to their canonical value before payload and cache
+construction. Explicitly disabling reasoning suppresses lower-precedence
+effort and budget defaults; a conflicting effort or budget in the same
+per-call layer fails. Effort/budget mode support, required omissions,
+coexistence, integer bounds, and relations to the single final
+`max_tokens`/`max_completion_tokens` value all fail closed.
+
+After structured-output, token-field, OpenRouter, and legacy capability
+planning, the final payload is decoded and validated again against the policy.
+This happens before cache lookup, HTTP client construction, rate limiting, or
+HTTP. Token-limit retry mutation repeats policy validation before a second HTTP
+attempt. Cache identity therefore uses the final canonical payload plus the
+existing planning capability identity: aliases and no-effect sampling choices
+share a key, while distinct effective payloads or capability versions do not.
+
+Unknown raw fields remain passthrough. A missing generation policy preserves
+legacy request, result, usage, streaming, structured-output, token-retry, and
+tuple behavior. The only policy-absent correction is that a core-generated
+unset temperature is omitted instead of being sent as JSON `null`; an explicit
+unknown raw `temperature: null` remains passthrough.
+
+### Generation-policy evidence refreshed 2026-07-24
+
+The schema covers the following current, official primary-source facts without
+adding any catalog route in this change:
+
+- Google documents model-specific thinking levels/defaults and, beginning with
+  Gemini 3.6 Flash and Gemini 3.5 Flash-Lite, deprecated and ignored
+  `temperature`/`top_p` parameters that should be removed; future model
+  generations will reject them:
+  https://ai.google.dev/gemini-api/docs/latest-model and
+  https://ai.google.dev/gemini-api/docs/thinking
+- Anthropic documents model-dependent manual, adaptive, and always-on thinking
+  contracts; effort availability/defaults; a 1,024-token manual-budget
+  minimum; a general `budget_tokens < max_tokens` rule with a documented
+  interleaved-thinking exception; incompatibility with modified
+  `temperature`/`top_k`; and a thinking-enabled `top_p` range of 0.95–1:
+  https://platform.claude.com/docs/en/build-with-claude/effort and
+  https://platform.claude.com/docs/en/build-with-claude/extended-thinking
+- DeepSeek documents `thinking.type` with enabled/disabled wire values,
+  enabled-by-default behavior, canonical `high`/`max` effort, and compatibility
+  aliases `low`/`medium -> high` and `xhigh -> max`; in thinking mode its
+  sampling and penalty parameters are accepted for compatibility but ignored:
+  https://api-docs.deepseek.com/guides/thinking_mode
+- Kimi K3 documents always-on reasoning, top-level `reasoning_effort` values
+  `low`/`high`/`max` with default `max`, and fixed
+  `temperature=1.0`/`top_p=0.95` values that callers should omit:
+  https://platform.kimi.ai/docs/guide/kimi-k3-quickstart
+- Alibaba Bailian's OpenAI-compatible parameter table documents
+  `temperature` in `[0, 2)` and `top_p` in `(0, 1.0)`, while also identifying
+  model-specific parameter support:
+  https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope
+- Volcengine's `ContextChatCompletions` endpoint documentation lists
+  `reasoning_effort` values `low`/`medium`/`high` and
+  `temperature`/`top_p` ranges `[0, 1]`:
+  https://api.volcengine.com/api-docs/view?action=ContextChatCompletions&serviceCode=ark&version=2024-01-01
+
+Generic endpoint documentation does not prove support for every model route.
+Each future catalog declaration still requires current official evidence for
+the exact provider, endpoint, and model ID. No authenticated console was used.
 
 ## Provider Connection Resolution
 
