@@ -19,10 +19,10 @@ PyPI's publisher and Integrity APIs expose the workflow filename as
 the full workflow path at `refs/heads/main`, the protected environment, and the
 exact source commit SHA.
 
-Every manual dispatch supplies an exact normalized stable `version`, an exact
-40-character current `main` `expected_sha`, and `dry_run`. The workflow rejects
-another ref, a stale `main`, disagreement among source/lock/distribution
-versions, or a version already present on PyPI.
+Every manual dispatch supplies an exact normalized stable epoch-0 `version`, an
+exact 40-character current `main` `expected_sha`, and `dry_run`. The workflow
+rejects another ref, a stale `main`, a nonzero PEP 440 epoch, disagreement among
+source/lock/distribution versions, or a version already present on PyPI.
 
 The release toolchain is deliberately fixed:
 
@@ -55,15 +55,23 @@ Action. It has no checkout, build, arbitrary shell step, username, password,
 secret, PAT, or PyPI API token. Attestations remain enabled and
 `skip-existing` is forbidden.
 
-After upload, a read-only job compares the local files against PyPI's version
-JSON API and Simple JSON API, downloads only bounded HTTPS responses from
-`pypi.org` and `files.pythonhosted.org`, and verifies filenames, sizes,
-non-yanked state, SHA-256 digests, Integrity subjects, and publisher identity.
-One 120-second-bounded verifier then parses each saved provenance document with
-`pypi-attestations` 0.0.29, cryptographically verifies its attestations against
-the exact downloaded distribution, and inspects the certificate on that same
-verified publish-attestation object. It requires the exact repository,
-workflow, `main` ref, protected environment, and source SHA.
+After every attempted non-dry-run upload, whether the `publish` job succeeds,
+fails, or is cancelled, a read-only job audits public PyPI state. A skipped
+`publish` job means no upload was attempted and does not trigger this audit.
+The auditor waits for bounded index consistency, classifies the public file set
+as absent, partial, or complete, and records that state in the workflow summary.
+A successful `publish` result requires the complete expected set; a failed or
+cancelled result may expose zero, one, or both files.
+
+For every file that is public, the auditor compares the local validated file
+against PyPI's version JSON API and Simple JSON API, downloads only bounded
+HTTPS responses from `pypi.org` and `files.pythonhosted.org`, and verifies its
+filename, size, non-yanked state, SHA-256 digest, Integrity subject, and
+publisher identity. A 120-second-bounded verifier then parses each saved
+provenance document with `pypi-attestations` 0.0.29, cryptographically verifies
+its attestations against that exact downloaded distribution, and inspects the
+certificate on that same verified publish-attestation object. It requires the
+exact repository, workflow, `main` ref, protected environment, and source SHA.
 
 The Integrity publisher object is open-ended. Its index-retained `claims`
 member may be omitted, null, or an object and is never treated as authenticated
@@ -102,13 +110,13 @@ Any preflight, quality, build, install, index, file, or provenance mismatch
 fails closed. A failed dry run publishes nothing. A failed OIDC exchange leaves
 no long-lived credential to rotate.
 
-PyPI package filenames and versions are not reusable. If publication is partial
-or a published version is bad, do not delete and retry, overwrite, use
-`skip-existing`, or reuse the version. Set
-`LLM_EXEC_CORE_PYPI_PUBLISH_ENABLED=false`, preserve the workflow and public
-evidence, yank every affected file/version as appropriate, and supersede it
-with a new legitimate version through the same reviewed process. Never reuse a
-public version.
+PyPI package filenames and versions are not reusable. If the audit reports a
+partial publication, or a published version is bad, do not delete and retry,
+overwrite, use `skip-existing`, or reuse the version. Set
+`LLM_EXEC_CORE_PYPI_PUBLISH_ENABLED=false`, preserve the workflow summary and
+public evidence, yank every affected file/version as appropriate, and supersede
+it with a new legitimate version through the same reviewed process. Never reuse
+a public version.
 
 If the PyPI project name is claimed before the first owner-controlled
 publication, stop the program and redesign the package identity. A pending

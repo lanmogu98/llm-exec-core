@@ -5,6 +5,7 @@ import re
 import runpy
 import sys
 from types import ModuleType, SimpleNamespace
+import urllib.error
 
 import pytest
 import yaml
@@ -336,6 +337,7 @@ def test_release_dispatch_and_source_identity_fail_closed() -> None:
     assert set(inputs) == {"version", "expected_sha", "dry_run"}
     assert inputs["version"]["required"] == "true"
     assert inputs["version"]["type"] == "string"
+    assert "epoch-0" in inputs["version"]["description"]
     assert inputs["expected_sha"]["required"] == "true"
     assert inputs["expected_sha"]["type"] == "string"
     assert inputs["dry_run"]["type"] == "boolean"
@@ -358,6 +360,48 @@ def test_release_dispatch_and_source_identity_fail_closed() -> None:
     assert "pull_request_target" not in text
     assert "secrets." not in text
     assert "${{ inputs." not in all_runs
+
+
+def test_release_preflight_rejects_nonzero_pep440_epoch_before_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = _embedded_python(
+        "Verify normalized source version and unused PyPI version"
+    )
+    version = "1!2.0"
+    (tmp_path / "pyproject.toml").write_text(
+        ("[project]\n" 'name = "llm-exec-core"\n' f'version = "{version}"\n'),
+        encoding="utf-8",
+    )
+    package_dir = tmp_path / "src" / "llm_exec_core"
+    package_dir.mkdir(parents=True)
+    (package_dir / "__init__.py").write_text(
+        f'__version__ = "{version}"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "uv.lock").write_text(
+        (
+            "version = 1\n"
+            "revision = 3\n"
+            'requires-python = ">=3.10"\n\n'
+            "[[package]]\n"
+            'name = "llm-exec-core"\n'
+            f'version = "{version}"\n'
+            'source = { editable = "." }\n'
+        ),
+        encoding="utf-8",
+    )
+
+    def reject_network(*_args, **_kwargs) -> None:
+        raise AssertionError("epoch rejection must happen before network I/O")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("RELEASE_VERSION", version)
+    monkeypatch.setattr("urllib.request.build_opener", reject_network)
+
+    with pytest.raises(SystemExit, match="epoch 0"):
+        exec(compile(script, "<release-preflight>", "exec"), {})
 
 
 def test_release_build_is_exact_and_hash_constrained() -> None:
@@ -496,9 +540,23 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
     verify_runs = "\n".join(
         step["run"] for step in verify["steps"] if "run" in step
     )
+    cryptographic = next(
+        step
+        for step in verify["steps"]
+        if step["name"]
+        == "Cryptographically verify saved provenance and signed claims"
+    )
 
     assert verify["needs"] == "publish"
+    assert verify["if"] == (
+        "${{ always() && !inputs.dry_run "
+        "&& needs.publish.result != 'skipped' }}"
+    )
     assert verify["permissions"] == {"contents": "read"}
+    assert verify["env"]["PUBLISH_RESULT"] == "${{ needs.publish.result }}"
+    assert cryptographic["if"] == (
+        "${{ steps.registry.outputs.public_count != '0' }}"
+    )
     assert "https://pypi.org/pypi/llm-exec-core/" in verify_runs
     assert "https://pypi.org/simple/llm-exec-core/" in verify_runs
     assert "application/vnd.pypi.simple.v1+json" in verify_runs
@@ -527,6 +585,245 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
 
 
 @pytest.mark.parametrize(
+    (
+        "public_count",
+        "publish_result",
+        "release_visible",
+        "expected_state",
+    ),
+    [
+        pytest.param(0, "failure", False, "absent", id="failed-absent"),
+        pytest.param(1, "failure", True, "partial", id="failed-partial"),
+        pytest.param(
+            1,
+            "cancelled",
+            True,
+            "partial",
+            id="cancelled-partial",
+        ),
+        pytest.param(
+            1,
+            "success",
+            True,
+            None,
+            id="successful-incomplete",
+        ),
+        pytest.param(
+            1,
+            "failure",
+            False,
+            None,
+            id="json-missing-simple-partial",
+        ),
+        pytest.param(2, "success", True, "complete", id="successful-complete"),
+        pytest.param(2, "failure", True, "complete", id="failed-complete"),
+    ],
+)
+def test_publication_audit_handles_absent_partial_and_success_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    public_count: int,
+    publish_result: str,
+    release_visible: bool,
+    expected_state: str | None,
+) -> None:
+    script = _embedded_python(
+        "Verify PyPI JSON, Simple API, files, and Integrity subjects"
+    )
+    version = "0.4.2"
+    expected_sha = "a" * 40
+    names = (
+        f"llm_exec_core-{version}-py3-none-any.whl",
+        f"llm_exec_core-{version}.tar.gz",
+    )
+    payloads = {
+        name: f"validated-{index}".encode("utf-8")
+        for index, name in enumerate(names)
+    }
+    hashes = {
+        name: hashlib.sha256(payload).hexdigest()
+        for name, payload in payloads.items()
+    }
+    package_dir = tmp_path / "release-artifact" / "packages"
+    package_dir.mkdir(parents=True)
+    for name, payload in payloads.items():
+        (package_dir / name).write_bytes(payload)
+    (tmp_path / "release-artifact" / "SHA256SUMS").write_text(
+        "".join(
+            f"{digest}  {name}\n" for name, digest in sorted(hashes.items())
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "release-artifact" / "release-evidence.json").write_text(
+        json.dumps(
+            {
+                "build_backend": "setuptools==83.0.0",
+                "files": hashes,
+                "project": "llm-exec-core",
+                "python": "3.13.14",
+                "source_sha": expected_sha,
+                "uv": "0.11.31",
+                "version": version,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    public_names = names[:public_count]
+    file_urls = {
+        name: f"https://files.pythonhosted.org/packages/aa/bb/{name}"
+        for name in public_names
+    }
+    provenance_urls = {
+        name: (
+            f"https://pypi.org/integrity/llm-exec-core/{version}/"
+            f"{name}/provenance"
+        )
+        for name in public_names
+    }
+    release_url = f"https://pypi.org/pypi/llm-exec-core/{version}/json"
+    simple_url = "https://pypi.org/simple/llm-exec-core/"
+    publisher = {
+        "environment": "pypi",
+        "kind": "GitHub",
+        "repository": "lanmogu98/llm-exec-core",
+        "workflow": "release.yml",
+    }
+    simple_files = [
+        {
+            "filename": name,
+            "hashes": {"sha256": hashes[name]},
+            "provenance": provenance_urls[name],
+            "size": len(payloads[name]),
+            "url": file_urls[name],
+            "yanked": False,
+        }
+        for name in public_names
+    ]
+    responses = {
+        simple_url: json.dumps({"files": simple_files}).encode("utf-8"),
+    }
+    if release_visible:
+        responses.update(
+            {
+                release_url: json.dumps(
+                    {
+                        "info": {"name": "llm-exec-core", "version": version},
+                        "urls": [
+                            {
+                                "digests": {"sha256": hashes[name]},
+                                "filename": name,
+                                "size": len(payloads[name]),
+                                "url": file_urls[name],
+                                "yanked": False,
+                            }
+                            for name in public_names
+                        ],
+                    }
+                ).encode("utf-8"),
+            }
+        )
+        for name in public_names:
+            responses[file_urls[name]] = payloads[name]
+            responses[provenance_urls[name]] = json.dumps(
+                {
+                    "attestation_bundles": [
+                        {
+                            "attestations": [],
+                            "publisher": publisher,
+                        }
+                    ],
+                    "version": 1,
+                }
+            ).encode("utf-8")
+
+    class FakeResponse:
+        def __init__(self, url: str, body: bytes) -> None:
+            self._url = url
+            self._body = body
+            self.headers = {"Content-Length": str(len(body))}
+
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def geturl(self) -> str:
+            return self._url
+
+        def read(self, limit: int) -> bytes:
+            return self._body[:limit]
+
+    class FakeOpener:
+        def open(self, request, *, timeout: int) -> FakeResponse:
+            assert timeout == 20
+            url = request.full_url
+            if not release_visible and url == release_url:
+                raise urllib.error.HTTPError(
+                    url,
+                    404,
+                    "Not Found",
+                    {},
+                    None,
+                )
+            assert url in responses
+            return FakeResponse(url, responses[url])
+
+    runner_temp = tmp_path / "runner"
+    github_output = tmp_path / "github-output"
+    github_summary = tmp_path / "github-summary"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("EXPECTED_SHA", expected_sha)
+    monkeypatch.setenv("GITHUB_OUTPUT", str(github_output))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(github_summary))
+    monkeypatch.setenv("PUBLISH_RESULT", publish_result)
+    monkeypatch.setenv("RELEASE_VERSION", version)
+    monkeypatch.setenv("RUNNER_TEMP", str(runner_temp))
+    monkeypatch.setattr(
+        "urllib.request.build_opener",
+        lambda *_handlers: FakeOpener(),
+    )
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    if expected_state is None:
+        with pytest.raises(SystemExit) as error:
+            exec(compile(script, "<release-registry-audit>", "exec"), {})
+        assert "audit did not become verifiable" in str(error.value)
+        assert public_names[0] in str(error.value)
+        return
+
+    exec(compile(script, "<release-registry-audit>", "exec"), {})
+
+    assert f"public_count={public_count}\n" in github_output.read_text(
+        encoding="utf-8"
+    )
+    assert f"publication_state={expected_state}\n" in github_output.read_text(
+        encoding="utf-8"
+    )
+    audit = json.loads(
+        (
+            runner_temp / "public-verification" / "publication-audit.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert audit == {
+        "expected_files": sorted(names),
+        "public_files": sorted(public_names),
+        "publication_state": expected_state,
+        "publish_result": publish_result,
+    }
+    assert expected_state in github_summary.read_text(encoding="utf-8")
+    for name in public_names:
+        assert (
+            runner_temp / "public-verification" / name
+        ).read_bytes() == payloads[name]
+        assert (
+            runner_temp / "public-verification" / f"{name}.provenance.json"
+        ).is_file()
+
+
+@pytest.mark.parametrize("public_count", [1, 2])
+@pytest.mark.parametrize(
     "publisher_extra",
     [
         pytest.param({}, id="claims-omitted"),
@@ -540,6 +837,7 @@ def test_post_publish_verification_is_bounded_and_cryptographic() -> None:
 def test_saved_provenance_is_verified_before_its_claims_are_inspected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    public_count: int,
     publisher_extra: dict,
 ) -> None:
     script = _embedded_python(
@@ -703,18 +1001,18 @@ def test_saved_provenance_is_verified_before_its_claims_are_inspected(
     runner_temp = tmp_path / "runner"
     verification_dir = runner_temp / "public-verification"
     verification_dir.mkdir(parents=True)
+    names = (
+        "llm_exec_core-0.4.2-py3-none-any.whl",
+        "llm_exec_core-0.4.2.tar.gz",
+    )
     evidence_files = {}
-    for index, name in enumerate(
-        (
-            "llm_exec_core-0.4.2-py3-none-any.whl",
-            "llm_exec_core-0.4.2.tar.gz",
-        )
-    ):
+    for index, name in enumerate(names):
+        distribution_bytes = f"distribution-{index}".encode("utf-8")
+        evidence_files[name] = hashlib.sha256(distribution_bytes).hexdigest()
+        if index >= public_count:
+            continue
         distribution = verification_dir / name
-        distribution.write_bytes(f"distribution-{index}".encode("utf-8"))
-        evidence_files[name] = hashlib.sha256(
-            distribution.read_bytes()
-        ).hexdigest()
+        distribution.write_bytes(distribution_bytes)
         publisher = {
             "environment": "pypi",
             "kind": "GitHub",
@@ -735,6 +1033,19 @@ def test_saved_provenance_is_verified_before_its_claims_are_inspected(
             json.dumps(provenance),
             encoding="utf-8",
         )
+    publication_state = "complete" if public_count == 2 else "partial"
+    publish_result = "success" if public_count == 2 else "failure"
+    (verification_dir / "publication-audit.json").write_text(
+        json.dumps(
+            {
+                "expected_files": sorted(names),
+                "public_files": sorted(names[:public_count]),
+                "publication_state": publication_state,
+                "publish_result": publish_result,
+            }
+        ),
+        encoding="utf-8",
+    )
 
     evidence_dir = tmp_path / "release-artifact"
     evidence_dir.mkdir()
@@ -744,11 +1055,12 @@ def test_saved_provenance_is_verified_before_its_claims_are_inspected(
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("EXPECTED_SHA", expected_sha)
+    monkeypatch.setenv("PUBLISH_RESULT", publish_result)
     monkeypatch.setenv("RUNNER_TEMP", str(runner_temp))
 
     exec(compile(script, "<release-verifier>", "exec"), {})
 
-    assert len(verified_attestations) == 2
+    assert len(verified_attestations) == public_count
     assert inspected_attestations == verified_attestations
 
 
@@ -765,6 +1077,10 @@ def test_release_runbook_records_owner_gates_and_safe_recovery() -> None:
     assert "must not" in runbook
     assert "yank" in runbook.lower()
     assert "never reuse" in runbook.lower()
+    assert "epoch-0" in runbook
+    assert "absent, partial, or complete" in runbook
+    assert "fails, or is cancelled" in runbook
+    assert "A skipped\n`publish` job" in runbook
     assert "Core #41" in runbook
     assert "Core #42" in runbook
     assert "Core #43" in runbook

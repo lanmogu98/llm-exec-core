@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Exact normalized stable version from the current main source
+        description: Exact normalized stable epoch-0 version from current main
         required: true
         type: string
       expected_sha:
@@ -137,6 +137,8 @@ jobs:
           parsed = Version(release_version)
           if str(parsed) != release_version:
               raise SystemExit("version input is not normalized")
+          if parsed.epoch != 0:
+              raise SystemExit("version input must use epoch 0")
           if (
               parsed.is_prerelease
               or parsed.is_devrelease
@@ -519,7 +521,8 @@ jobs:
           print-hash: true
 
   verify_publication:
-    name: Release / verify public PyPI provenance
+    name: Release / audit public PyPI state and provenance
+    if: ${{ always() && !inputs.dry_run && needs.publish.result != 'skipped' }}
     needs: publish
     runs-on: ubuntu-latest
     permissions:
@@ -527,6 +530,7 @@ jobs:
     env:
       RELEASE_VERSION: ${{ inputs.version }}
       EXPECTED_SHA: ${{ inputs.expected_sha }}
+      PUBLISH_RESULT: ${{ needs.publish.result }}
     steps:
       - name: Download validated distributions
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -540,6 +544,7 @@ jobs:
           python-version: "3.13.14"
           enable-cache: false
       - name: Verify PyPI JSON, Simple API, files, and Integrity subjects
+        id: registry
         shell: bash
         run: |
           set -euo pipefail
@@ -556,6 +561,7 @@ jobs:
 
           PROJECT = "llm-exec-core"
           VERSION = os.environ["RELEASE_VERSION"]
+          PUBLISH_RESULT = os.environ["PUBLISH_RESULT"]
           EXPECTED_REPOSITORY = "lanmogu98/llm-exec-core"
           EXPECTED_WORKFLOW = "release.yml"
           EXPECTED_ENVIRONMENT = "pypi"
@@ -573,9 +579,15 @@ jobs:
           RUNNER_TEMP = Path(os.environ["RUNNER_TEMP"])
           VERIFICATION_DIR = RUNNER_TEMP / "public-verification"
           VERIFICATION_DIR.mkdir(parents=True, exist_ok=True)
+          if PUBLISH_RESULT not in {"success", "failure", "cancelled"}:
+              raise SystemExit("unexpected publish job result")
 
 
           class PendingPublication(Exception):
+              pass
+
+
+          class ReleaseUnavailable(PendingPublication):
               pass
 
 
@@ -695,14 +707,35 @@ jobs:
               raise SystemExit("release evidence does not match the dispatch")
 
 
-          def verify_registry() -> None:
+          def verify_registry(*, require_complete: bool) -> set[str]:
               encoded_version = urllib.parse.quote(VERSION, safe="")
               release_url = f"{PYPI_JSON_PREFIX}{encoded_version}/json"
-              release = fetch_json(
-                  release_url,
-                  accept="application/json",
-                  pending_404=True,
-              )
+              try:
+                  simple = fetch_json(
+                      PYPI_SIMPLE_URL,
+                      accept="application/vnd.pypi.simple.v1+json",
+                      pending_404=True,
+                  )
+              except PendingPublication:
+                  simple = None
+              simple_rows = {
+                  row["filename"]: row
+                  for row in (simple or {}).get("files", [])
+                  if row["filename"] in expected_names
+              }
+              try:
+                  release = fetch_json(
+                      release_url,
+                      accept="application/json",
+                      pending_404=True,
+                  )
+              except PendingPublication as error:
+                  if simple_rows:
+                      raise PendingPublication(
+                          "PyPI JSON is unavailable while Simple files exist: "
+                          f"{sorted(simple_rows)}"
+                      ) from error
+                  raise ReleaseUnavailable(release_url) from error
               if release["info"]["name"] != PROJECT:
                   raise SystemExit("PyPI JSON project name mismatch")
               if release["info"]["version"] != VERSION:
@@ -710,27 +743,23 @@ jobs:
               json_rows = {
                   row["filename"]: row for row in release.get("urls", [])
               }
-              if not expected_names.issubset(json_rows):
-                  raise PendingPublication("PyPI JSON files incomplete")
-              if set(json_rows) != expected_names:
+              public_names = set(json_rows)
+              if not public_names.issubset(expected_names):
                   raise SystemExit("PyPI JSON contains unexpected files")
+              if require_complete and public_names != expected_names:
+                  raise PendingPublication(
+                      f"PyPI JSON files incomplete: {sorted(public_names)}"
+                  )
+              if simple is None:
+                  raise PendingPublication("PyPI Simple API is unavailable")
+              if set(simple_rows) != public_names:
+                  raise PendingPublication(
+                      "PyPI JSON and Simple file sets disagree: "
+                      f"JSON={sorted(public_names)}, "
+                      f"Simple={sorted(simple_rows)}"
+                  )
 
-              simple = fetch_json(
-                  PYPI_SIMPLE_URL,
-                  accept="application/vnd.pypi.simple.v1+json",
-                  pending_404=True,
-              )
-              simple_rows = {
-                  row["filename"]: row
-                  for row in simple.get("files", [])
-                  if row["filename"] in expected_names
-              }
-              if not expected_names.issubset(simple_rows):
-                  raise PendingPublication("PyPI Simple files incomplete")
-              if set(simple_rows) != expected_names:
-                  raise SystemExit("PyPI Simple file set mismatch")
-
-              for name in sorted(expected_names):
+              for name in sorted(public_names):
                   json_row = json_rows[name]
                   simple_row = simple_rows[name]
                   if json_row.get("yanked") is not False:
@@ -818,22 +847,81 @@ jobs:
                       json.dumps(provenance, sort_keys=True),
                       encoding="utf-8",
                   )
+              return public_names
 
 
+          require_complete = PUBLISH_RESULT == "success"
+          public_names = None
           for attempt in range(1, MAX_ATTEMPTS + 1):
               try:
-                  verify_registry()
-                  break
+                  public_names = verify_registry(
+                      require_complete=require_complete
+                  )
+                  if (
+                      not require_complete
+                      and public_names != expected_names
+                      and attempt < MAX_ATTEMPTS
+                  ):
+                      raise PendingPublication(
+                          "waiting for failed publish state to settle: "
+                          f"{sorted(public_names)}"
+                      )
+              except ReleaseUnavailable as error:
+                  if not require_complete and attempt == MAX_ATTEMPTS:
+                      public_names = set()
+                      break
+                  pending_error = error
               except PendingPublication as error:
-                  if attempt == MAX_ATTEMPTS:
-                      raise SystemExit(
-                          "PyPI publication did not become complete in time"
-                      ) from error
-                  time.sleep(RETRY_SECONDS)
+                  pending_error = error
+              else:
+                  break
+              if attempt == MAX_ATTEMPTS:
+                  raise SystemExit(
+                      "PyPI publication audit did not become verifiable "
+                      f"in time: {pending_error}"
+                  ) from pending_error
+              time.sleep(RETRY_SECONDS)
           else:
               raise SystemExit("bounded publication verification failed")
+          if public_names is None:
+              raise SystemExit("public file set was not determined")
+
+          if public_names == expected_names:
+              publication_state = "complete"
+          elif public_names:
+              publication_state = "partial"
+          else:
+              publication_state = "absent"
+          audit = {
+              "expected_files": sorted(expected_names),
+              "public_files": sorted(public_names),
+              "publication_state": publication_state,
+              "publish_result": PUBLISH_RESULT,
+          }
+          (VERIFICATION_DIR / "publication-audit.json").write_text(
+              json.dumps(audit, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          with Path(os.environ["GITHUB_OUTPUT"]).open(
+              "a", encoding="utf-8"
+          ) as output:
+              output.write(f"public_count={len(public_names)}\n")
+              output.write(
+                  f"publication_state={publication_state}\n"
+              )
+          public_display = ", ".join(sorted(public_names)) or "none"
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open(
+              "a", encoding="utf-8"
+          ) as summary:
+              summary.write(
+                  "## PyPI publication audit\n\n"
+                  f"- Publish job result: `{PUBLISH_RESULT}`\n"
+                  f"- Public state: `{publication_state}`\n"
+                  f"- Verified public files: {public_display}\n"
+              )
           PY
       - name: Cryptographically verify saved provenance and signed claims
+        if: ${{ steps.registry.outputs.public_count != '0' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -917,10 +1005,45 @@ jobs:
           verification_dir = (
               Path(os.environ["RUNNER_TEMP"]) / "public-verification"
           )
-
-          for name, expected_hash in sorted(expected_hashes.items()):
+          for name, expected_hash in expected_hashes.items():
               if Path(name).name != name:
                   raise SystemExit("unsafe distribution filename")
+              if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+                  raise SystemExit("invalid expected distribution hash")
+
+          audit = json.loads(
+              (verification_dir / "publication-audit.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          public_files = audit.get("public_files")
+          if (
+              not isinstance(public_files, list)
+              or not public_files
+              or not all(isinstance(name, str) for name in public_files)
+          ):
+              raise SystemExit("audit must name public files")
+          public_names = set(public_files)
+          expected_names = set(expected_hashes)
+          if (
+              len(public_names) != len(public_files)
+              or not public_names.issubset(expected_names)
+          ):
+              raise SystemExit("audit public file set is invalid")
+          if public_names == expected_names:
+              publication_state = "complete"
+          else:
+              publication_state = "partial"
+          if audit != {
+              "expected_files": sorted(expected_names),
+              "public_files": sorted(public_names),
+              "publication_state": publication_state,
+              "publish_result": os.environ["PUBLISH_RESULT"],
+          }:
+              raise SystemExit("publication audit does not match evidence")
+
+          for name in sorted(public_names):
+              expected_hash = expected_hashes[name]
               distribution_path = verification_dir / name
               provenance_path = verification_dir / (
                   f"{name}.provenance.json"
@@ -932,9 +1055,7 @@ jobs:
 
               distribution = Distribution.from_file(distribution_path)
               if (
-                  not isinstance(expected_hash, str)
-                  or len(expected_hash) != 64
-                  or distribution.digest != expected_hash
+                  distribution.digest != expected_hash
                   or hashlib.sha256(
                       distribution_path.read_bytes()
                   ).hexdigest()
