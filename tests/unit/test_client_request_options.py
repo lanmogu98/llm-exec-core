@@ -1,12 +1,14 @@
 from contextlib import asynccontextmanager
 from copy import deepcopy
 import json
+import math
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
+import llm_exec_core.config as config_module
 from llm_exec_core import StructuredOutputValidationError
 from llm_exec_core.client import LLMClient
 
@@ -129,6 +131,192 @@ def _qwen_no_tools_capabilities():
     capabilities["tools"] = False
     capabilities["tool_choice"] = False
     return capabilities
+
+
+def _supported_rule(
+    minimum=0.0,
+    maximum=1.0,
+    minimum_inclusive=True,
+    maximum_inclusive=True,
+):
+    return {
+        "state": "supported",
+        "range": {
+            "minimum": minimum,
+            "maximum": maximum,
+            "minimum_inclusive": minimum_inclusive,
+            "maximum_inclusive": maximum_inclusive,
+        },
+    }
+
+
+def _policy(
+    *,
+    availability="optional",
+    allowed_modes=None,
+    default_mode=None,
+    can_disable=None,
+    mode_path=("thinking", "type"),
+    mode_values=None,
+    effort=True,
+    effort_path=("reasoning", "effort"),
+    effort_omission="provider-selected",
+    effort_default=None,
+    budget=True,
+    budget_path=("reasoning", "budget_tokens"),
+    budget_omission="provider-selected",
+    budget_default=None,
+    budget_minimum=0,
+    budget_maximum=8192,
+    output_limit_relation="none",
+    allow_effort_with_budget=True,
+    temperature=None,
+    top_p=None,
+):
+    if allowed_modes is None:
+        allowed_modes = {
+            "unavailable": ("disabled",),
+            "optional": ("disabled", "enabled"),
+            "adaptive": ("disabled", "adaptive"),
+            "always-on": ("always-on",),
+        }[availability]
+    if default_mode is None:
+        default_mode = {
+            "unavailable": "disabled",
+            "optional": "disabled",
+            "adaptive": "adaptive",
+            "always-on": "always-on",
+        }[availability]
+    if can_disable is None:
+        can_disable = availability in {"optional", "adaptive"} and (
+            "disabled" in allowed_modes
+        )
+    if mode_values is None:
+        mode_values = {
+            selectable_mode: selectable_mode
+            for selectable_mode in allowed_modes
+            if selectable_mode != "always-on"
+        }
+    active_modes = [
+        mode
+        for mode in allowed_modes
+        if mode in {"enabled", "adaptive", "always-on"}
+    ]
+    reasoning = {
+        "availability": availability,
+        "allowed_modes": list(allowed_modes),
+        "default_mode": default_mode,
+        "can_disable": can_disable,
+        "mode": (
+            None
+            if availability in {"unavailable", "always-on"}
+            else {"path": list(mode_path), "values": deepcopy(mode_values)}
+        ),
+        "effort": None,
+        "budget_tokens": None,
+        "allow_effort_with_budget_in": [],
+    }
+    if effort:
+        reasoning["effort"] = {
+            "path": list(effort_path),
+            "allowed_values": ["low", "high", "max"],
+            "aliases": {"medium": "high", "xhigh": "max"},
+            "modes": {
+                mode: {
+                    "omission": effort_omission,
+                    "default": effort_default,
+                }
+                for mode in active_modes
+            },
+        }
+    if budget:
+        reasoning["budget_tokens"] = {
+            "path": list(budget_path),
+            "minimum": budget_minimum,
+            "maximum": budget_maximum,
+            "modes": {
+                mode: {
+                    "omission": budget_omission,
+                    "default": budget_default,
+                    "output_limit_relation": output_limit_relation,
+                }
+                for mode in active_modes
+            },
+        }
+    if effort and budget and allow_effort_with_budget:
+        reasoning["allow_effort_with_budget_in"] = active_modes
+    if temperature is None:
+        temperature = {"base": _supported_rule(0.0, 2.0, True, False)}
+    if top_p is None:
+        top_p = {"base": _supported_rule(0.0, 1.0, False, True)}
+    return {
+        "reasoning": reasoning,
+        "sampling": {
+            "temperature": deepcopy(temperature),
+            "top_p": deepcopy(top_p),
+        },
+    }
+
+
+def _policy_capabilities(policy=None, version="unit-policy-2026-07-24"):
+    return {
+        "version": version,
+        "source": "https://example.invalid/generation-policy",
+        "source_date": "2026-07-24",
+        "reasoning_controls": [],
+        "generation_policy": deepcopy(
+            policy if policy is not None else _policy()
+        ),
+    }
+
+
+def _policy_config(
+    *,
+    policy=None,
+    version="unit-policy-2026-07-24",
+    request_overrides=None,
+    provider_settings=None,
+    model_settings=None,
+    provider_name="test-provider",
+    model_name="test-model",
+    api_base_url="https://example.invalid/chat/completions",
+):
+    return _config(
+        request_overrides=request_overrides,
+        model_capabilities=_policy_capabilities(policy, version),
+        provider_settings=provider_settings,
+        model_settings=model_settings,
+        provider_name=provider_name,
+        model_name=model_name,
+        api_base_url=api_base_url,
+    )
+
+
+async def _capture_policy_request(
+    config_source,
+    *,
+    client_kwargs=None,
+    generate_kwargs=None,
+    response_content="ok",
+):
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response(
+            response_content
+        )
+        mock_cls.return_value = mock_httpx_client
+        client = LLMClient(
+            "test-model",
+            config_source=config_source,
+            **(client_kwargs or {}),
+        )
+        _disable_rate_limit(client)
+        result = await client.generate(
+            "Hello",
+            **(generate_kwargs or {}),
+        )
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+    return payload, client, mock_httpx_client, result
 
 
 def test_client_resolves_model_request_policy_scalars_over_provider_defaults(
@@ -2474,3 +2662,1651 @@ async def test_request_stream_options_none_overrides_provider_options(
     payload = mock_httpx_client.post.await_args.kwargs["json"]
 
     assert payload["stream_options"] is None
+
+
+@pytest.mark.asyncio
+async def test_policy_absent_omits_only_core_generated_unset_temperature(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    config = _config(provider_settings={"temperature": None})
+
+    payload, _, _, _ = await _capture_policy_request(
+        config,
+        generate_kwargs={
+            "request_options": {
+                "vendor_null": None,
+                "temperature": None,
+            }
+        },
+    )
+
+    assert payload["temperature"] is None
+    assert payload["vendor_null"] is None
+
+    payload, _, _, _ = await _capture_policy_request(config)
+    assert "temperature" not in payload
+
+
+@pytest.mark.asyncio
+async def test_generation_controls_require_a_generation_policy(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    client = LLMClient("test-model", config_source=_config())
+    client._cache_enabled = True
+    client._cache.get = MagicMock()
+    client._wait_for_rate_limit = AsyncMock()
+    client._get_client = AsyncMock()
+
+    with pytest.raises(ValueError, match="generation_policy"):
+        await client.generate(
+            "Hello",
+            generation_controls={"sampling": {"temperature": 0.2}},
+        )
+
+    client._cache.get.assert_not_called()
+    client._wait_for_rate_limit.assert_not_awaited()
+    client._get_client.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_empty_typed_generation_controls_are_legacy_safe(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    payload, _, _, _ = await _capture_policy_request(
+        _config(),
+        generate_kwargs={
+            "generation_controls": config_module.GenerationControls()
+        },
+    )
+
+    assert payload["temperature"] == 0.1
+
+
+@pytest.mark.asyncio
+async def test_generate_response_accepts_generation_controls_and_keeps_tuple(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response("legacy")
+        mock_cls.return_value = mock_httpx_client
+        client = LLMClient(
+            "test-model",
+            config_source=_policy_config(),
+        )
+        _disable_rate_limit(client)
+        text, usage = await client.generate_response(
+            "Hello",
+            generation_controls={
+                "reasoning": {"mode": "enabled", "effort": "medium"},
+                "sampling": {"temperature": 0.25},
+            },
+        )
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+    assert text == "legacy"
+    assert isinstance(usage, dict)
+    assert payload["thinking"]["type"] == "enabled"
+    assert payload["reasoning"]["effort"] == "high"
+    assert payload["temperature"] == 0.25
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode_values", "raw_value", "expected_mode"),
+    [
+        ({"disabled": False, "enabled": True}, True, "enabled"),
+        ({"disabled": "off", "enabled": "on"}, "on", "enabled"),
+    ],
+    ids=["boolean-wire", "string-wire"],
+)
+async def test_reasoning_mode_raw_values_decode_and_reencode_exactly(
+    monkeypatch, mode_values, raw_value, expected_mode
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(mode_values=mode_values, effort=False, budget=False)
+
+    payload, _, _, _ = await _capture_policy_request(
+        _policy_config(policy=policy),
+        generate_kwargs={"request_options": {"thinking": {"type": raw_value}}},
+    )
+
+    assert payload["thinking"]["type"] == mode_values[expected_mode]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_mode_wire_comparison_keeps_bool_distinct_from_int(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(
+        mode_values={"disabled": False, "enabled": True},
+        effort=False,
+        budget=False,
+    )
+
+    with pytest.raises(ValueError, match="reasoning mode"):
+        await LLMClient(
+            "test-model",
+            config_source=_policy_config(policy=policy),
+        ).generate(
+            "Hello",
+            request_options={"thinking": {"type": 1}},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("availability", "controls", "expected_mode_field"),
+    [
+        (
+            "optional",
+            {"reasoning": {"mode": "enabled"}},
+            "enabled",
+        ),
+        (
+            "adaptive",
+            {},
+            None,
+        ),
+        (
+            "always-on",
+            {},
+            None,
+        ),
+        (
+            "unavailable",
+            {},
+            None,
+        ),
+    ],
+)
+async def test_reasoning_availability_modes_plan_without_provider_branches(
+    monkeypatch, availability, controls, expected_mode_field
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(
+        availability=availability,
+        effort=False,
+        budget=False,
+    )
+
+    payload, _, _, _ = await _capture_policy_request(
+        _policy_config(policy=policy),
+        generate_kwargs=(
+            {"generation_controls": controls} if controls else None
+        ),
+    )
+
+    if expected_mode_field is None:
+        assert "thinking" not in payload
+    else:
+        assert payload["thinking"]["type"] == expected_mode_field
+
+
+@pytest.mark.asyncio
+async def test_adaptive_policy_can_expose_evidence_backed_manual_mode(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(
+        availability="adaptive",
+        allowed_modes=("disabled", "enabled", "adaptive"),
+        default_mode="adaptive",
+        effort=False,
+        budget=False,
+    )
+
+    payload, _, _, _ = await _capture_policy_request(
+        _policy_config(policy=policy),
+        generate_kwargs={
+            "generation_controls": {"reasoning": {"mode": "enabled"}}
+        },
+    )
+
+    assert payload["thinking"]["type"] == "enabled"
+
+
+@pytest.mark.asyncio
+async def test_always_on_rejects_caller_mode_and_unavailable_rejects_effort(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    always_client = LLMClient(
+        "test-model",
+        config_source=_policy_config(
+            policy=_policy(
+                availability="always-on",
+                effort=True,
+                budget=False,
+            )
+        ),
+    )
+    unavailable_client = LLMClient(
+        "test-model",
+        config_source=_policy_config(
+            policy=_policy(
+                availability="unavailable",
+                effort=False,
+                budget=False,
+            )
+        ),
+    )
+
+    with pytest.raises(ValueError, match="always-on"):
+        await always_client.generate(
+            "Hello",
+            generation_controls={"reasoning": {"mode": "enabled"}},
+        )
+    with pytest.raises(ValueError, match="unavailable"):
+        await unavailable_client.generate(
+            "Hello",
+            request_options={"reasoning_effort": "high"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_effort_aliases_and_thinking_level_use_declared_wire_path(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(
+        default_mode="enabled",
+        budget=False,
+        effort_path=("controls", "depth"),
+    )
+
+    payload, _, _, _ = await _capture_policy_request(
+        _policy_config(policy=policy),
+        client_kwargs={"thinking_level": "medium"},
+    )
+    assert payload["controls"]["depth"] == "high"
+    assert "reasoning_effort" not in payload
+
+    payload, _, _, _ = await _capture_policy_request(
+        _policy_config(policy=policy),
+        client_kwargs={"thinking_level": "low"},
+        generate_kwargs={
+            "generation_controls": {"reasoning": {"effort": "xhigh"}}
+        },
+    )
+    assert payload["controls"]["depth"] == "max"
+
+
+@pytest.mark.asyncio
+async def test_per_call_effort_tombstone_clears_thinking_level(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(default_mode="enabled", budget=False)
+
+    payload, _, _, _ = await _capture_policy_request(
+        _policy_config(policy=policy),
+        client_kwargs={"thinking_level": "high"},
+        generate_kwargs={
+            "generation_controls": {"reasoning": {"effort": None}}
+        },
+    )
+
+    assert "reasoning" not in payload
+
+
+def test_policy_thinking_level_rejects_unsupported_or_invalid_effort(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with pytest.raises(ValueError, match="does not declare effort"):
+        LLMClient(
+            "test-model",
+            thinking_level="high",
+            config_source=_policy_config(
+                policy=_policy(effort=False, budget=False)
+            ),
+        )
+    with pytest.raises(ValueError, match="allowed"):
+        LLMClient(
+            "test-model",
+            thinking_level="ultra",
+            config_source=_policy_config(
+                policy=_policy(default_mode="enabled", budget=False)
+            ),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("omission", "default", "should_fail"),
+    [
+        ("provider-default", "high", False),
+        ("provider-selected", None, False),
+        ("required", None, True),
+    ],
+)
+async def test_effort_omission_modes_are_enforced(
+    monkeypatch, omission, default, should_fail
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(
+        default_mode="enabled",
+        effort_omission=omission,
+        effort_default=default,
+        budget=False,
+    )
+    client = LLMClient(
+        "test-model",
+        config_source=_policy_config(policy=policy),
+    )
+    _disable_rate_limit(client)
+
+    if should_fail:
+        with pytest.raises(ValueError, match="required"):
+            await client.generate("Hello")
+    else:
+        payload, _, _, _ = await _capture_policy_request(
+            _policy_config(policy=policy)
+        )
+        assert "reasoning" not in payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget_tokens", [0, 8192])
+async def test_budget_inclusive_boundaries_are_sent(
+    monkeypatch, budget_tokens
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(
+        default_mode="enabled",
+        effort=False,
+        budget_minimum=0,
+        budget_maximum=8192,
+    )
+
+    payload, _, _, _ = await _capture_policy_request(
+        _policy_config(policy=policy),
+        generate_kwargs={
+            "generation_controls": {
+                "reasoning": {"budget_tokens": budget_tokens}
+            }
+        },
+    )
+
+    assert payload["reasoning"]["budget_tokens"] == budget_tokens
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("budget_tokens", "match"),
+    [
+        (True, "plain integer"),
+        (-1, "minimum"),
+        (8193, "maximum"),
+    ],
+)
+async def test_budget_rejects_bool_and_out_of_bounds_values(
+    monkeypatch, budget_tokens, match
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    client = LLMClient(
+        "test-model",
+        config_source=_policy_config(
+            policy=_policy(default_mode="enabled", effort=False)
+        ),
+    )
+
+    with pytest.raises(ValueError, match=match):
+        await client.generate(
+            "Hello",
+            request_options={"reasoning": {"budget_tokens": budget_tokens}},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("relation", "budget", "token_options", "should_pass", "match"),
+    [
+        ("none", 128, {}, True, None),
+        ("less-than", 127, {"max_tokens": 128}, True, None),
+        ("less-than", 128, {"max_tokens": 128}, False, "less than"),
+        (
+            "less-than-or-equal",
+            128,
+            {"max_completion_tokens": 128},
+            True,
+            None,
+        ),
+        (
+            "less-than-or-equal",
+            129,
+            {"max_completion_tokens": 128},
+            False,
+            "less than or equal",
+        ),
+        (
+            "less-than",
+            10,
+            {"max_tokens": None},
+            False,
+            "plain integer",
+        ),
+    ],
+)
+async def test_budget_output_limit_relations_use_final_token_field(
+    monkeypatch, relation, budget, token_options, should_pass, match
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(
+        default_mode="enabled",
+        effort=False,
+        output_limit_relation=relation,
+    )
+    client = LLMClient(
+        "test-model",
+        config_source=_policy_config(policy=policy),
+    )
+    _disable_rate_limit(client)
+    kwargs = {
+        "request_options": {
+            **token_options,
+            "reasoning": {"budget_tokens": budget},
+        }
+    }
+
+    if should_pass:
+        with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+            mock_httpx_client = AsyncMock()
+            mock_httpx_client.post.return_value = _success_response()
+            mock_cls.return_value = mock_httpx_client
+            await client.generate("Hello", **kwargs)
+        assert mock_httpx_client.post.await_count == 1
+    else:
+        with pytest.raises(ValueError, match=match):
+            await client.generate("Hello", **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_budget_relation_rejects_missing_and_dual_output_limits(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(
+        default_mode="enabled",
+        effort=False,
+        output_limit_relation="less-than",
+    )
+    missing_limit_config = _policy_config(
+        policy=policy,
+        provider_settings={"max_tokens": None},
+    )
+
+    with pytest.raises(ValueError, match="token-limit"):
+        await LLMClient(
+            "test-model",
+            config_source=missing_limit_config,
+        ).generate(
+            "Hello",
+            generation_controls={"reasoning": {"budget_tokens": 10}},
+        )
+
+    with pytest.raises(ValueError, match="both max_tokens"):
+        await LLMClient(
+            "test-model",
+            config_source=_policy_config(policy=policy),
+        ).generate(
+            "Hello",
+            request_options={
+                "max_tokens": 100,
+                "max_completion_tokens": 100,
+                "reasoning": {"budget_tokens": 10},
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_effort_and_budget_pair_requires_declared_mode_permission(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    forbidden_policy = _policy(
+        default_mode="enabled",
+        allow_effort_with_budget=False,
+    )
+    allowed_policy = _policy(
+        default_mode="enabled",
+        allow_effort_with_budget=True,
+    )
+    controls = {
+        "reasoning": {
+            "effort": "high",
+            "budget_tokens": 1024,
+        }
+    }
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        await LLMClient(
+            "test-model",
+            config_source=_policy_config(policy=forbidden_policy),
+        ).generate("Hello", generation_controls=controls)
+
+    payload, _, _, _ = await _capture_policy_request(
+        _policy_config(policy=allowed_policy),
+        generate_kwargs={"generation_controls": controls},
+    )
+    assert payload["reasoning"] == {
+        "effort": "high",
+        "budget_tokens": 1024,
+    }
+
+
+@pytest.mark.asyncio
+async def test_explicit_disable_suppresses_lower_effort_and_budget(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    config = _policy_config(
+        policy=_policy(default_mode="enabled"),
+        request_overrides={
+            "thinking": {"type": "enabled"},
+            "reasoning": {"effort": "high", "budget_tokens": 1024},
+        },
+    )
+
+    payload, _, _, _ = await _capture_policy_request(
+        config,
+        generate_kwargs={
+            "generation_controls": {"reasoning": {"mode": "disabled"}}
+        },
+    )
+
+    assert payload["thinking"]["type"] == "disabled"
+    assert "reasoning" not in payload
+
+
+@pytest.mark.asyncio
+async def test_same_layer_disable_with_effort_or_budget_is_contradictory(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    client = LLMClient(
+        "test-model",
+        config_source=_policy_config(policy=_policy(default_mode="enabled")),
+    )
+
+    with pytest.raises(ValueError, match="disabled"):
+        await client.generate(
+            "Hello",
+            generation_controls={
+                "reasoning": {
+                    "mode": "disabled",
+                    "effort": "high",
+                }
+            },
+        )
+    with pytest.raises(ValueError, match="disabled"):
+        await client.generate(
+            "Hello",
+            request_options={
+                "thinking": {"type": "disabled"},
+                "reasoning": {"budget_tokens": 1024},
+            },
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("temperature", 0.0),
+        ("temperature", 1.999),
+        ("top_p", 0.001),
+        ("top_p", 1.0),
+    ],
+)
+async def test_supported_sampling_accepts_exact_range_boundaries(
+    monkeypatch, field, value
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    payload, _, _, _ = await _capture_policy_request(
+        _policy_config(policy=_policy(effort=False, budget=False)),
+        generate_kwargs={"generation_controls": {"sampling": {field: value}}},
+    )
+
+    assert payload[field] == value
+    assert type(payload[field]) is float
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("temperature", 2.0, "range"),
+        ("top_p", 0.0, "range"),
+        ("temperature", True, "number"),
+        ("top_p", math.inf, "finite"),
+        ("temperature", math.nan, "finite"),
+    ],
+)
+async def test_supported_sampling_rejects_invalid_type_finite_and_boundaries(
+    monkeypatch, field, value, match
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    client = LLMClient(
+        "test-model",
+        config_source=_policy_config(
+            policy=_policy(effort=False, budget=False)
+        ),
+    )
+
+    with pytest.raises(ValueError, match=match):
+        await client.generate(
+            "Hello",
+            request_options={field: value},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("negative_zero", [-0.0, 0.0])
+async def test_sampling_canonicalizes_signed_zero(monkeypatch, negative_zero):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    payload, _, _, _ = await _capture_policy_request(
+        _policy_config(policy=_policy(effort=False, budget=False)),
+        generate_kwargs={
+            "generation_controls": {"sampling": {"temperature": negative_zero}}
+        },
+    )
+
+    assert payload["temperature"] == 0.0
+    assert math.copysign(1.0, payload["temperature"]) == 1.0
+
+
+@pytest.mark.asyncio
+async def test_fixed_sampling_omits_defaults_and_equal_explicit_values(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(
+        effort=False,
+        budget=False,
+        temperature={"base": {"state": "fixed", "fixed_value": 1.0}},
+        top_p={"base": {"state": "fixed", "fixed_value": 0.95}},
+    )
+    config = _policy_config(
+        policy=policy,
+        request_overrides={"top_p": 0.1},
+        provider_settings={"temperature": 0.4},
+        model_settings={
+            "temperature": 0.6,
+            "request_overrides": {"top_p": 0.2},
+        },
+    )
+
+    omitted, _, _, _ = await _capture_policy_request(config)
+    equal, _, _, _ = await _capture_policy_request(
+        config,
+        generate_kwargs={
+            "generation_controls": {
+                "sampling": {"temperature": 1, "top_p": 0.95}
+            }
+        },
+    )
+
+    assert "temperature" not in omitted
+    assert "top_p" not in omitted
+    assert "temperature" not in equal
+    assert "top_p" not in equal
+
+    with pytest.raises(ValueError, match="fixed"):
+        await LLMClient(
+            "test-model",
+            config_source=config,
+        ).generate(
+            "Hello",
+            generation_controls={"sampling": {"temperature": 0.9}},
+        )
+
+
+@pytest.mark.asyncio
+async def test_ignored_sampling_omits_finite_values_and_rejects_invalid(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(
+        effort=False,
+        budget=False,
+        temperature={"base": {"state": "ignored"}},
+    )
+    config = _policy_config(policy=policy)
+
+    payload, _, _, _ = await _capture_policy_request(
+        config,
+        generate_kwargs={
+            "generation_controls": {"sampling": {"temperature": 0.7}}
+        },
+    )
+    assert "temperature" not in payload
+
+    with pytest.raises(ValueError, match="number"):
+        await LLMClient("test-model", config_source=config).generate(
+            "Hello",
+            request_options={"temperature": True},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["deprecated", "forbidden"])
+async def test_deprecated_and_forbidden_sampling_fail_only_for_explicit_values(
+    monkeypatch, state
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(
+        effort=False,
+        budget=False,
+        temperature={"base": {"state": state}},
+    )
+    config = _policy_config(
+        policy=policy,
+        provider_settings={"temperature": 0.4},
+    )
+
+    payload, _, _, _ = await _capture_policy_request(config)
+    assert "temperature" not in payload
+
+    with pytest.raises(ValueError, match=state):
+        await LLMClient("test-model", config_source=config).generate(
+            "Hello",
+            generation_controls={"sampling": {"temperature": 0.4}},
+        )
+
+
+@pytest.mark.asyncio
+async def test_reasoning_mode_selects_conditional_sampling_rule(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    temperature = {
+        "base": _supported_rule(0.0, 1.0),
+        "by_reasoning_mode": {
+            "enabled": {"state": "forbidden"},
+        },
+    }
+    policy = _policy(
+        effort=False,
+        budget=False,
+        temperature=temperature,
+    )
+
+    payload, _, _, _ = await _capture_policy_request(
+        _policy_config(policy=policy),
+        generate_kwargs={
+            "generation_controls": {
+                "reasoning": {"mode": "disabled"},
+                "sampling": {"temperature": 0.5},
+            }
+        },
+    )
+    assert payload["temperature"] == 0.5
+
+    with pytest.raises(ValueError, match="forbidden"):
+        await LLMClient(
+            "test-model",
+            config_source=_policy_config(policy=policy),
+        ).generate(
+            "Hello",
+            generation_controls={
+                "reasoning": {"mode": "enabled"},
+                "sampling": {"temperature": 0.5},
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_generation_control_precedence_is_layered_path_by_path(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(default_mode="enabled", budget=False)
+    config = _policy_config(
+        policy=policy,
+        request_overrides={
+            "temperature": 0.2,
+            "reasoning": {"effort": "low"},
+        },
+        provider_settings={"temperature": 0.1},
+        model_settings={
+            "temperature": 0.3,
+            "request_overrides": {
+                "temperature": 0.4,
+                "reasoning": {"effort": "medium"},
+            },
+        },
+    )
+
+    payload, _, _, _ = await _capture_policy_request(
+        config,
+        client_kwargs={"thinking_level": "xhigh"},
+    )
+    assert payload["temperature"] == 0.4
+    assert payload["reasoning"]["effort"] == "max"
+
+    raw_payload, _, _, _ = await _capture_policy_request(
+        config,
+        client_kwargs={"thinking_level": "xhigh"},
+        generate_kwargs={
+            "request_options": {
+                "temperature": 0.5,
+                "reasoning": {"effort": "low"},
+            }
+        },
+    )
+    assert raw_payload["temperature"] == 0.5
+    assert raw_payload["reasoning"]["effort"] == "low"
+
+    typed_payload, _, _, _ = await _capture_policy_request(
+        config,
+        client_kwargs={"thinking_level": "xhigh"},
+        generate_kwargs={
+            "generation_controls": {
+                "reasoning": {"effort": "medium"},
+                "sampling": {"temperature": 0.6},
+            }
+        },
+    )
+    assert typed_payload["temperature"] == 0.6
+    assert typed_payload["reasoning"]["effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_model_tombstones_clear_provider_policy_controls(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(default_mode="enabled", budget=False)
+    config = _policy_config(
+        policy=policy,
+        request_overrides={
+            "temperature": 0.2,
+            "reasoning": {"effort": "high"},
+        },
+        model_settings={
+            "request_overrides": {
+                "temperature": None,
+                "reasoning": {"effort": None},
+            }
+        },
+    )
+
+    payload, _, _, _ = await _capture_policy_request(config)
+
+    assert "temperature" not in payload
+    assert "reasoning" not in payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_options", "generation_controls", "control"),
+    [
+        (
+            {"temperature": None},
+            {"sampling": {"temperature": None}},
+            "temperature",
+        ),
+        (
+            {"reasoning": {"effort": None}},
+            {"reasoning": {"effort": None}},
+            "effort",
+        ),
+        (
+            {"thinking": {"type": "enabled"}},
+            {"reasoning": {"mode": "enabled"}},
+            "mode",
+        ),
+    ],
+)
+async def test_raw_and_typed_same_control_collision_is_rejected(
+    monkeypatch, request_options, generation_controls, control
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    client = LLMClient(
+        "test-model",
+        config_source=_policy_config(policy=_policy(default_mode="enabled")),
+    )
+
+    with pytest.raises(ValueError, match=f"{control}.*raw.*typed"):
+        await client.generate(
+            "Hello",
+            request_options=request_options,
+            generation_controls=generation_controls,
+        )
+
+
+@pytest.mark.asyncio
+async def test_raw_and_typed_different_controls_can_be_combined(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    payload, _, _, _ = await _capture_policy_request(
+        _policy_config(policy=_policy(default_mode="enabled", budget=False)),
+        generate_kwargs={
+            "request_options": {"top_p": 0.8},
+            "generation_controls": {
+                "reasoning": {"effort": "medium"},
+                "sampling": {"temperature": 0.2},
+            },
+        },
+    )
+
+    assert payload["top_p"] == 0.8
+    assert payload["temperature"] == 0.2
+    assert payload["reasoning"]["effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_extra_body_direct_key_wins_before_semantic_validation(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    payload, _, _, _ = await _capture_policy_request(
+        _policy_config(policy=_policy(effort=False, budget=False)),
+        generate_kwargs={
+            "request_options": {
+                "temperature": 0.4,
+                "extra_body": {"temperature": 0.3},
+            }
+        },
+    )
+
+    assert payload["temperature"] == 0.4
+
+
+@pytest.mark.asyncio
+async def test_nested_declared_paths_preserve_unknown_siblings(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(
+        default_mode="enabled",
+        mode_path=("vendor", "thinking", "mode"),
+        effort_path=("vendor", "reasoning", "effort"),
+        budget_path=("vendor", "reasoning", "budget"),
+    )
+    request_options = {
+        "vendor": {
+            "thinking": {"mode": "enabled", "keep_mode_sibling": True},
+            "reasoning": {
+                "effort": "medium",
+                "budget": 1024,
+                "keep_reasoning_sibling": "yes",
+            },
+            "keep_root_sibling": [1, 2],
+        },
+        "unknown_null": None,
+    }
+
+    payload, _, _, _ = await _capture_policy_request(
+        _policy_config(policy=policy),
+        generate_kwargs={"request_options": request_options},
+    )
+
+    assert payload["vendor"] == {
+        "thinking": {"mode": "enabled", "keep_mode_sibling": True},
+        "reasoning": {
+            "effort": "high",
+            "budget": 1024,
+            "keep_reasoning_sibling": "yes",
+        },
+        "keep_root_sibling": [1, 2],
+    }
+    assert payload["unknown_null"] is None
+    assert request_options["vendor"]["reasoning"]["effort"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_declared_path_survives_stream_options_normalization(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(
+        default_mode="enabled",
+        effort_path=("stream_options", "reasoning_effort"),
+        budget=False,
+    )
+
+    payload, _, _, _ = await _capture_policy_request(
+        _policy_config(policy=policy),
+        generate_kwargs={
+            "request_options": {
+                "stream_options": {
+                    "reasoning_effort": "medium",
+                    "vendor_option": True,
+                }
+            },
+        },
+    )
+
+    assert payload["stream_options"] == {
+        "reasoning_effort": "high",
+        "vendor_option": True,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "request_options",
+    [
+        {"vendor": "not-a-mapping"},
+        {"vendor": {"reasoning": "not-a-mapping"}},
+    ],
+)
+async def test_declared_path_mapping_scalar_collisions_fail_safely(
+    monkeypatch, request_options
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(
+        default_mode="enabled",
+        mode_path=("vendor", "thinking", "mode"),
+        effort_path=("vendor", "reasoning", "effort"),
+        budget=False,
+    )
+
+    with pytest.raises(ValueError, match="reasoning.*path"):
+        await LLMClient(
+            "test-model",
+            config_source=_policy_config(policy=policy),
+        ).generate("Hello", request_options=request_options)
+
+
+@pytest.mark.asyncio
+async def test_policy_resolution_does_not_mutate_settings_inputs_or_clients(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    provider_overrides = {
+        "reasoning": {"effort": "medium"},
+        "nested": {"provider": [1]},
+    }
+    model_overrides = {
+        "temperature": 0.4,
+        "nested": {"model": [2]},
+    }
+    request_options = {
+        "thinking": {"type": "enabled"},
+        "top_p": 0.8,
+    }
+    originals = deepcopy(
+        (provider_overrides, model_overrides, request_options)
+    )
+    config = _policy_config(
+        policy=_policy(default_mode="enabled", budget=False),
+        request_overrides=provider_overrides,
+        model_settings={"request_overrides": model_overrides},
+    )
+
+    first = LLMClient("test-model", config_source=config)
+    second = LLMClient("test-model", config_source=config)
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+        _disable_rate_limit(first)
+        await first.generate("Hello", request_options=request_options)
+
+    assert (provider_overrides, model_overrides, request_options) == originals
+    assert first.request_overrides == second.request_overrides
+    assert first.request_overrides["reasoning"]["effort"] == "medium"
+    assert config["test-provider"]["request_overrides"] == provider_overrides
+
+
+@pytest.mark.asyncio
+async def test_same_upstream_id_can_have_route_specific_policies(monkeypatch):
+    monkeypatch.setenv("NATIVE_KEY", "test-key")
+    monkeypatch.setenv("THIRD_PARTY_KEY", "test-key")
+    supported = _policy(effort=False, budget=False)
+    fixed = _policy(
+        availability="always-on",
+        effort=False,
+        budget=False,
+        temperature={"base": {"state": "fixed", "fixed_value": 1.0}},
+    )
+    config = {
+        **_policy_config(
+            policy=supported,
+            provider_name="native-route",
+            model_name="native-model",
+            provider_settings={"api_key_env_var": "NATIVE_KEY"},
+            model_settings={"id": "same-upstream-id"},
+        ),
+        **_policy_config(
+            policy=fixed,
+            provider_name="third-party-route",
+            model_name="third-party-model",
+            provider_settings={"api_key_env_var": "THIRD_PARTY_KEY"},
+            model_settings={"id": "same-upstream-id"},
+        ),
+    }
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+        native = LLMClient("native-model", config_source=config)
+        third_party = LLMClient("third-party-model", config_source=config)
+        _disable_rate_limit(native)
+        _disable_rate_limit(third_party)
+        await native.generate(
+            "Hello",
+            generation_controls={"sampling": {"temperature": 0.5}},
+        )
+        await third_party.generate(
+            "Hello",
+            generation_controls={"sampling": {"temperature": 1.0}},
+        )
+
+    native_payload = mock_httpx_client.post.await_args_list[0].kwargs["json"]
+    third_payload = mock_httpx_client.post.await_args_list[1].kwargs["json"]
+    assert native_payload["model"] == third_payload["model"]
+    assert native_payload["temperature"] == 0.5
+    assert "temperature" not in third_payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_name", "model_name", "api_base_url"),
+    [
+        ("renamed-a", "alias-a", "https://a.invalid/chat/completions"),
+        ("renamed-b", "alias-b", "https://b.invalid/chat/completions"),
+    ],
+)
+async def test_generation_policy_behavior_is_name_and_endpoint_neutral(
+    monkeypatch, provider_name, model_name, api_base_url
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    config = _policy_config(
+        policy=_policy(default_mode="enabled", budget=False),
+        provider_name=provider_name,
+        model_name=model_name,
+        api_base_url=api_base_url,
+    )
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+        client = LLMClient(model_name, config_source=config)
+        _disable_rate_limit(client)
+        await client.generate(
+            "Hello",
+            generation_controls={
+                "reasoning": {"effort": "medium"},
+                "sampling": {"temperature": 0.2},
+            },
+        )
+
+    payload = mock_httpx_client.post.await_args.kwargs["json"]
+    assert payload["reasoning"]["effort"] == "high"
+    assert payload["temperature"] == 0.2
+
+
+@pytest.mark.asyncio
+async def test_cache_identity_uses_canonical_effort_aliases(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response("cached")
+        mock_cls.return_value = mock_httpx_client
+        client = LLMClient(
+            "test-model",
+            config_source=_policy_config(
+                policy=_policy(default_mode="enabled", budget=False)
+            ),
+        )
+        client._cache_enabled = True
+        _disable_rate_limit(client)
+        first = await client.generate(
+            "Hello",
+            generation_controls={"reasoning": {"effort": "medium"}},
+        )
+        second = await client.generate(
+            "Hello",
+            generation_controls={"reasoning": {"effort": "high"}},
+        )
+
+    assert first.text == second.text == "cached"
+    assert mock_httpx_client.post.await_count == 1
+    assert client.get_cache_stats()["hits"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["fixed", "ignored"])
+async def test_cache_identity_normalizes_no_effect_sampling_to_omission(
+    monkeypatch, state
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    rule = (
+        {"state": "fixed", "fixed_value": 1.0}
+        if state == "fixed"
+        else {"state": "ignored"}
+    )
+    policy = _policy(
+        effort=False,
+        budget=False,
+        temperature={"base": rule},
+    )
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response("cached")
+        mock_cls.return_value = mock_httpx_client
+        client = LLMClient(
+            "test-model",
+            config_source=_policy_config(policy=policy),
+        )
+        client._cache_enabled = True
+        _disable_rate_limit(client)
+        await client.generate("Hello")
+        await client.generate(
+            "Hello",
+            generation_controls={
+                "sampling": {"temperature": 1.0 if state == "fixed" else 0.3}
+            },
+        )
+
+    assert mock_httpx_client.post.await_count == 1
+    assert client.get_cache_stats()["hits"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cache_separates_distinct_final_generation_payloads(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response()
+        mock_cls.return_value = mock_httpx_client
+        client = LLMClient(
+            "test-model",
+            config_source=_policy_config(
+                policy=_policy(default_mode="enabled", budget=False)
+            ),
+        )
+        client._cache_enabled = True
+        _disable_rate_limit(client)
+        for controls in (
+            {"reasoning": {"effort": "low"}},
+            {"reasoning": {"effort": "high"}},
+            {"sampling": {"temperature": 0.2}},
+            {"sampling": {"temperature": 0.3}},
+        ):
+            await client.generate("Hello", generation_controls=controls)
+
+    assert mock_httpx_client.post.await_count == 4
+    assert client.get_cache_stats()["misses"] == 4
+
+
+@pytest.mark.asyncio
+async def test_cache_identity_includes_capability_version(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    shared_cache = None
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.return_value = _success_response("cached")
+        mock_cls.return_value = mock_httpx_client
+        first = LLMClient(
+            "test-model",
+            config_source=_policy_config(version="policy-v1"),
+        )
+        second = LLMClient(
+            "test-model",
+            config_source=_policy_config(version="policy-v2"),
+        )
+        first._cache_enabled = True
+        second._cache_enabled = True
+        shared_cache = first._cache
+        second._cache = shared_cache
+        _disable_rate_limit(first)
+        _disable_rate_limit(second)
+        await first.generate("Hello")
+        await second.generate("Hello")
+
+    assert mock_httpx_client.post.await_count == 2
+    assert shared_cache.get_stats()["misses"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutated_value", "match"),
+    [
+        (None, "temperature.*null"),
+        (1, "temperature.*canonical"),
+        (-0.0, "temperature.*canonical"),
+    ],
+)
+async def test_final_payload_is_revalidated_after_later_planners(
+    monkeypatch, mutated_value, match
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    client = LLMClient(
+        "test-model",
+        config_source=_policy_config(
+            policy=_policy(effort=False, budget=False)
+        ),
+    )
+    client._cache_enabled = True
+    client._cache.get = MagicMock()
+    client._wait_for_rate_limit = AsyncMock()
+    client._get_client = AsyncMock()
+
+    def inject_invalid_policy_value(data, structured_output):
+        data["temperature"] = mutated_value
+        return client._planning_metadata()
+
+    monkeypatch.setattr(
+        client, "_plan_structured_output", inject_invalid_policy_value
+    )
+
+    with pytest.raises(ValueError, match=match):
+        await client.generate("Hello")
+
+    client._cache.get.assert_not_called()
+    client._wait_for_rate_limit.assert_not_awaited()
+    client._get_client.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("policy", "request_options", "generation_controls", "match"),
+    [
+        (
+            _policy(effort=False, budget=False),
+            {"temperature": 2.0},
+            None,
+            "range",
+        ),
+        (
+            _policy(default_mode="enabled", budget=False),
+            {"reasoning": {"effort": "invalid"}},
+            None,
+            "allowed",
+        ),
+        (
+            _policy(default_mode="enabled", effort=False),
+            {"reasoning": {"budget_tokens": True}},
+            None,
+            "plain integer",
+        ),
+        (
+            _policy(default_mode="enabled"),
+            None,
+            {
+                "reasoning": {
+                    "mode": "disabled",
+                    "effort": "high",
+                }
+            },
+            "disabled",
+        ),
+        (
+            _policy(
+                effort=False,
+                budget=False,
+                temperature={"base": {"state": "forbidden"}},
+            ),
+            None,
+            {"sampling": {"temperature": 0.2}},
+            "forbidden",
+        ),
+    ],
+    ids=[
+        "sampling-range",
+        "effort-enum",
+        "budget-type",
+        "reasoning-conflict",
+        "sampling-state",
+    ],
+)
+async def test_invalid_controls_fail_before_all_execution_boundaries(
+    monkeypatch, policy, request_options, generation_controls, match
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    client = LLMClient(
+        "test-model",
+        config_source=_policy_config(policy=policy),
+    )
+    client._cache_enabled = True
+    client._cache.get = MagicMock()
+    client._wait_for_rate_limit = AsyncMock()
+    client._get_client = AsyncMock()
+
+    with pytest.raises(ValueError, match=match):
+        await client.generate(
+            "Hello",
+            request_options=request_options,
+            generation_controls=generation_controls,
+        )
+
+    client._cache.get.assert_not_called()
+    client._wait_for_rate_limit.assert_not_awaited()
+    client._get_client.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_invalid_typed_controls_do_not_echo_request_values(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    sensitive_value = "do-not-echo-this-request-value"
+    client = LLMClient(
+        "test-model",
+        config_source=_policy_config(
+            policy=_policy(default_mode="enabled", budget=False)
+        ),
+    )
+    client._cache_enabled = True
+    client._cache.get = MagicMock()
+    client._wait_for_rate_limit = AsyncMock()
+    client._get_client = AsyncMock()
+
+    with pytest.raises(ValueError) as exc_info:
+        await client.generate(
+            "Hello",
+            generation_controls={"sampling": {"temperature": sensitive_value}},
+        )
+
+    assert sensitive_value not in str(exc_info.value)
+    client._cache.get.assert_not_called()
+    client._wait_for_rate_limit.assert_not_awaited()
+    client._get_client.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_policy_declared_known_paths_do_not_require_legacy_duplication(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(
+        default_mode="enabled",
+        mode_path=("thinking", "type"),
+        effort_path=("reasoning_effort",),
+        budget=False,
+    )
+
+    payload, _, _, _ = await _capture_policy_request(
+        _policy_config(policy=policy),
+        generate_kwargs={
+            "request_options": {
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": "medium",
+            }
+        },
+    )
+
+    assert payload["thinking"]["type"] == "enabled"
+    assert payload["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_undeclared_known_reasoning_control_keeps_legacy_guard(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    client = LLMClient(
+        "test-model",
+        config_source=_policy_config(
+            policy=_policy(effort=False, budget=False)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="does not support verbosity"):
+        await client.generate(
+            "Hello",
+            request_options={"verbosity": "high"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_policy_sampling_is_authoritative_over_openrouter_temperature(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    capabilities = _policy_capabilities(_policy(effort=False, budget=False))
+    capabilities["openrouter_supported_parameters"] = ["max_tokens"]
+    config = _config(
+        provider_name="renamed-openrouter-route",
+        api_base_url="https://openrouter.ai/api/v1/chat/completions",
+        model_capabilities=capabilities,
+    )
+
+    payload, _, _, _ = await _capture_policy_request(
+        config,
+        generate_kwargs={
+            "generation_controls": {"sampling": {"temperature": 0.2}}
+        },
+    )
+
+    assert payload["temperature"] == 0.2
+
+
+@pytest.mark.asyncio
+async def test_policy_streaming_preserves_assembly_and_bypasses_cache(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    payloads = []
+
+    async def mock_lines():
+        yield 'data: {"choices": [{"delta": {"content": "A"}}]}'
+        yield 'data: {"choices": [{"delta": {"content": "B"}}]}'
+        yield "data: [DONE]"
+
+    @asynccontextmanager
+    async def mock_stream(*args, **kwargs):
+        payloads.append(kwargs["json"])
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.aiter_lines = mock_lines
+        yield response
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.stream = mock_stream
+        mock_cls.return_value = mock_httpx_client
+        client = LLMClient(
+            "test-model",
+            config_source=_policy_config(
+                policy=_policy(default_mode="enabled", budget=False)
+            ),
+        )
+        client._cache_enabled = True
+        _disable_rate_limit(client)
+        result = await client.generate(
+            "Hello",
+            stream=True,
+            generation_controls={"reasoning": {"effort": "medium"}},
+        )
+
+    assert result.text == "AB"
+    assert payloads[0]["reasoning"]["effort"] == "high"
+    assert payloads[0]["stream_options"]["include_usage"] is True
+    assert client.get_cache_stats()["hits"] == 0
+    assert client.get_cache_stats()["misses"] == 0
+
+
+@pytest.mark.asyncio
+async def test_policy_structured_output_keeps_semantic_planner(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    capabilities = _policy_capabilities(_policy(effort=False, budget=False))
+    capabilities.update(
+        {
+            "strict_response_schema": True,
+            "json_object_response": True,
+        }
+    )
+
+    payload, _, _, result = await _capture_policy_request(
+        _config(model_capabilities=capabilities),
+        response_content='{"answer": "ok"}',
+        generate_kwargs={
+            "generation_controls": {"sampling": {"temperature": 0.2}},
+            "structured_output": {
+                "mode": "require",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    )
+
+    assert payload["temperature"] == 0.2
+    assert payload["response_format"]["type"] == "json_schema"
+    assert result.structured == {"answer": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_token_retry_revalidates_budget_relation_before_second_http(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    policy = _policy(
+        default_mode="enabled",
+        effort=False,
+        output_limit_relation="less-than",
+    )
+    config = _policy_config(
+        policy=policy,
+        provider_settings={
+            "max_tokens_retry": {
+                "status_code": 400,
+                "body_contains": "reduce limit",
+                "max_tokens_limit": 1000,
+            }
+        },
+    )
+    request = httpx.Request("POST", "https://example.invalid/chat/completions")
+    response = httpx.Response(
+        400,
+        request=request,
+        text="please reduce limit",
+    )
+    error = httpx.HTTPStatusError(
+        "bad request",
+        request=request,
+        response=response,
+    )
+
+    with patch("llm_exec_core.client.httpx.AsyncClient") as mock_cls:
+        mock_httpx_client = AsyncMock()
+        mock_httpx_client.post.side_effect = error
+        mock_cls.return_value = mock_httpx_client
+        client = LLMClient("test-model", config_source=config)
+        _disable_rate_limit(client)
+        with patch("llm_exec_core.client.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(ValueError, match="less than"):
+                await client.generate(
+                    "Hello",
+                    request_options={
+                        "max_tokens": 2000,
+                        "reasoning": {"budget_tokens": 1500},
+                    },
+                )
+
+    assert mock_httpx_client.post.await_count == 1

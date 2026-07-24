@@ -255,6 +255,92 @@ def _pricing_context(**overrides):
     return context
 
 
+def _supported_sampling_rule(
+    minimum=0.0,
+    maximum=1.0,
+    minimum_inclusive=True,
+    maximum_inclusive=True,
+):
+    return {
+        "state": "supported",
+        "range": {
+            "minimum": minimum,
+            "maximum": maximum,
+            "minimum_inclusive": minimum_inclusive,
+            "maximum_inclusive": maximum_inclusive,
+        },
+    }
+
+
+def _generation_policy(
+    *,
+    availability="optional",
+    allowed_modes=None,
+    default_mode=None,
+    can_disable=None,
+    mode=OMITTED,
+    effort=OMITTED,
+    budget_tokens=OMITTED,
+    allow_effort_with_budget_in=(),
+    temperature=OMITTED,
+    top_p=OMITTED,
+):
+    if allowed_modes is None:
+        allowed_modes = {
+            "unavailable": ("disabled",),
+            "optional": ("disabled", "enabled"),
+            "adaptive": ("disabled", "adaptive"),
+            "always-on": ("always-on",),
+        }[availability]
+    if default_mode is None:
+        default_mode = {
+            "unavailable": "disabled",
+            "optional": "disabled",
+            "adaptive": "adaptive",
+            "always-on": "always-on",
+        }[availability]
+    if can_disable is None:
+        can_disable = availability in {"optional", "adaptive"} and (
+            "disabled" in allowed_modes
+        )
+    if mode is OMITTED:
+        if availability in {"unavailable", "always-on"}:
+            mode = None
+        else:
+            mode = {
+                "path": ["thinking", "type"],
+                "values": {
+                    selectable_mode: selectable_mode
+                    for selectable_mode in allowed_modes
+                    if selectable_mode != "always-on"
+                },
+            }
+    if effort is OMITTED:
+        effort = None
+    if budget_tokens is OMITTED:
+        budget_tokens = None
+    if temperature is OMITTED:
+        temperature = {"base": _supported_sampling_rule(0.0, 2.0, True, False)}
+    if top_p is OMITTED:
+        top_p = {"base": _supported_sampling_rule(0.0, 1.0, False, True)}
+    return {
+        "reasoning": {
+            "availability": availability,
+            "allowed_modes": list(allowed_modes),
+            "default_mode": default_mode,
+            "can_disable": can_disable,
+            "mode": deepcopy(mode),
+            "effort": deepcopy(effort),
+            "budget_tokens": deepcopy(budget_tokens),
+            "allow_effort_with_budget_in": list(allow_effort_with_budget_in),
+        },
+        "sampling": {
+            "temperature": deepcopy(temperature),
+            "top_p": deepcopy(top_p),
+        },
+    }
+
+
 def _call_catalog_api(api_name, config_source=OMITTED):
     source_args = () if config_source is OMITTED else (config_source,)
     model_name = "test-model"
@@ -341,6 +427,592 @@ def test_request_policy_schema_fields_have_legacy_safe_defaults():
     assert "output_token_field" in provider_schema
     assert provider.output_token_field == "max_tokens"
     assert provider.model_dump()["output_token_field"] == "max_tokens"
+
+
+def test_generation_policy_public_schema_and_legacy_serialization_contract():
+    legacy = config_module.ModelCapabilities(
+        version="unit-v1",
+        source="https://example.invalid/policy",
+        source_date="2026-07-24",
+    )
+    policy = _generation_policy(
+        effort={
+            "path": ["reasoning", "effort"],
+            "allowed_values": ["low", "high"],
+            "aliases": {"medium": "high"},
+            "modes": {
+                "enabled": {
+                    "omission": "provider-default",
+                    "default": "high",
+                }
+            },
+        },
+        budget_tokens={
+            "path": ["reasoning", "budget_tokens"],
+            "minimum": 0,
+            "maximum": 8192,
+            "modes": {
+                "enabled": {
+                    "omission": "provider-selected",
+                    "output_limit_relation": "less-than-or-equal",
+                }
+            },
+        },
+        allow_effort_with_budget_in=("enabled",),
+        top_p={
+            "base": _supported_sampling_rule(0.0, 1.0, False, True),
+            "by_reasoning_mode": {
+                "enabled": {
+                    "state": "fixed",
+                    "fixed_value": 0.95,
+                }
+            },
+        },
+    )
+    capabilities = config_module.ModelCapabilities(
+        version="unit-v2",
+        source="https://example.invalid/policy",
+        source_date="2026-07-24",
+        generation_policy=policy,
+    )
+
+    legacy_dump = legacy.model_dump(mode="json")
+    policy_dump = capabilities.model_dump(mode="json")
+    schema = config_module.ModelCapabilities.model_json_schema()
+
+    assert "generation_policy" in config_module.ModelCapabilities.model_fields
+    assert "generation_policy" in schema["properties"]
+    assert "generation_policy" not in legacy_dump
+    assert policy_dump["generation_policy"]["reasoning"]["mode"]["path"] == [
+        "thinking",
+        "type",
+    ]
+    assert policy_dump["generation_policy"]["reasoning"]["effort"]["path"] == [
+        "reasoning",
+        "effort",
+    ]
+    assert policy_dump["generation_policy"]["reasoning"]["availability"] == (
+        "optional"
+    )
+    assert (
+        policy_dump["generation_policy"]["sampling"]["top_p"][
+            "by_reasoning_mode"
+        ]["enabled"]["fixed_value"]
+        == 0.95
+    )
+    for public_name in (
+        "GenerationPolicy",
+        "ReasoningPolicy",
+        "ReasoningModeWire",
+        "ReasoningEffortPolicy",
+        "EffortModeRule",
+        "ReasoningBudgetPolicy",
+        "BudgetModeRule",
+        "SamplingPolicy",
+        "SamplingControlPolicy",
+        "SamplingRule",
+        "NumericRange",
+        "GenerationControls",
+        "ReasoningRequest",
+        "SamplingRequest",
+    ):
+        assert hasattr(config_module, public_name)
+
+
+def test_generation_controls_preserve_absent_and_tombstone_fields():
+    controls = config_module.GenerationControls.model_validate(
+        {
+            "reasoning": {"effort": None},
+            "sampling": {"temperature": None},
+        }
+    )
+
+    assert controls.model_fields_set == {"reasoning", "sampling"}
+    assert controls.reasoning is not None
+    assert controls.reasoning.model_fields_set == {"effort"}
+    assert controls.sampling is not None
+    assert controls.sampling.model_fields_set == {"temperature"}
+    assert controls.reasoning.effort is None
+    assert controls.sampling.temperature is None
+    assert config_module.GenerationControls().model_fields_set == set()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"unknown": True},
+        {"reasoning": {"unknown": True}},
+        {"sampling": {"unknown": True}},
+        {"reasoning": {"budget_tokens": True}},
+        {"sampling": {"temperature": True}},
+        {"sampling": {"top_p": math.inf}},
+    ],
+)
+def test_generation_controls_are_strict_and_reject_invalid_typed_values(
+    payload,
+):
+    with pytest.raises(ValidationError):
+        config_module.GenerationControls.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        _generation_policy(availability="unavailable"),
+        _generation_policy(availability="optional"),
+        _generation_policy(
+            availability="adaptive",
+            allowed_modes=("disabled", "enabled", "adaptive"),
+            default_mode="adaptive",
+        ),
+        _generation_policy(availability="always-on"),
+    ],
+    ids=["unavailable", "optional", "adaptive-transitional", "always-on"],
+)
+def test_generation_policy_accepts_every_reasoning_availability_shape(policy):
+    parsed = config_module.GenerationPolicy.model_validate(policy)
+
+    assert parsed.reasoning.availability == policy["reasoning"]["availability"]
+    assert tuple(parsed.reasoning.allowed_modes) == tuple(
+        policy["reasoning"]["allowed_modes"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("availability", "mutator", "match"),
+    [
+        (
+            "unavailable",
+            lambda policy: policy["reasoning"].update(
+                {"allowed_modes": ["disabled", "enabled"]}
+            ),
+            "unavailable",
+        ),
+        (
+            "unavailable",
+            lambda policy: policy["reasoning"].update({"can_disable": True}),
+            "unavailable",
+        ),
+        (
+            "unavailable",
+            lambda policy: policy["reasoning"].update(
+                {
+                    "mode": {
+                        "path": ["thinking"],
+                        "values": {"disabled": False},
+                    }
+                }
+            ),
+            "unavailable",
+        ),
+        (
+            "optional",
+            lambda policy: policy["reasoning"].update(
+                {"allowed_modes": ["enabled"]}
+            ),
+            "allowed mode",
+        ),
+        (
+            "optional",
+            lambda policy: policy["reasoning"]["mode"]["values"].pop(
+                "enabled"
+            ),
+            "mode",
+        ),
+        (
+            "adaptive",
+            lambda policy: policy["reasoning"].update(
+                {"default_mode": "enabled"}
+            ),
+            "allowed mode",
+        ),
+        (
+            "adaptive",
+            lambda policy: policy["reasoning"].update({"can_disable": False}),
+            "can_disable",
+        ),
+        (
+            "always-on",
+            lambda policy: policy["reasoning"].update(
+                {"mode": {"path": ["thinking"], "values": {}}}
+            ),
+            "always-on",
+        ),
+    ],
+    ids=[
+        "unavailable-extra-mode",
+        "unavailable-disable",
+        "unavailable-wire",
+        "optional-missing-disabled",
+        "optional-missing-wire-value",
+        "adaptive-invalid-default",
+        "adaptive-disable-mismatch",
+        "always-on-wire",
+    ],
+)
+def test_generation_policy_rejects_invalid_availability_invariants(
+    availability, mutator, match
+):
+    policy = _generation_policy(availability=availability)
+    mutator(policy)
+
+    with pytest.raises(ValidationError, match=match):
+        config_module.GenerationPolicy.model_validate(policy)
+
+
+@pytest.mark.parametrize(
+    ("path", "values", "match"),
+    [
+        ([], {"disabled": "off", "enabled": "on"}, "path"),
+        (["thinking", ""], {"disabled": "off", "enabled": "on"}, "path"),
+        (
+            ["thinking", "type"],
+            {"disabled": "same", "enabled": "same"},
+            "unique",
+        ),
+        (
+            ["thinking", "type"],
+            {"disabled": 0, "enabled": "on"},
+            "string or boolean",
+        ),
+    ],
+)
+def test_reasoning_mode_wire_rejects_ambiguous_or_invalid_paths(
+    path, values, match
+):
+    policy = _generation_policy()
+    policy["reasoning"]["mode"] = {"path": path, "values": values}
+
+    with pytest.raises(ValidationError, match=match):
+        config_module.GenerationPolicy.model_validate(policy)
+
+
+def _effort_policy(**overrides):
+    effort = {
+        "path": ["reasoning", "effort"],
+        "allowed_values": ["low", "high"],
+        "aliases": {"medium": "high"},
+        "modes": {
+            "enabled": {
+                "omission": "provider-default",
+                "default": "high",
+            }
+        },
+    }
+    effort.update(deepcopy(overrides))
+    return effort
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"allowed_values": ["high", "high"]}, "unique"),
+        ({"allowed_values": [""]}, "nonempty"),
+        ({"aliases": {"high": "low"}}, "collide"),
+        ({"aliases": {"medium": "missing"}}, "canonical"),
+        (
+            {
+                "modes": {
+                    "enabled": {
+                        "omission": "provider-default",
+                        "default": "missing",
+                    }
+                }
+            },
+            "canonical",
+        ),
+        (
+            {
+                "modes": {
+                    "enabled": {
+                        "omission": "provider-selected",
+                        "default": "high",
+                    }
+                }
+            },
+            "forbid",
+        ),
+        (
+            {
+                "modes": {
+                    "enabled": {
+                        "omission": "provider-default",
+                        "default": None,
+                    }
+                }
+            },
+            "requires",
+        ),
+    ],
+)
+def test_reasoning_effort_policy_rejects_invalid_values_aliases_and_omission(
+    overrides, match
+):
+    policy = _generation_policy(effort=_effort_policy(**overrides))
+
+    with pytest.raises(ValidationError, match=match):
+        config_module.GenerationPolicy.model_validate(policy)
+
+
+def _budget_policy(**overrides):
+    budget = {
+        "path": ["reasoning", "budget_tokens"],
+        "minimum": 0,
+        "maximum": 8192,
+        "modes": {
+            "enabled": {
+                "omission": "provider-default",
+                "default": 1024,
+                "output_limit_relation": "less-than",
+            }
+        },
+    }
+    budget.update(deepcopy(overrides))
+    return budget
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"minimum": True}, "plain integer"),
+        ({"maximum": True}, "plain integer"),
+        ({"minimum": -1}, "nonnegative"),
+        ({"minimum": 10, "maximum": 9}, "maximum"),
+        (
+            {
+                "modes": {
+                    "enabled": {
+                        "omission": "provider-default",
+                        "default": True,
+                        "output_limit_relation": "none",
+                    }
+                }
+            },
+            "plain integer",
+        ),
+        (
+            {
+                "modes": {
+                    "enabled": {
+                        "omission": "provider-default",
+                        "default": 9000,
+                        "output_limit_relation": "none",
+                    }
+                }
+            },
+            "bounds",
+        ),
+        (
+            {
+                "modes": {
+                    "enabled": {
+                        "omission": "required",
+                        "default": 1024,
+                        "output_limit_relation": "none",
+                    }
+                }
+            },
+            "forbid",
+        ),
+    ],
+)
+def test_reasoning_budget_policy_rejects_invalid_bounds_and_omission(
+    overrides, match
+):
+    policy = _generation_policy(budget_tokens=_budget_policy(**overrides))
+
+    with pytest.raises(ValidationError, match=match):
+        config_module.GenerationPolicy.model_validate(policy)
+
+
+@pytest.mark.parametrize(
+    ("effort_path", "budget_path", "match"),
+    [
+        (["model", "effort"], ["reasoning", "budget"], "protected"),
+        (["temperature", "effort"], ["reasoning", "budget"], "sampling"),
+        (["reasoning"], ["reasoning", "budget"], "prefix"),
+        (["reasoning", "control"], ["reasoning", "control"], "distinct"),
+    ],
+)
+def test_generation_policy_rejects_protected_overlapping_control_paths(
+    effort_path, budget_path, match
+):
+    effort = _effort_policy(path=effort_path)
+    budget = _budget_policy(path=budget_path)
+    policy = _generation_policy(
+        effort=effort,
+        budget_tokens=budget,
+        allow_effort_with_budget_in=("enabled",),
+    )
+
+    with pytest.raises(ValidationError, match=match):
+        config_module.GenerationPolicy.model_validate(policy)
+
+
+@pytest.mark.parametrize(
+    ("mutator", "match"),
+    [
+        (
+            lambda policy: policy["reasoning"]["effort"]["modes"].update(
+                {
+                    "adaptive": {
+                        "omission": "provider-selected",
+                        "default": None,
+                    }
+                }
+            ),
+            "active",
+        ),
+        (
+            lambda policy: policy["reasoning"].update(
+                {"allow_effort_with_budget_in": ["adaptive"]}
+            ),
+            "active",
+        ),
+        (
+            lambda policy: policy["reasoning"].update(
+                {"allow_effort_with_budget_in": ["enabled"]}
+            ),
+            "coexist",
+        ),
+    ],
+)
+def test_generation_policy_rejects_invalid_effort_budget_mode_relationships(
+    mutator, match
+):
+    policy = _generation_policy(effort=_effort_policy())
+    mutator(policy)
+
+    with pytest.raises(ValidationError, match=match):
+        config_module.GenerationPolicy.model_validate(policy)
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        _supported_sampling_rule(0.0, 1.0),
+        {"state": "fixed", "fixed_value": 0.95},
+        {"state": "ignored"},
+        {"state": "deprecated"},
+        {"state": "forbidden"},
+    ],
+    ids=["supported", "fixed", "ignored", "deprecated", "forbidden"],
+)
+def test_sampling_policy_accepts_every_control_state(rule):
+    policy = _generation_policy(temperature={"base": rule})
+
+    parsed = config_module.GenerationPolicy.model_validate(policy)
+
+    assert parsed.sampling.temperature.base.state == rule["state"]
+
+
+@pytest.mark.parametrize(
+    ("rule", "match"),
+    [
+        ({"state": "supported"}, "range"),
+        (
+            {
+                "state": "supported",
+                "range": {"minimum": 0.0, "maximum": math.inf},
+            },
+            "finite",
+        ),
+        (
+            {
+                "state": "supported",
+                "range": {"minimum": 2.0, "maximum": 1.0},
+            },
+            "ordered",
+        ),
+        (
+            {
+                "state": "supported",
+                "range": {
+                    "minimum": 1.0,
+                    "maximum": 1.0,
+                    "minimum_inclusive": False,
+                    "maximum_inclusive": True,
+                },
+            },
+            "empty",
+        ),
+        ({"state": "supported", "fixed_value": 1.0}, "fixed"),
+        ({"state": "fixed"}, "fixed_value"),
+        (
+            {
+                "state": "fixed",
+                "fixed_value": math.nan,
+            },
+            "finite",
+        ),
+        (
+            {
+                "state": "ignored",
+                "range": {"minimum": 0.0, "maximum": 1.0},
+            },
+            "permit neither",
+        ),
+        ({"state": "forbidden", "fixed_value": 1.0}, "permit neither"),
+    ],
+)
+def test_sampling_policy_rejects_invalid_state_payloads(rule, match):
+    policy = _generation_policy(temperature={"base": rule})
+
+    with pytest.raises(ValidationError, match=match):
+        config_module.GenerationPolicy.model_validate(policy)
+
+
+def test_generation_policy_rejects_unreachable_sampling_mode_override():
+    temperature = {
+        "base": _supported_sampling_rule(),
+        "by_reasoning_mode": {"adaptive": {"state": "forbidden"}},
+    }
+    policy = _generation_policy(temperature=temperature)
+
+    with pytest.raises(ValidationError, match="reachable"):
+        config_module.GenerationPolicy.model_validate(policy)
+
+
+def test_generation_policy_rejects_unknown_fields_at_every_nested_level():
+    policy = _generation_policy()
+    policy["reasoning"]["unexpected"] = True
+
+    with pytest.raises(ValidationError, match="unexpected"):
+        config_module.GenerationPolicy.model_validate(policy)
+
+    policy = _generation_policy()
+    policy["sampling"]["temperature"]["base"]["unexpected"] = True
+    with pytest.raises(ValidationError, match="unexpected"):
+        config_module.GenerationPolicy.model_validate(policy)
+
+
+def test_generation_policy_is_deeply_isolated_across_explicit_loads():
+    source = deepcopy(CUSTOM_CONFIG)
+    source["test-provider"]["models"]["test-model"]["capabilities"] = {
+        "version": "unit-policy-2026-07-24",
+        "source": "https://example.invalid/policy",
+        "source_date": "2026-07-24",
+        "generation_policy": _generation_policy(
+            effort=_effort_policy(),
+        ),
+    }
+
+    _, _, first = get_model_details("test-model", source)
+    assert first.capabilities is not None
+    assert first.capabilities.generation_policy is not None
+    first.capabilities.generation_policy.reasoning.effort.aliases["medium"] = (
+        "low"
+    )
+
+    _, _, second = get_model_details("test-model", source)
+    assert second.capabilities is not None
+    assert second.capabilities.generation_policy is not None
+    assert second.capabilities.generation_policy.reasoning.effort.aliases == {
+        "medium": "high"
+    }
+    assert source["test-provider"]["models"]["test-model"]["capabilities"][
+        "generation_policy"
+    ]["reasoning"]["effort"]["aliases"] == {"medium": "high"}
 
 
 @pytest.mark.parametrize("target", ["provider", "model"])
