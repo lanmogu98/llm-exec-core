@@ -988,6 +988,21 @@ class LLMClient:
         if capabilities is None:
             return
 
+        if "service_tier" in data and capabilities.service_tiers is not None:
+            tier = data["service_tier"]
+            if (
+                not isinstance(tier, str)
+                or tier not in capabilities.service_tiers
+            ):
+                raise ValueError(
+                    f"{self.model_name} does not support "
+                    f"service_tier={tier!r}."
+                )
+            if self._is_openrouter_route():
+                self._validate_openrouter_supported_parameter(
+                    "service_tier", capabilities
+                )
+
         response_format = data.get("response_format")
         if isinstance(response_format, Mapping):
             response_format_type = response_format.get("type")

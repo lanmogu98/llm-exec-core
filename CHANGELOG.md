@@ -9,6 +9,15 @@
   effective periods, provenance, deterministic fail-closed selection, and
   legacy-flat cost compatibility.
 
+- Add optional caller-owned `ModelCapabilities.service_tiers` declarations and
+  validate explicit effective request tiers before HTTP, including OpenRouter
+  parameter support. Missing declarations preserve legacy raw passthrough;
+  account activation and actual response tiers remain outside this contract.
+
+### Changed
+
+- Default capability serialization adds `service_tiers=None`.
+
 ## 0.4.1
 
 ### Added

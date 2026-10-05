@@ -14,6 +14,24 @@ This feature includes a capability-aware request planner for known high-risk
 extensions. It does not execute tools, parse tool-call responses, perform live
 provider probes, or implement the OpenAI Responses API.
 
+## Optional Service-Tier Contract
+
+`ModelCapabilities.service_tiers: list[str] | None` is caller-owned route/model
+metadata. `None` preserves the existing raw transport contract; an empty list
+rejects explicit tiers; a non-empty list restricts requests to those strings.
+Core validates the effective payload after provider/model/per-call merging and
+`extra_body` promotion. Declared OpenRouter tiers additionally require the
+parameter in `openrouter_supported_parameters`. The same validation runs for
+streaming and non-streaming requests before HTTP client construction.
+
+The field adds `service_tiers=None` to default capability serialization. Legacy
+catalogs and unknown request parameters retain their prior behavior. There is
+no universal tier enum or hard-coded provider/model allowlist. The caller owns
+reviewed capability declarations; core does not probe accounts or assert that
+a requested tier was actually served. Reverting this feature removes the
+optional field and validation, restores version metadata, and requires
+consumers to remove that declaration and any dependency on its validation.
+
 ## Target Model Scope
 
 Capability review for Issue #2 targets the intended current model set, not
