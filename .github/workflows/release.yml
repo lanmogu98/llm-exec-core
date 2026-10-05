@@ -1,0 +1,1362 @@
+name: Release to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact normalized stable epoch-0 version from current main
+        required: true
+        type: string
+      expected_sha:
+        description: Exact 40-character current main commit SHA
+        required: true
+        type: string
+      dry_run:
+        description: Validate and retain distributions without publishing
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llm-exec-core-pypi-release
+  cancel-in-progress: false
+
+env:
+  UV_VERSION: "0.11.31"
+  RELEASE_PYTHON: "3.13.14"
+
+jobs:
+  preflight:
+    name: Release / preflight
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+    steps:
+      - name: Check out the dispatched source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install exact uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.31"
+          python-version: "3.13.14"
+          enable-cache: false
+      - name: Sync locked validation dependencies
+        run: uv sync --locked --group dev
+      - name: Verify main and exact current source
+        env:
+          CURRENT_MAIN_API: https://api.github.com/repos/${{ github.repository }}/commits/main
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Release dispatches must run from refs/heads/main." >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "expected_sha must be a lowercase 40-character commit SHA." >&2
+            exit 1
+          fi
+          if [[ "$EXPECTED_SHA" != "$GITHUB_SHA" ]]; then
+            echo "expected_sha does not match the dispatched source." >&2
+            exit 1
+          fi
+          current_main_sha="$(
+            python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          MAX_BYTES = 1_000_000
+          TIMEOUT_SECONDS = 20
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+                  return None
+
+
+          request = urllib.request.Request(
+              os.environ["CURRENT_MAIN_API"],
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                  "User-Agent": "llm-exec-core-release-preflight",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          opener = urllib.request.build_opener(NoRedirect())
+          with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
+              if response.geturl() != os.environ["CURRENT_MAIN_API"]:
+                  raise SystemExit("GitHub API redirected unexpectedly")
+              body = response.read(MAX_BYTES + 1)
+          if len(body) > MAX_BYTES:
+              raise SystemExit("GitHub API response exceeded the size limit")
+          sha = json.loads(body)["sha"]
+          print(sha)
+          PY
+          )"
+          if [[ "$current_main_sha" != "$EXPECTED_SHA" ]]; then
+            echo "expected_sha is no longer the current main SHA." >&2
+            exit 1
+          fi
+      - name: Verify normalized source version and unused PyPI version
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --frozen python - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          from packaging.version import Version
+
+          try:
+              import tomllib
+          except ModuleNotFoundError:
+              import tomli as tomllib
+
+          MAX_BYTES = 2_000_000
+          TIMEOUT_SECONDS = 20
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+                  return None
+
+
+          release_version = os.environ["RELEASE_VERSION"]
+          parsed = Version(release_version)
+          if str(parsed) != release_version:
+              raise SystemExit("version input is not normalized")
+          if parsed.epoch != 0:
+              raise SystemExit("version input must use epoch 0")
+          if (
+              parsed.is_prerelease
+              or parsed.is_devrelease
+              or parsed.local is not None
+          ):
+              raise SystemExit("version input must be stable")
+
+          pyproject = tomllib.loads(
+              Path("pyproject.toml").read_text(encoding="utf-8")
+          )
+          pyproject_version = pyproject["project"]["version"]
+
+          init_text = Path(
+              "src/llm_exec_core/__init__.py"
+          ).read_text(encoding="utf-8")
+          init_match = re.search(
+              r'^__version__\s*=\s*["\']([^"\']+)["\']',
+              init_text,
+              flags=re.MULTILINE,
+          )
+          if init_match is None:
+              raise SystemExit("package __version__ was not found")
+          init_version = init_match.group(1)
+
+          lock = tomllib.loads(Path("uv.lock").read_text(encoding="utf-8"))
+          root_packages = [
+              package
+              for package in lock["package"]
+              if package["name"] == "llm-exec-core"
+          ]
+          if len(root_packages) != 1:
+              raise SystemExit("uv.lock must contain one Core root package")
+          lock_version = root_packages[0]["version"]
+
+          observed = {
+              "workflow input": release_version,
+              "pyproject.toml": pyproject_version,
+              "package __version__": init_version,
+              "uv.lock root": lock_version,
+          }
+          if set(observed.values()) != {release_version}:
+              raise SystemExit(f"version loci disagree: {observed}")
+
+          encoded_version = urllib.parse.quote(release_version, safe="")
+          url = (
+              "https://pypi.org/pypi/llm-exec-core/"
+              f"{encoded_version}/json"
+          )
+          request = urllib.request.Request(
+              url,
+              headers={"User-Agent": "llm-exec-core-release-preflight"},
+          )
+          opener = urllib.request.build_opener(NoRedirect())
+          try:
+              with opener.open(
+                  request, timeout=TIMEOUT_SECONDS
+              ) as response:
+                  if response.geturl() != url:
+                      raise SystemExit("PyPI API redirected unexpectedly")
+                  body = response.read(MAX_BYTES + 1)
+          except urllib.error.HTTPError as error:
+              if error.code == 404:
+                  body = b""
+              else:
+                  raise
+          else:
+              if len(body) > MAX_BYTES:
+                  raise SystemExit("PyPI API response exceeded the size limit")
+              raise SystemExit(
+                  f"llm-exec-core {release_version} already exists on PyPI"
+              )
+          PY
+
+  quality:
+    name: Release quality / python-${{ matrix.label }}
+    needs: preflight
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "3.10"
+            python-version: "3.10.20"
+          - label: "3.13"
+            python-version: "3.13.14"
+    steps:
+      - name: Check out the dispatched source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install exact uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.31"
+          python-version: ${{ matrix.python-version }}
+          enable-cache: false
+      - name: Sync locked development dependencies
+        run: uv sync --locked --group dev
+      - name: Test
+        run: uv run --frozen pytest -q
+      - name: Check formatting
+        run: uv run --frozen black --check src tests
+      - name: Lint
+        run: uv run --frozen flake8 src tests
+      - name: Type check
+        run: uv run --frozen mypy src
+
+  build:
+    name: Release / build and validate
+    needs: preflight
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+    outputs:
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - name: Check out the dispatched source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install exact uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.31"
+          python-version: "3.13.14"
+          enable-cache: false
+      - name: Build once with hash-constrained isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv build --no-sources \
+            --build-constraints .github/release-build-constraints.txt \
+            --require-hashes \
+            --python 3.13.14 \
+            --clear \
+            --out-dir release-artifact/packages
+      - name: Validate metadata, filenames, and hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from email.parser import BytesParser
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import tarfile
+          import zipfile
+
+          version = os.environ["RELEASE_VERSION"]
+          package_dir = Path("release-artifact/packages")
+          expected_names = {
+              f"llm_exec_core-{version}-py3-none-any.whl",
+              f"llm_exec_core-{version}.tar.gz",
+          }
+          files = sorted(path for path in package_dir.iterdir() if path.is_file())
+          observed_names = {path.name for path in files}
+          if observed_names != expected_names:
+              raise SystemExit(
+                  f"expected exactly one wheel and one sdist: {observed_names}"
+              )
+
+          wheel = package_dir / f"llm_exec_core-{version}-py3-none-any.whl"
+          with zipfile.ZipFile(wheel) as archive:
+              metadata_members = [
+                  name
+                  for name in archive.namelist()
+                  if name.endswith(".dist-info/METADATA")
+              ]
+              if len(metadata_members) != 1:
+                  raise SystemExit("wheel must contain one METADATA file")
+              wheel_metadata = BytesParser().parsebytes(
+                  archive.read(metadata_members[0])
+              )
+
+          sdist = package_dir / f"llm_exec_core-{version}.tar.gz"
+          with tarfile.open(sdist, mode="r:gz") as archive:
+              metadata_members = [
+                  member
+                  for member in archive.getmembers()
+                  if member.isfile()
+                  and member.name.endswith("/PKG-INFO")
+                  and len(Path(member.name).parts) == 2
+              ]
+              if len(metadata_members) != 1:
+                  raise SystemExit("sdist must contain one root PKG-INFO")
+              extracted = archive.extractfile(metadata_members[0])
+              if extracted is None:
+                  raise SystemExit("sdist PKG-INFO could not be read")
+              sdist_metadata = BytesParser().parsebytes(extracted.read())
+
+          for kind, metadata in (
+              ("wheel", wheel_metadata),
+              ("sdist", sdist_metadata),
+          ):
+              if metadata["Name"] != "llm-exec-core":
+                  raise SystemExit(f"{kind} has the wrong project name")
+              if metadata["Version"] != version:
+                  raise SystemExit(f"{kind} has the wrong version")
+
+          hashes = {
+              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in files
+          }
+          sums = Path("release-artifact/SHA256SUMS")
+          sums.write_text(
+              "".join(
+                  f"{digest}  {name}\n"
+                  for name, digest in sorted(hashes.items())
+              ),
+              encoding="utf-8",
+          )
+          evidence = {
+              "project": "llm-exec-core",
+              "version": version,
+              "source_sha": os.environ["EXPECTED_SHA"],
+              "python": "3.13.14",
+              "uv": "0.11.31",
+              "build_backend": "setuptools==83.0.0",
+              "files": hashes,
+          }
+          Path("release-artifact/release-evidence.json").write_text(
+              json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+      - name: Retain validated distributions
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: validated-distributions
+          path: release-artifact
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  smoke:
+    name: Release smoke / ${{ matrix.label }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      PYTHON_VERSION: ${{ matrix.python-version }}
+      DISTRIBUTION_KIND: ${{ matrix.distribution }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "3.10-wheel"
+            python-version: "3.10.20"
+            distribution: wheel
+          - label: "3.10-sdist"
+            python-version: "3.10.20"
+            distribution: sdist
+          - label: "3.13-wheel"
+            python-version: "3.13.14"
+            distribution: wheel
+          - label: "3.13-sdist"
+            python-version: "3.13.14"
+            distribution: sdist
+    steps:
+      - name: Check out the dispatched source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download validated distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: validated-distributions
+          path: release-artifact
+      - name: Install exact uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.31"
+          python-version: ${{ matrix.python-version }}
+          enable-cache: false
+      - name: Clean-install and import distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd release-artifact/packages
+            sha256sum --check ../SHA256SUMS
+          )
+          runtime_requirements="$RUNNER_TEMP/runtime-requirements.txt"
+          smoke_venv="$RUNNER_TEMP/smoke-venv"
+          uv export --frozen --no-dev --no-emit-project \
+            --format requirements-txt \
+            --output-file "$runtime_requirements"
+          uv venv --python "$PYTHON_VERSION" "$smoke_venv"
+          uv pip install --python "$smoke_venv/bin/python" \
+            --require-hashes \
+            --requirements "$runtime_requirements"
+          case "$DISTRIBUTION_KIND" in
+            wheel)
+              artifacts=(release-artifact/packages/*.whl)
+              ;;
+            sdist)
+              artifacts=(release-artifact/packages/*.tar.gz)
+              ;;
+            *)
+              echo "Unsupported distribution kind." >&2
+              exit 1
+              ;;
+          esac
+          if [[ "${#artifacts[@]}" -ne 1 ]]; then
+            echo "Expected exactly one selected distribution." >&2
+            exit 1
+          fi
+          uv pip install --python "$smoke_venv/bin/python" \
+            --no-deps \
+            --build-constraints .github/release-build-constraints.txt \
+            "${artifacts[0]}"
+          "$smoke_venv/bin/python" - <<'PY'
+          import importlib.metadata
+          import os
+
+          import llm_exec_core
+
+          expected = os.environ["RELEASE_VERSION"]
+          metadata_version = importlib.metadata.version("llm-exec-core")
+          if metadata_version != expected:
+              raise SystemExit("installed metadata version does not match")
+          if llm_exec_core.__version__ != expected:
+              raise SystemExit("imported package version does not match")
+          PY
+
+  publication_gate:
+    name: Release / publication gate
+    if: ${{ !inputs.dry_run }}
+    needs: [preflight, quality, build, smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      PUBLISH_ENABLED: ${{ vars.LLM_EXEC_CORE_PYPI_PUBLISH_ENABLED }}
+    steps:
+      - name: Require the explicit publication kill switch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${PUBLISH_ENABLED:-}" != "true" ]]; then
+            echo "LLM_EXEC_CORE_PYPI_PUBLISH_ENABLED must be exactly true." >&2
+            exit 1
+          fi
+
+  publish:
+    name: Release / publish to PyPI
+    if: ${{ !inputs.dry_run }}
+    needs: publication_gate
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/llm-exec-core/${{ inputs.version }}/
+    permissions:
+      id-token: write # Required only here for PyPI Trusted Publishing OIDC.
+    steps:
+      - name: Download validated distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: validated-distributions
+          path: release-artifact
+      - name: Publish with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        with:
+          packages-dir: release-artifact/packages/
+          attestations: true
+          print-hash: true
+
+  verify_publication:
+    name: Release / audit public PyPI state and provenance
+    if: ${{ always() && !inputs.dry_run && needs.publish.result != 'skipped' }}
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      PUBLISH_RESULT: ${{ needs.publish.result }}
+    steps:
+      - name: Download validated distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: validated-distributions
+          path: release-artifact
+      - name: Install exact uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.31"
+          python-version: "3.13.14"
+          enable-cache: false
+      - name: Verify PyPI JSON, Simple API, files, and Integrity subjects
+        id: registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          PROJECT = "llm-exec-core"
+          VERSION = os.environ["RELEASE_VERSION"]
+          PUBLISH_RESULT = os.environ["PUBLISH_RESULT"]
+          EXPECTED_REPOSITORY = "lanmogu98/llm-exec-core"
+          EXPECTED_WORKFLOW = "release.yml"
+          EXPECTED_ENVIRONMENT = "pypi"
+          PYPI_JSON_PREFIX = "https://pypi.org/pypi/llm-exec-core/"
+          PYPI_SIMPLE_URL = "https://pypi.org/simple/llm-exec-core/"
+          PYPI_INTEGRITY_PREFIX = (
+              "https://pypi.org/integrity/llm-exec-core/"
+          )
+          TIMEOUT_SECONDS = 20
+          MAX_METADATA_BYTES = 2_000_000
+          MAX_FILE_BYTES = 50_000_000
+          MAX_ATTEMPTS = 12
+          RETRY_SECONDS = 10
+          MAX_REDIRECTS = 0
+          RUNNER_TEMP = Path(os.environ["RUNNER_TEMP"])
+          VERIFICATION_DIR = RUNNER_TEMP / "public-verification"
+          VERIFICATION_DIR.mkdir(parents=True, exist_ok=True)
+          if PUBLISH_RESULT not in {"success", "failure", "cancelled"}:
+              raise SystemExit("unexpected publish job result")
+
+
+          class PendingPublication(Exception):
+              pass
+
+
+          class ReleaseUnavailable(PendingPublication):
+              pass
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              max_redirections = MAX_REDIRECTS
+
+              def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+                  return None
+
+
+          def fetch(
+              url: str,
+              *,
+              allowed_hosts: set[str],
+              max_bytes: int,
+              accept: str | None = None,
+              pending_404: bool = False,
+          ) -> bytes:
+              parsed = urllib.parse.urlsplit(url)
+              if (
+                  parsed.scheme != "https"
+                  or parsed.hostname not in allowed_hosts
+                  or parsed.username is not None
+                  or parsed.password is not None
+                  or parsed.port is not None
+                  or parsed.query
+                  or parsed.fragment
+              ):
+                  raise SystemExit(f"rejected URL: {url}")
+              headers = {"User-Agent": "llm-exec-core-release-verifier"}
+              if accept is not None:
+                  headers["Accept"] = accept
+              request = urllib.request.Request(url, headers=headers)
+              opener = urllib.request.build_opener(NoRedirect())
+              try:
+                  with opener.open(
+                      request, timeout=TIMEOUT_SECONDS
+                  ) as response:
+                      if response.geturl() != url:
+                          raise SystemExit("redirects are forbidden")
+                      content_length = response.headers.get("Content-Length")
+                      if (
+                          content_length is not None
+                          and int(content_length) > max_bytes
+                      ):
+                          raise SystemExit("response exceeds size limit")
+                      body = response.read(max_bytes + 1)
+              except urllib.error.HTTPError as error:
+                  if pending_404 and error.code == 404:
+                      raise PendingPublication(url) from error
+                  raise
+              if len(body) > max_bytes:
+                  raise SystemExit("response exceeds size limit")
+              return body
+
+
+          def fetch_json(
+              url: str,
+              *,
+              accept: str,
+              pending_404: bool = False,
+          ) -> dict:
+              return json.loads(
+                  fetch(
+                      url,
+                      allowed_hosts={"pypi.org"},
+                      max_bytes=MAX_METADATA_BYTES,
+                      accept=accept,
+                      pending_404=pending_404,
+                  )
+              )
+
+
+          package_dir = Path("release-artifact/packages")
+          local_files = sorted(
+              path for path in package_dir.iterdir() if path.is_file()
+          )
+          if len(local_files) != 2:
+              raise SystemExit("validated artifact must contain two files")
+          expected_names = {path.name for path in local_files}
+
+          sum_lines = Path("release-artifact/SHA256SUMS").read_text(
+              encoding="utf-8"
+          ).splitlines()
+          expected_hashes = {}
+          for line in sum_lines:
+              match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9_.+-]+)", line)
+              if match is None:
+                  raise SystemExit("invalid SHA256SUMS line")
+              expected_hashes[match.group(2)] = match.group(1)
+          if set(expected_hashes) != expected_names:
+              raise SystemExit("SHA256SUMS file set mismatch")
+
+          expected_sizes = {}
+          for path in local_files:
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if digest != expected_hashes[path.name]:
+                  raise SystemExit("local validated distribution hash mismatch")
+              expected_sizes[path.name] = path.stat().st_size
+
+          evidence = json.loads(
+              Path("release-artifact/release-evidence.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          if evidence != {
+              "build_backend": "setuptools==83.0.0",
+              "files": expected_hashes,
+              "project": PROJECT,
+              "python": "3.13.14",
+              "source_sha": os.environ["EXPECTED_SHA"],
+              "uv": "0.11.31",
+              "version": VERSION,
+          }:
+              raise SystemExit("release evidence does not match the dispatch")
+
+
+          def verify_registry(
+              *,
+              require_complete: bool,
+              allow_index_fallback: bool,
+          ) -> tuple[set[str], set[str], set[str], str]:
+              encoded_version = urllib.parse.quote(VERSION, safe="")
+              release_url = f"{PYPI_JSON_PREFIX}{encoded_version}/json"
+              try:
+                  simple = fetch_json(
+                      PYPI_SIMPLE_URL,
+                      accept="application/vnd.pypi.simple.v1+json",
+                      pending_404=True,
+                  )
+              except PendingPublication:
+                  simple = None
+              simple_rows = {
+                  row["filename"]: row
+                  for row in (simple or {}).get("files", [])
+                  if row["filename"] in expected_names
+              }
+              simple_names = set(simple_rows)
+              try:
+                  release = fetch_json(
+                      release_url,
+                      accept="application/json",
+                      pending_404=True,
+                  )
+              except PendingPublication as error:
+                  if not allow_index_fallback:
+                      if simple_names:
+                          raise PendingPublication(
+                              "PyPI JSON is unavailable while Simple files "
+                              f"exist: {sorted(simple_names)}"
+                          ) from error
+                      raise ReleaseUnavailable(release_url) from error
+                  if simple is None:
+                      raise ReleaseUnavailable(release_url) from error
+                  release = None
+                  json_rows = {}
+              else:
+                  if release["info"]["name"] != PROJECT:
+                      raise SystemExit("PyPI JSON project name mismatch")
+                  if release["info"]["version"] != VERSION:
+                      raise SystemExit("PyPI JSON version mismatch")
+                  json_rows = {
+                      row["filename"]: row
+                      for row in release.get("urls", [])
+                  }
+              json_names = set(json_rows)
+              if not json_names.issubset(expected_names):
+                  raise SystemExit("PyPI JSON contains unexpected files")
+              if require_complete and json_names != expected_names:
+                  raise PendingPublication(
+                      f"PyPI JSON files incomplete: {sorted(json_names)}"
+                  )
+              indexes_agree = (
+                  simple is not None and json_names == simple_names
+              )
+              if not indexes_agree and not allow_index_fallback:
+                  if release is None:
+                      raise PendingPublication(
+                          "PyPI JSON is unavailable while Simple files exist: "
+                          f"{sorted(simple_names)}"
+                      )
+                  raise PendingPublication(
+                      "PyPI JSON and Simple file sets disagree: "
+                      f"JSON={sorted(json_names)}, "
+                      f"Simple={sorted(simple_names)}"
+                  )
+              registry_mode = (
+                  "consistent" if indexes_agree else "index-fallback"
+              )
+              public_names = json_names | simple_names
+
+              for name in sorted(public_names):
+                  json_row = json_rows.get(name)
+                  simple_row = simple_rows.get(name)
+                  if (
+                      json_row is not None
+                      and json_row.get("yanked") is not False
+                  ):
+                      raise SystemExit(f"{name} is yanked in PyPI JSON")
+                  if (
+                      simple_row is not None
+                      and simple_row.get("yanked") is not False
+                  ):
+                      raise SystemExit(f"{name} is yanked in PyPI Simple")
+                  if (
+                      json_row is not None
+                      and json_row.get("size") != expected_sizes[name]
+                  ):
+                      raise SystemExit(f"{name} JSON size mismatch")
+                  if (
+                      simple_row is not None
+                      and simple_row.get("size") != expected_sizes[name]
+                  ):
+                      raise SystemExit(f"{name} Simple size mismatch")
+                  if (
+                      json_row is not None
+                      and (
+                          json_row.get("digests", {}).get("sha256")
+                          != expected_hashes[name]
+                      )
+                  ):
+                      raise SystemExit(f"{name} JSON hash mismatch")
+                  if (
+                      simple_row is not None
+                      and (
+                          simple_row.get("hashes", {}).get("sha256")
+                          != expected_hashes[name]
+                      )
+                  ):
+                      raise SystemExit(f"{name} Simple hash mismatch")
+                  if (
+                      json_row is not None
+                      and simple_row is not None
+                      and json_row.get("url") != simple_row.get("url")
+                  ):
+                      raise SystemExit(f"{name} API URL mismatch")
+
+                  observed_row = simple_row or json_row
+                  if observed_row is None:
+                      raise SystemExit(f"{name} has no public metadata")
+                  file_url = observed_row["url"]
+                  file_bytes = fetch(
+                      file_url,
+                      allowed_hosts={"files.pythonhosted.org"},
+                      max_bytes=MAX_FILE_BYTES,
+                  )
+                  if len(file_bytes) != expected_sizes[name]:
+                      raise SystemExit(f"{name} downloaded size mismatch")
+                  if (
+                      hashlib.sha256(file_bytes).hexdigest()
+                      != expected_hashes[name]
+                  ):
+                      raise SystemExit(f"{name} downloaded hash mismatch")
+                  (VERIFICATION_DIR / name).write_bytes(file_bytes)
+
+                  encoded_name = urllib.parse.quote(name, safe="")
+                  provenance_url = (
+                      f"{PYPI_INTEGRITY_PREFIX}{encoded_version}/"
+                      f"{encoded_name}/provenance"
+                  )
+                  if (
+                      simple_row is not None
+                      and simple_row.get("provenance") != provenance_url
+                  ):
+                      raise PendingPublication(
+                          f"{name} provenance URL is not visible"
+                      )
+                  provenance = fetch_json(
+                      provenance_url,
+                      accept="application/vnd.pypi.integrity.v1+json",
+                      pending_404=True,
+                  )
+                  matching_bundles = [
+                      bundle
+                      for bundle in provenance.get(
+                          "attestation_bundles", []
+                      )
+                      if (
+                          bundle.get("publisher", {}).get("kind")
+                          == "GitHub"
+                          and bundle.get("publisher", {}).get("repository")
+                          == EXPECTED_REPOSITORY
+                          and bundle.get("publisher", {}).get("workflow")
+                          == EXPECTED_WORKFLOW
+                          and bundle.get("publisher", {}).get("environment")
+                          == EXPECTED_ENVIRONMENT
+                      )
+                  ]
+                  if len(matching_bundles) != 1:
+                      raise SystemExit(
+                          f"{name} publisher identity mismatch"
+                      )
+                  publisher = matching_bundles[0]["publisher"]
+                  if publisher.get("repository") != EXPECTED_REPOSITORY:
+                      raise SystemExit("publisher repository mismatch")
+                  if publisher.get("workflow") != EXPECTED_WORKFLOW:
+                      raise SystemExit("publisher workflow mismatch")
+                  if publisher.get("environment") != EXPECTED_ENVIRONMENT:
+                      raise SystemExit("publisher environment mismatch")
+
+                  provenance_path = VERIFICATION_DIR / (
+                      f"{name}.provenance.json"
+                  )
+                  provenance_path.write_text(
+                      json.dumps(provenance, sort_keys=True),
+                      encoding="utf-8",
+                  )
+              return (
+                  public_names,
+                  json_names,
+                  simple_names,
+                  registry_mode,
+              )
+
+
+          require_complete = PUBLISH_RESULT == "success"
+          public_names = None
+          json_names = None
+          simple_names = None
+          registry_mode = None
+          for attempt in range(1, MAX_ATTEMPTS + 1):
+              try:
+                  (
+                      public_names,
+                      json_names,
+                      simple_names,
+                      registry_mode,
+                  ) = verify_registry(
+                      require_complete=require_complete,
+                      allow_index_fallback=(
+                          not require_complete
+                          and attempt == MAX_ATTEMPTS
+                      ),
+                  )
+                  if (
+                      not require_complete
+                      and public_names != expected_names
+                      and attempt < MAX_ATTEMPTS
+                  ):
+                      raise PendingPublication(
+                          "waiting for failed publish state to settle: "
+                          f"{sorted(public_names)}"
+                      )
+              except ReleaseUnavailable as error:
+                  if not require_complete and attempt == MAX_ATTEMPTS:
+                      public_names = set()
+                      json_names = set()
+                      simple_names = set()
+                      registry_mode = "consistent"
+                      break
+                  pending_error = error
+              except PendingPublication as error:
+                  pending_error = error
+              else:
+                  break
+              if attempt == MAX_ATTEMPTS:
+                  raise SystemExit(
+                      "PyPI publication audit did not become verifiable "
+                      f"in time: {pending_error}"
+                  ) from pending_error
+              time.sleep(RETRY_SECONDS)
+          else:
+              raise SystemExit("bounded publication verification failed")
+          if (
+              public_names is None
+              or json_names is None
+              or simple_names is None
+              or registry_mode is None
+          ):
+              raise SystemExit("registry state was not determined")
+
+          if public_names == expected_names:
+              publication_state = "complete"
+          elif public_names:
+              publication_state = "partial"
+          else:
+              publication_state = "absent"
+          audit = {
+              "expected_files": sorted(expected_names),
+              "json_files": sorted(json_names),
+              "public_files": sorted(public_names),
+              "publication_state": publication_state,
+              "publish_result": PUBLISH_RESULT,
+              "registry_mode": registry_mode,
+              "simple_files": sorted(simple_names),
+          }
+          (VERIFICATION_DIR / "publication-audit.json").write_text(
+              json.dumps(audit, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          with Path(os.environ["GITHUB_OUTPUT"]).open(
+              "a", encoding="utf-8"
+          ) as output:
+              output.write(f"public_count={len(public_names)}\n")
+              output.write(
+                  f"publication_state={publication_state}\n"
+              )
+          public_display = ", ".join(sorted(public_names)) or "none"
+          json_display = ", ".join(sorted(json_names)) or "none"
+          simple_display = ", ".join(sorted(simple_names)) or "none"
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open(
+              "a", encoding="utf-8"
+          ) as summary:
+              summary.write(
+                  "## PyPI publication audit\n\n"
+                  f"- Publish job result: `{PUBLISH_RESULT}`\n"
+                  f"- Public state: `{publication_state}`\n"
+                  f"- Registry mode: `{registry_mode}`\n"
+                  f"- Version JSON files: {json_display}\n"
+                  f"- Simple API files: {simple_display}\n"
+                  f"- Verified public union: {public_display}\n"
+              )
+          PY
+      - name: Validate publication audit schema
+        id: audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          PUBLISH_RESULT = os.environ["PUBLISH_RESULT"]
+          if PUBLISH_RESULT not in {"success", "failure", "cancelled"}:
+              raise SystemExit("unexpected publish job result")
+
+          evidence = json.loads(
+              Path("release-artifact/release-evidence.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          expected_hashes = evidence.get("files")
+          if not isinstance(expected_hashes, dict) or len(expected_hashes) != 2:
+              raise SystemExit("release evidence must name two files")
+          expected_names = set(expected_hashes)
+          for name, expected_hash in expected_hashes.items():
+              if Path(name).name != name:
+                  raise SystemExit("unsafe distribution filename")
+              if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+                  raise SystemExit("invalid expected distribution hash")
+
+          verification_dir = (
+              Path(os.environ["RUNNER_TEMP"]) / "public-verification"
+          )
+          audit = json.loads(
+              (verification_dir / "publication-audit.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+
+
+          def audit_file_set(field: str) -> set[str]:
+              value = audit.get(field)
+              if (
+                  not isinstance(value, list)
+                  or not all(isinstance(name, str) for name in value)
+              ):
+                  raise SystemExit(f"audit {field} is invalid")
+              names = set(value)
+              if (
+                  len(names) != len(value)
+                  or not names.issubset(expected_names)
+              ):
+                  raise SystemExit(f"audit {field} is invalid")
+              return names
+
+
+          public_names = audit_file_set("public_files")
+          json_names = audit_file_set("json_files")
+          simple_names = audit_file_set("simple_files")
+          registry_mode = audit.get("registry_mode")
+          if registry_mode == "consistent":
+              if not (public_names == json_names == simple_names):
+                  raise SystemExit("consistent registry sets disagree")
+          elif registry_mode == "index-fallback":
+              if (
+                  json_names == simple_names
+                  or public_names != json_names | simple_names
+              ):
+                  raise SystemExit("fallback registry sets are invalid")
+          else:
+              raise SystemExit("audit registry mode is invalid")
+
+          if public_names == expected_names:
+              publication_state = "complete"
+          elif public_names:
+              publication_state = "partial"
+          else:
+              publication_state = "absent"
+          if PUBLISH_RESULT == "success" and (
+              publication_state != "complete"
+              or registry_mode != "consistent"
+              or json_names != expected_names
+              or simple_names != expected_names
+          ):
+              raise SystemExit(
+                  "successful publish audit must be complete and consistent"
+              )
+          if audit != {
+              "expected_files": sorted(expected_names),
+              "json_files": sorted(json_names),
+              "public_files": sorted(public_names),
+              "publication_state": publication_state,
+              "publish_result": PUBLISH_RESULT,
+              "registry_mode": registry_mode,
+              "simple_files": sorted(simple_names),
+          }:
+              raise SystemExit("publication audit does not match evidence")
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open(
+              "a", encoding="utf-8"
+          ) as output:
+              output.write(f"public_count={len(public_names)}\n")
+          PY
+      - name: Cryptographically verify saved provenance and signed claims
+        if: ${{ steps.audit.outputs.public_count != '0' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 120s uv run \
+            --no-project \
+            --python "3.13.14" \
+            --with "pypi-attestations==0.0.29" \
+            python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          from cryptography import x509
+          from cryptography.x509.oid import ExtensionOID, ObjectIdentifier
+          from pypi_attestations import (
+              Distribution,
+              GitHubPublisher,
+              Provenance,
+          )
+
+          EXPECTED_SHA = os.environ["EXPECTED_SHA"]
+          EXPECTED_REPOSITORY = "lanmogu98/llm-exec-core"
+          EXPECTED_WORKFLOW = "release.yml"
+          EXPECTED_ENVIRONMENT = "pypi"
+          PUBLISH_ATTESTATION = (
+              "https://docs.pypi.org/attestations/publish/v1"
+          )
+          EXPECTED_SIGNER = (
+              "https://github.com/lanmogu98/llm-exec-core/"
+              ".github/workflows/release.yml@refs/heads/main"
+          )
+
+
+          def decode_der_utf8(value: bytes) -> str:
+              if not value or value[0] != 0x0C:
+                  raise SystemExit("certificate extension is not UTF8String")
+              first_length = value[1]
+              if first_length < 0x80:
+                  length = first_length
+                  start = 2
+              else:
+                  length_bytes = first_length & 0x7F
+                  if length_bytes == 0 or length_bytes > 4:
+                      raise SystemExit("invalid DER length")
+                  start = 2 + length_bytes
+                  length = int.from_bytes(value[2:start], "big")
+              payload = value[start:]
+              if len(payload) != length:
+                  raise SystemExit("invalid DER UTF8String payload")
+              return payload.decode("utf-8")
+
+
+          expected_extensions = {
+              "1.3.6.1.4.1.57264.1.8": (
+                  "https://token.actions.githubusercontent.com"
+              ),
+              "1.3.6.1.4.1.57264.1.9": EXPECTED_SIGNER,
+              "1.3.6.1.4.1.57264.1.10": EXPECTED_SHA,
+              "1.3.6.1.4.1.57264.1.11": "github-hosted",
+              "1.3.6.1.4.1.57264.1.12": (
+                  "https://github.com/lanmogu98/llm-exec-core"
+              ),
+              "1.3.6.1.4.1.57264.1.13": EXPECTED_SHA,
+              "1.3.6.1.4.1.57264.1.14": "refs/heads/main",
+              "1.3.6.1.4.1.57264.1.18": EXPECTED_SIGNER,
+              "1.3.6.1.4.1.57264.1.19": EXPECTED_SHA,
+              "1.3.6.1.4.1.57264.1.20": "workflow_dispatch",
+              "1.3.6.1.4.1.57264.1.22": "public",
+              "1.3.6.1.4.1.57264.1.23": "pypi",
+          }
+
+          evidence = json.loads(
+              Path("release-artifact/release-evidence.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          expected_hashes = evidence.get("files")
+          if not isinstance(expected_hashes, dict) or len(expected_hashes) != 2:
+              raise SystemExit("release evidence must name two files")
+          verification_dir = (
+              Path(os.environ["RUNNER_TEMP"]) / "public-verification"
+          )
+          for name, expected_hash in expected_hashes.items():
+              if Path(name).name != name:
+                  raise SystemExit("unsafe distribution filename")
+              if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+                  raise SystemExit("invalid expected distribution hash")
+
+          audit = json.loads(
+              (verification_dir / "publication-audit.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          public_files = audit.get("public_files")
+          json_files = audit.get("json_files")
+          simple_files = audit.get("simple_files")
+          if (
+              not isinstance(public_files, list)
+              or not public_files
+              or not all(isinstance(name, str) for name in public_files)
+              or not isinstance(json_files, list)
+              or not all(isinstance(name, str) for name in json_files)
+              or not isinstance(simple_files, list)
+              or not all(isinstance(name, str) for name in simple_files)
+          ):
+              raise SystemExit("audit file sets are invalid")
+          public_names = set(public_files)
+          json_names = set(json_files)
+          simple_names = set(simple_files)
+          expected_names = set(expected_hashes)
+          if (
+              len(public_names) != len(public_files)
+              or len(json_names) != len(json_files)
+              or len(simple_names) != len(simple_files)
+              or not public_names.issubset(expected_names)
+              or not json_names.issubset(expected_names)
+              or not simple_names.issubset(expected_names)
+          ):
+              raise SystemExit("audit file set is invalid")
+          registry_mode = audit.get("registry_mode")
+          if registry_mode == "consistent":
+              if not (public_names == json_names == simple_names):
+                  raise SystemExit("consistent registry sets disagree")
+          elif registry_mode == "index-fallback":
+              if (
+                  json_names == simple_names
+                  or public_names != json_names | simple_names
+              ):
+                  raise SystemExit("fallback registry sets are invalid")
+          else:
+              raise SystemExit("audit registry mode is invalid")
+          if public_names == expected_names:
+              publication_state = "complete"
+          else:
+              publication_state = "partial"
+          publish_result = os.environ["PUBLISH_RESULT"]
+          if publish_result == "success" and (
+              publication_state != "complete"
+              or registry_mode != "consistent"
+              or json_names != expected_names
+              or simple_names != expected_names
+          ):
+              raise SystemExit(
+                  "successful publish audit must be complete and consistent"
+              )
+          if audit != {
+              "expected_files": sorted(expected_names),
+              "json_files": sorted(json_names),
+              "public_files": sorted(public_names),
+              "publication_state": publication_state,
+              "publish_result": publish_result,
+              "registry_mode": registry_mode,
+              "simple_files": sorted(simple_names),
+          }:
+              raise SystemExit("publication audit does not match evidence")
+
+          for name in sorted(public_names):
+              expected_hash = expected_hashes[name]
+              distribution_path = verification_dir / name
+              provenance_path = verification_dir / (
+                  f"{name}.provenance.json"
+              )
+              if not distribution_path.is_file():
+                  raise SystemExit(f"missing downloaded distribution: {name}")
+              if not provenance_path.is_file():
+                  raise SystemExit(f"missing saved provenance: {name}")
+
+              distribution = Distribution.from_file(distribution_path)
+              if (
+                  distribution.digest != expected_hash
+                  or hashlib.sha256(
+                      distribution_path.read_bytes()
+                  ).hexdigest()
+                  != expected_hash
+              ):
+                  raise SystemExit(f"{name} verifier digest mismatch")
+
+              raw_provenance = json.loads(
+                  provenance_path.read_text(encoding="utf-8")
+              )
+              raw_bundles = raw_provenance.get("attestation_bundles")
+              if not isinstance(raw_bundles, list):
+                  raise SystemExit("invalid attestation bundle list")
+              matching_indexes = []
+              for index, raw_bundle in enumerate(raw_bundles):
+                  if not isinstance(raw_bundle, dict):
+                      continue
+                  publisher = raw_bundle.get("publisher")
+                  if not isinstance(publisher, dict):
+                      continue
+                  if (
+                      publisher.get("kind") == "GitHub"
+                      and publisher.get("repository")
+                      == EXPECTED_REPOSITORY
+                      and publisher.get("workflow") == EXPECTED_WORKFLOW
+                      and publisher.get("environment")
+                      == EXPECTED_ENVIRONMENT
+                  ):
+                      matching_indexes.append(index)
+              if len(matching_indexes) != 1:
+                  raise SystemExit("exact publisher bundle not found")
+
+              provenance = Provenance.model_validate(raw_provenance)
+              if len(provenance.attestation_bundles) != len(raw_bundles):
+                  raise SystemExit("parsed provenance bundle mismatch")
+              bundle = provenance.attestation_bundles[
+                  matching_indexes[0]
+              ]
+              publisher = bundle.publisher
+              if (
+                  not isinstance(publisher, GitHubPublisher)
+                  or publisher.repository != EXPECTED_REPOSITORY
+                  or publisher.workflow != EXPECTED_WORKFLOW
+                  or publisher.environment != EXPECTED_ENVIRONMENT
+              ):
+                  raise SystemExit("parsed publisher identity mismatch")
+
+              verified_publish_attestations = []
+              for attestation in bundle.attestations:
+                  predicate_type, _ = attestation.verify(
+                      publisher,
+                      distribution,
+                  )
+                  if predicate_type == PUBLISH_ATTESTATION:
+                      verified_publish_attestations.append(attestation)
+              if len(verified_publish_attestations) != 1:
+                  raise SystemExit(
+                      f"{name} must have one verified publish attestation"
+                  )
+
+              verified_attestation = verified_publish_attestations[0]
+              certificate = x509.load_der_x509_certificate(
+                  verified_attestation.verification_material.certificate
+              )
+              san = certificate.extensions.get_extension_for_oid(
+                  ExtensionOID.SUBJECT_ALTERNATIVE_NAME
+              ).value
+              identities = san.get_values_for_type(
+                  x509.UniformResourceIdentifier
+              )
+              if identities != [EXPECTED_SIGNER]:
+                  raise SystemExit("certificate workflow identity mismatch")
+              for oid_text, expected in expected_extensions.items():
+                  extension = certificate.extensions.get_extension_for_oid(
+                      ObjectIdentifier(oid_text)
+                  ).value
+                  actual = decode_der_utf8(extension.value)
+                  if actual != expected:
+                      raise SystemExit(
+                          f"certificate claim {oid_text} mismatch"
+                      )
+          PY
