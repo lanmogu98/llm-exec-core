@@ -384,6 +384,7 @@ class ModelCapabilities(BaseModel):
     tool_choice: bool = False
     parallel_tool_calls: bool = False
     reasoning_controls: List[str] = Field(default_factory=list)
+    service_tiers: Optional[List[str]] = None
     openrouter_supported_parameters: List[str] = Field(default_factory=list)
 
 

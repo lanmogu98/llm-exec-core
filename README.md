@@ -146,6 +146,22 @@ payload fields. For target models with capability metadata, core validates known
 high-risk fields such as `response_format`, `tools`, tool streaming, and
 reasoning controls before sending the request.
 
+A caller-owned model's `capabilities.service_tiers` optionally declares the
+accepted `service_tier` strings for that exact provider/model route. `None`
+(the default, including an omitted declaration) preserves legacy raw
+passthrough; `[]` rejects every explicit tier; a non-empty list accepts only
+those strings. Validation applies to the effective merged payload, including
+provider/model defaults and promoted `extra_body`, before HTTP client creation.
+An OpenRouter route with an explicit declaration also needs `service_tier` in
+`openrouter_supported_parameters`. Omitting `service_tier` leaves provider
+behavior unchanged. This declaration describes supported request values, not
+account activation, quota availability, or the tier actually served.
+
+This additive public schema change adds `service_tiers=None` to the default
+`ModelCapabilities.model_dump()` output; callers comparing complete serialized
+capability dictionaries should account for that field. Unknown request fields
+retain their existing raw passthrough semantics.
+
 Catalog lookup remains raw: `get_model_details()` returns the declared
 `ProviderSettings` and `ModelDetails` without synthesizing or mutating an
 effective settings object. A model may optionally override `temperature`,
