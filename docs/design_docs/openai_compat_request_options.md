@@ -489,7 +489,13 @@ On OpenRouter routes with capability metadata, core-generated `temperature`,
 `supported_parameters`. Unsupported generated defaults are omitted; a generated
 `max_tokens` is converted to `max_completion_tokens` when only that token-limit
 parameter is listed. Explicit provider/model/per-call values for unsupported
-fields fail fast instead of being sent silently.
+fields fail fast instead of being sent silently. When the route declares a
+generation policy, the `temperature` element of that planning is skipped
+entirely: neither the generated-default omission path nor the fail-fast path
+for an explicitly supplied non-default `temperature` applies, and sampling
+authority for `temperature`/`top_p` comes from the policy instead.
+`max_tokens`/`max_completion_tokens` handling and all correctness-dependent
+`require_parameters` behavior are unchanged.
 
 `stream_options` is deep-merged as provider first, then model, then per call.
 When `stream=True`, `include_usage: true` is added when final `stream_options` is
