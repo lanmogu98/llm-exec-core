@@ -225,6 +225,17 @@ rules declare one finite value.
 | `deprecated` | Omit. | Fail before execution. |
 | `forbidden` | Omit. | Fail before execution. |
 
+When a route declares a generation policy, that policy is authoritative for
+sampling: `temperature` and `top_p` authority comes from the declared policy,
+not from provider, model, or OpenRouter metadata defaults. In particular, on a
+policy-present OpenRouter route the OpenRouter `supported_parameters` check for
+`temperature` does not apply at all, including its otherwise fail-closed
+handling of an explicitly supplied non-default `temperature`. No OpenRouter
+metadata fallback guards `temperature` on such a route, so catalog authors must
+declare the sampling policy correctly. Token-limit (`max_tokens`,
+`max_completion_tokens`) planning and all correctness-dependent
+`require_parameters` behavior are unchanged by this exception.
+
 All new schema objects reject unknown fields. Wire paths are nonempty arrays of
 nonempty strings. Reasoning paths cannot root at core-owned `model`,
 `messages`, or `stream`, cannot root at sampling-owned `temperature` or
@@ -266,8 +277,13 @@ A request cannot provide the same semantic control through both raw and typed
 per-call surfaces. Different controls may use the two surfaces together.
 Direct keys continue to win over promoted `extra_body` keys before semantic
 resolution. Canonical writing removes lower-precedence declarations at the
-route-declared path, preserves unknown siblings, and fails if a declared path
-would traverse a scalar.
+route-declared path, prunes a container that becomes empty as part of that
+removal, preserves unknown siblings, and fails if a declared path would
+traverse a scalar. Pruning also removes an explicitly supplied empty container
+that is an ancestor of a declared reasoning path — for example a raw
+`{"reasoning": {}}` when the declared effort path is `reasoning.effort` — from
+the planned payload. Non-empty containers and their unknown siblings are
+preserved.
 
 Effort aliases are converted to their canonical value before payload and cache
 construction. Explicitly disabling reasoning suppresses lower-precedence
@@ -290,10 +306,16 @@ tuple behavior. The only policy-absent correction is that a core-generated
 unset temperature is omitted instead of being sent as JSON `null`; an explicit
 unknown raw `temperature: null` remains passthrough.
 
-### Generation-policy evidence refreshed 2026-07-24
+### Generation-policy schema-state facts retrieved 2026-07-24
 
-The schema covers the following current, official primary-source facts without
-adding any catalog route in this change:
+This section records implementation-date retrieval (2026-07-24) of
+schema-state facts from official primary sources. It is not a review-date
+re-verification, and it authorizes no catalog row: this change adds no catalog
+route and this evidence does not stand in for one. Each future catalog
+declaration must obtain and record its own current, route-specific official
+evidence for the exact provider, endpoint, and model ID — the facts below are
+not carried forward automatically. At retrieval time the schema covered these
+official primary-source facts:
 
 - Google documents model-specific thinking levels/defaults and, beginning with
   Gemini 3.6 Flash and Gemini 3.5 Flash-Lite, deprecated and ignored
@@ -498,7 +520,11 @@ capability metadata. Raw unknown/provider-specific fields still pass through.
   correctness-dependent fields.
 - On OpenRouter routes, core defaults for `temperature`, `max_tokens`, and
   `max_completion_tokens` are also checked against `supported_parameters` before
-  sending the request.
+  sending the request. When the route declares a generation policy, the
+  `temperature` element of that check is skipped entirely and sampling
+  authority for `temperature`/`top_p` comes from the policy instead.
+  `max_tokens`/`max_completion_tokens` handling and all correctness-dependent
+  `require_parameters` behavior are unchanged.
 - On Gemini routes, the final normalized payload rejects `reasoning_effort`
   combined with `thinking_level` or `thinking_budget` under either
   `google.thinking_config` or `extra_body.google.thinking_config`.
